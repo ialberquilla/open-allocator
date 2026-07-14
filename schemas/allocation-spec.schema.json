@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-allocator.local/schemas/allocation-spec.schema.json",
+  "title": "AllocationSpec",
+  "description": "Agent-authored allocation intent. Either explicit per-instrument weights (mode A) or a named strategy with params + selection (mode B). Materialized deterministically by build-allocation, then gated by check-policy — the spec never bypasses policy.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "amount_usd": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Deploy size; overridden by the CLI --amount when both are given."
+    },
+    "risk": {
+      "enum": ["conservative", "balanced", "aggressive"]
+    },
+    "weights": {
+      "type": "object",
+      "description": "Mode A: explicit instrument_id -> weight (honored as pins).",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      }
+    },
+    "strategy": {
+      "type": "string",
+      "description": "Mode B: named strategy from the vetted library."
+    },
+    "params": {
+      "type": "object",
+      "description": "Mode B: strategy parameters; validated by the strategy."
+    },
+    "selection": {
+      "$ref": "#/$defs/Selection"
+    }
+  },
+  "oneOf": [
+    {
+      "required": ["weights"]
+    },
+    {
+      "required": ["strategy"]
+    }
+  ],
+  "$defs": {
+    "Selection": {
+      "title": "Selection",
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Advisory narrowing and shaping. Can only shrink the candidate set; policy still runs on whatever survives.",
+      "properties": {
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "min_sharpe": {
+          "type": "number"
+        },
+        "max_drawdown": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_reward_dependence": {
+          "type": "number",
+          "minimum": 0
+        },
+        "min_history_days": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "curators": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "min_tvl_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_positions": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_position_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

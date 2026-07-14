@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-allocator.local/schemas/allocation.schema.json",
+  "title": "Allocation",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "legs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AllocationLeg"
+      }
+    },
+    "total_usd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      }
+    }
+  },
+  "required": ["legs", "total_usd"],
+  "$defs": {
+    "JsonScalar": {
+      "type": ["string", "number", "boolean", "null"]
+    },
+    "JsonValue": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/JsonScalar"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JsonScalar"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonScalar"
+          }
+        }
+      ]
+    },
+    "AllocationLeg": {
+      "title": "AllocationLeg",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "instrument_id": {
+          "type": "string"
+        },
+        "weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": ["instrument_id", "weight", "usd"]
+    }
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-allocator.local/schemas/vault-score.schema.json",
+  "title": "VaultScore",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "instrument_id": {
+      "type": "string"
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "factors": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/FactorScore"
+      }
+    },
+    "risk_metrics": {
+      "type": "object",
+      "description": "Yield-path risk metrics; numbers or the string \"Unknown\".",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "const": "Unknown"
+          }
+        ]
+      }
+    }
+  },
+  "required": ["instrument_id", "score", "factors"],
+  "$defs": {
+    "JsonScalar": {
+      "type": ["string", "number", "boolean", "null"]
+    },
+    "JsonValue": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/JsonScalar"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JsonScalar"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonScalar"
+          }
+        }
+      ]
+    },
+    "FactorScore": {
+      "title": "FactorScore",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "raw_input": {
+          "$ref": "#/$defs/JsonValue"
+        },
+        "normalized_value": {
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "weight": {
+          "type": "number",
+          "minimum": 0
+        },
+        "unknown": {
+          "type": "boolean"
+        }
+      },
+      "required": ["raw_input", "normalized_value", "weight"]
+    }
+  }
+}

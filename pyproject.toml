@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "open-allocator"
+version = "0.1.0"
+description = "Agent-operated, policy-bounded DeFi yield allocator on 1Tx (CLI)."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "eth-account==0.13.7",
+    "httpx==0.28.1",
+    "jsonschema==4.26.0",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "pyyaml==6.0.3",
+    "safe-eth-py==7.7.0",
+    "typer==0.26.7",
+    "web3==7.16.0",
+]
+
+[dependency-groups]
+dev = [
+    "eth-tester==0.13.0b1",
+    "py-evm==0.12.1b1",
+    "pytest==9.1.1",
+    "ruff==0.15.19",
+]
+
+[project.scripts]
+open-allocator = "open_allocator.cli:main"
+
+[tool.uv]
+default-groups = ["dev"]
+exclude-newer = "7 days"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/open_allocator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: hits live 1Tx API / RPC; skipped without creds"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/open_allocator", "pyproject.toml", "uv.lock"]

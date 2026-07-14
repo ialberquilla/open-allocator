@@ -1,0 +1,35 @@
+# Secrets / local environment
+.env.keys
+.env
+.env.*
+!.env.example
+
+# Local execution state and live proof artifacts
+.open_allocator/
+artifacts/
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Tool/editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+plan*.md

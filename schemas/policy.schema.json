@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-allocator.local/schemas/policy.schema.json",
+  "title": "Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer"
+    },
+    "wallet": {
+      "$ref": "#/$defs/PolicyWallet"
+    },
+    "allowed": {
+      "$ref": "#/$defs/PolicyAllowed"
+    },
+    "caps": {
+      "$ref": "#/$defs/PolicyCaps"
+    },
+    "gates": {
+      "$ref": "#/$defs/PolicyGates"
+    }
+  },
+  "required": ["wallet", "allowed", "caps", "gates"],
+  "$defs": {
+    "PolicyWallet": {
+      "title": "PolicyWallet",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "signer": {
+          "enum": ["local-eoa", "remote", "safe", "erc4337-paymaster"]
+        }
+      },
+      "required": ["mode", "signer"]
+    },
+    "PolicyAllowed": {
+      "title": "PolicyAllowed",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocols": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "string"
+          }
+        },
+        "chains": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "integer"
+          }
+        },
+        "asset_categories": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "string"
+          }
+        },
+        "stablecoin_only": {
+          "type": ["boolean", "null"]
+        },
+        "assets": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "string"
+          }
+        },
+        "curators": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PolicyCaps": {
+      "title": "PolicyCaps",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_weight_per_instrument": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_weight_per_protocol": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_weight_per_curator": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_weight_per_chain": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "min_instrument_tvl_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_reward_dependence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "max_weight_per_instrument",
+        "max_weight_per_protocol",
+        "max_weight_per_curator",
+        "max_weight_per_chain",
+        "min_instrument_tvl_usd",
+        "max_reward_dependence"
+      ]
+    },
+    "PolicyGates": {
+      "title": "PolicyGates",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "new_instrument_needs_approval": {
+          "type": "boolean"
+        },
+        "autonomous_rebalance": {
+          "type": "boolean"
+        },
+        "max_deploy_per_cycle_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "new_instrument_needs_approval",
+        "autonomous_rebalance",
+        "max_deploy_per_cycle_usd"
+      ]
+    }
+  }
+}

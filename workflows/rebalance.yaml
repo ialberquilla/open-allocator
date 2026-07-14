@@ -1,0 +1,84 @@
+status: active
+workflow: rebalance
+description: Position-to-target rebalance flow that executes only material deltas after approval.
+stages:
+  - stage: snapshot_positions
+    skill: skills/rebalance.md
+    command: positions
+    produces:
+      - current-positions-json
+    review_focus:
+      - positions_reconcile
+      - checkpoint
+    human_approval_default: false
+  - stage: build_or_load_target
+    skill: skills/build-allocation.md
+    command: build-allocation
+    produces:
+      - target-allocation-json
+    review_focus:
+      - allocation_concentration
+      - policy_candidate_filter
+    human_approval_default: false
+  - stage: backtest_target
+    skill: skills/agentic-allocation.md
+    command: backtest
+    produces:
+      - backtest-json
+    review_focus:
+      - allocation_concentration
+      - apy_descriptive
+    human_approval_default: false
+  - stage: simulate_target
+    skill: skills/meta/risk-review.md
+    command: simulate
+    produces:
+      - simulation-json
+      - advisory-risk-review
+    review_focus:
+      - concentration
+      - reward_dependence
+      - liquidity
+      - apy_descriptive
+    human_approval_default: false
+  - stage: policy_gate
+    skill: skills/rebalance.md
+    command: check-policy
+    produces:
+      - policy-result-json
+    review_focus:
+      - policy_conformance
+    human_approval_default: false
+  - stage: plan_rebalance
+    skill: skills/rebalance.md
+    command: rebalance
+    produces:
+      - rebalance-dry-run-json
+    review_focus:
+      - deltas_only
+      - min_trade_threshold
+      - share_balance_exit
+      - gas_readiness
+    human_approval_default: false
+  - stage: execute_rebalance_confirmed
+    skill: skills/rebalance.md
+    command: rebalance
+    produces:
+      - rebalance-execution-report-json
+      - checkpoint-json
+      - allocation-log-jsonl
+    review_focus:
+      - human_confirmation
+      - idempotency_resume
+      - allocation_log
+    human_approval_default: true
+  - stage: reconcile_positions
+    skill: skills/meta/checkpoint-protocol.md
+    command: positions
+    produces:
+      - post-rebalance-positions-json
+      - reconciliation-notes
+    review_focus:
+      - positions_reconcile
+      - checkpoint
+    human_approval_default: false

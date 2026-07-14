@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-allocator.local/schemas/tx-plan.schema.json",
+  "title": "TxPlan",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TxStep"
+      }
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": ["steps", "summary"],
+  "$defs": {
+    "TxStep": {
+      "title": "TxStep",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "to": {
+          "type": "string"
+        },
+        "data": {
+          "type": "string"
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "chain_id": {
+          "type": "integer"
+        },
+        "kind": {
+          "enum": ["approve", "buy", "sell"]
+        }
+      },
+      "required": ["to", "data", "value", "chain_id", "kind"]
+    }
+  }
+}

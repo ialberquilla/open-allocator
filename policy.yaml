@@ -1,0 +1,23 @@
+# policy.yaml - the allocator's constitution
+version: 1
+wallet:
+  mode: self-custody           # self-custody EOA now; Safe multisig later
+  signer: local-eoa            # local-eoa | remote | safe
+allowed:
+  protocols: null              # null/omitted = all protocols 1Tx exposes
+  chains: null                 # null/omitted = all chains 1Tx exposes
+  asset_categories: null       # null = all; e.g. [USD] for dollar-denominated only (1Tx assetCategory)
+  stablecoin_only: true        # only isStablecoin instruments — the stablecoin-first knob (null/false = any)
+  assets: null                 # optional fine-grained tokenSymbol allowlist; null = all (e.g. [USDC] to exclude EUR stables)
+  curators: null               # null/omitted = any curator
+caps:
+  max_weight_per_instrument: 0.30  # no single pool > 30%
+  max_weight_per_protocol: 0.50
+  max_weight_per_curator: 0.40
+  max_weight_per_chain: 0.70
+  min_instrument_tvl_usd: 50_000
+  max_reward_dependence: 0.50      # cap emissions-driven APY dependence
+gates:
+  new_instrument_needs_approval: false  # first touch of a pool needs approval
+  autonomous_rebalance: true          # opt in explicitly before autonomy
+  max_deploy_per_cycle_usd: 25_000
