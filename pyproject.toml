@@ -6,7 +6,12 @@ build-backend = "hatchling.build"
 name = "open-allocator"
 version = "0.1.0"
 description = "Agent-operated, policy-bounded DeFi yield allocator on 1Tx (CLI)."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
+authors = [{ name = "Ivan Alberquilla" }]
+keywords = ["defi", "ai-agents", "ethereum", "yield", "1tx", "cli"]
 dependencies = [
     "eth-account==0.13.7",
     "httpx==0.28.1",
@@ -18,6 +23,10 @@ dependencies = [
     "typer==0.26.7",
     "web3==7.16.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ialberquilla/open-allocator"
+Repository = "https://github.com/ialberquilla/open-allocator"
 
 [dependency-groups]
 dev = [
