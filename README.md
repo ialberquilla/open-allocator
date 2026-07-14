@@ -1,6 +1,6 @@
 <div align="center">
 
-# open-allocator
+# OpenAllocator
 
 **Agent-operated, policy-bounded DeFi yield allocator on the [1Tx](https://1tx.com) API — run as a CLI.**
 
