@@ -2,7 +2,7 @@
 
 # OpenAllocator
 
-**Agent-operated, policy-bounded DeFi yield allocator on the [1Tx](https://1tx.com) API — run as a CLI.**
+**A harness for AI agents to run policy-bounded DeFi yield allocation on the [1Tx](https://1tx.com) API — every step a JSON-out CLI command an agent can drive.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](pyproject.toml)
