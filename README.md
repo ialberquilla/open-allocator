@@ -15,12 +15,15 @@
 
 `open-allocator` is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://app.1tx.fi/) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.
 
+**This is portfolio construction, not yield-chasing.** Most "auto-yield" tools sweep funds into whatever APY is highest this hour. `open-allocator` does what a professional asset allocator does — it builds a diversified allocation across explicit risk/reward metrics (Sharpe, volatility, drawdown), risk tiers, and real portfolio structures (`core_satellite`, `risk_parity`/`inverse_vol`, `sleeves`, `ladder`), bounded by an explicit policy — and runs it through an agent instead of a desk. High APY is a risk input, never the objective.
+
 This is an end-user allocator, not Morpho's curator-side Allocator role.
 
 > APY is descriptive, not predictive. Rates move, rewards end, liquidity changes, and smart-contract risk remains. Every metric here is yield-path only — never principal, depeg, bridge, or contract-loss risk.
 
 ## Why It Exists
 
+- **Professional allocation, not APY-chasing** — risk/reward metrics, risk tiers, and portfolio strategies (`core_satellite`, `risk_parity`, `sleeves`, `ladder`) — the way an allocator builds a book, not a sweep to the top rate.
 - **Dynamic discovery** — no hardcoded protocol or chain universe; new networks and instruments are picked up automatically from 1Tx.
 - **Transparent scoring** — every allocation and risk score maps to visible inputs. Unknown fields stay `Unknown` instead of being guessed.
 - **Policy-bounded execution** — allowlists and caps block unsafe proposals before signing. Policy can only tighten, never loosen.
