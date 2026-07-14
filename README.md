@@ -9,7 +9,7 @@
 [![Tests](https://img.shields.io/badge/tests-338%20passing-brightgreen.svg)](#development)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
 
-[Install](#install) · [Commands](#commands) · [Agent Operation](#agent-operation) · [Safety](#safety)
+[Install](#install) · [Talking to Your Agent](#talking-to-your-agent) · [Commands](#commands) · [Safety](#safety) · [Disclaimer](#disclaimer)
 
 </div>
 
@@ -60,6 +60,30 @@ Create a 1Tx account and generate an API key at **[app.1tx.fi/settings](https://
 Secrets may be dotenvx-encrypted at rest; this package does not decrypt `.env` itself. At-rest encryption does not hide values from a process that can read the decrypted runtime environment — a leaked key is only truly out of an agent's reach with a `remote` signer enclave or a Safe multisig.
 
 Governance lives in [policy.yaml](policy.yaml) — the allocator's constitution. It defines `allowed` axes (protocols, chains, `asset_categories`, `stablecoin_only`, assets, curators), `caps` (per-instrument / protocol / curator / chain weight, min TVL, max LLTV, max reward dependence), and `gates` (new-instrument approval, autonomous rebalance, max deploy per cycle). Allowlists are narrowing filters over discovery (`null` = all); they never replace discovery.
+
+## Talking to Your Agent
+
+`open-allocator` is a harness: you don't type CLI commands, your **agent** does. Point a coding agent (Claude Code, Cursor, or any agent that can run a shell) at this repo — it reads [AGENT_GUIDE.md](AGENT_GUIDE.md) and the [skills](#agent-operation) — and then you drive everything in plain language. The agent translates your intent into the JSON-out commands below, and every spend stays confirmation-gated.
+
+**Discover & analyze** (read-only)
+
+> "Show me the highest-scoring stablecoin venues 1Tx can see right now, and explain why the top three rank where they do."
+>
+> "Screen for anything with Sharpe above 1 and max drawdown under 10%, stablecoin-only, then build me a balanced $10k allocation."
+>
+> "Backtest that allocation against just holding USDC and show me the drawdown."
+
+**Check policy & execute** (confirmation-gated)
+
+> "Check this allocation against my policy — tell me exactly what would block before I sign anything."
+>
+> "Looks good — execute it, but first walk me through the wallet, chains, instruments, amounts, and gas."
+>
+> "Rebalance my current positions toward this target and show me the diff before broadcasting anything."
+>
+> "Withdraw position X and tell me what I'll receive, in shares."
+
+The agent never signs or broadcasts without announcing the exact action and getting your confirmation (see [Safety](#safety)). The [Commands](#commands) below are what it runs under the hood — you can also run them directly.
 
 ## Commands
 
