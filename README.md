@@ -2,7 +2,7 @@
 
 # OpenAllocator
 
-**A harness for AI agents to run policy-bounded DeFi yield allocation on the [1Tx](https://1tx.com) API — every step a JSON-out CLI command an agent can drive.**
+**A harness for AI agents to run policy-bounded DeFi yield allocation on the [1Tx](https://app.1tx.fi/) API — every step a JSON-out CLI command an agent can drive.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](pyproject.toml)
@@ -13,7 +13,7 @@
 
 </div>
 
-`open-allocator` is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://1tx.com) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.
+`open-allocator` is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://app.1tx.fi/) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.
 
 This is an end-user allocator, not Morpho's curator-side Allocator role.
 
@@ -47,11 +47,11 @@ uv run open-allocator --help
 
 ## Configure
 
-Copy [.env.example](.env.example) to `.env` (or run under `dotenvx`) and set:
+Create a 1Tx account and generate an API key at **[app.1tx.fi/settings](https://app.1tx.fi/settings)**, then copy [.env.example](.env.example) to `.env` (or run under `dotenvx`) and set:
 
 | Variable | Purpose |
 | --- | --- |
-| `ONE_TX_API_URL`, `ONE_TX_API_KEY` | 1Tx API endpoint and key. |
+| `ONE_TX_API_URL`, `ONE_TX_API_KEY` | 1Tx API endpoint and key — create the key at [app.1tx.fi/settings](https://app.1tx.fi/settings). |
 | `SIGNER_MODE` | `local-eoa` (default), `remote`, or `safe`. |
 | `ONE_TX_PRIVATE_KEY` | Funded EOA key; required only for `local-eoa`. |
 | `RPC_URL_<chainId>` | Override the built-in public RPC for a chain (required for broadcast). |
@@ -126,3 +126,21 @@ Unit tests mock 1Tx over `httpx.MockTransport` and the chain over `eth-tester`; 
 Layout: `src/open_allocator/core` (allocation, scoring, policy, risk metrics, strategies, screening, backtest, positions, checkpoints), `src/open_allocator/exec` (1Tx client, signers, executor, RPC registry), `schemas/` (JSON artifact contracts), `skills/` + `workflows/` (agent instruction layer), `docs/` (reference notes).
 
 The live 1Tx risk-factor field refresh remains credential-gated; see [docs/onetx-analysis-fields.md](docs/onetx-analysis-fields.md).
+
+## Disclaimer
+
+This software is provided **"as is", without warranty of any kind**, express or
+implied (see [LICENSE](LICENSE)). It is **alpha, unaudited** software that signs
+and broadcasts real on-chain transactions and moves real funds.
+
+- **Not financial, investment, legal, or tax advice.** Nothing produced by this
+  tool — scores, backtests, allocations, or projections — is a recommendation to
+  buy, sell, or hold any asset. You are solely responsible for your own decisions.
+- **APY is descriptive, not predictive.** Rates move, rewards end, liquidity
+  changes, and smart-contract, depeg, bridge, and principal-loss risks remain.
+  Metrics here are yield-path only.
+- **Use at your own risk.** DeFi carries risk of total loss. Only use funds you
+  can afford to lose, run your own review, and always inspect a proposed
+  transaction before confirming it.
+- The authors and contributors accept **no liability** for any loss or damage
+  arising from use of this software.
