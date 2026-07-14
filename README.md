@@ -1,4 +1,17 @@
+<div align="center">
+
 # open-allocator
+
+**Agent-operated, policy-bounded DeFi yield allocator on the [1Tx](https://1tx.com) API — run as a CLI.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](pyproject.toml)
+[![Tests](https://img.shields.io/badge/tests-338%20passing-brightgreen.svg)](#development)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
+
+[Install](#install) · [Commands](#commands) · [Agent Operation](#agent-operation) · [Safety](#safety)
+
+</div>
 
 `open-allocator` is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://1tx.com) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.
 
@@ -105,7 +118,7 @@ Stage skills and workflow graphs describe how to drive the CLI and review artifa
 
 ```bash
 uv run ruff check
-uv run pytest            # 336 passed, 4 integration tests skipped without live creds
+uv run pytest            # 338 passed, 4 integration tests skipped without live creds
 ```
 
 Unit tests mock 1Tx over `httpx.MockTransport` and the chain over `eth-tester`; no live network is touched. Live API/RPC tests are opt-in behind `@pytest.mark.integration` and explicit credential gates.
