@@ -384,9 +384,44 @@ class GenericHttpSafeTransactionServiceAdapter:
         raise SafeSignerError("generic Safe HTTP adapter is proposal-only")
 
 
+def safe_address_from_config(config: object) -> str:
+    """The Safe to act on: the explicit address, else derived from the seed.
+
+    Deriving means a dev never has to create a Safe in the UI first — the
+    address is a pure function of owners + threshold + salt (06-02).
+    """
+    explicit = getattr(config, "safe_address", None)
+    if explicit:
+        return str(explicit)
+
+    owners = getattr(config, "safe_owners", None)
+    threshold = getattr(config, "safe_threshold", None)
+    if not owners or threshold is None:
+        raise SafeSignerError(
+            "no SAFE_ADDRESS and no SAFE_OWNERS/SAFE_THRESHOLD to derive one"
+        )
+
+    chain_id = int(_required_config_value(config, "safe_chain_id"))
+    from web3 import HTTPProvider, Web3
+
+    from open_allocator.exec import chains, safe_deployment
+
+    rpc_url = chains.require_rpc_url(chain_id, config)
+    seed = safe_deployment.SafeSeed(
+        owners=tuple(owners),
+        threshold=int(threshold),
+        salt_nonce=int(getattr(config, "safe_salt_nonce", 0) or 0),
+    )
+    return safe_deployment.predict_address(
+        Web3(HTTPProvider(rpc_url)),
+        seed,
+        chain_id=chain_id,
+    )
+
+
 def _adapter_from_config(config: object) -> SafeTransactionServiceAdapter:
     return SafeEthPyTransactionServiceAdapter(
-        safe_address=_required_config_value(config, "safe_address"),
+        safe_address=safe_address_from_config(config),
         chain_id=int(_required_config_value(config, "safe_chain_id")),
         transaction_service_url=_required_config_value(
             config,

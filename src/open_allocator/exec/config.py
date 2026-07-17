@@ -5,12 +5,58 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    DotEnvSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 from open_allocator.exec import chains
+from open_allocator.exec.composition import (
+    LEGACY_SIGNER_MODES,
+    Account,
+    OwnerSigner,
+    SignerComposition,
+    Submission,
+    UnknownSignerMode,
+    axis_env_name,
+    legacy_signer_mode,
+)
+from open_allocator.exec.secrets import SecretBackendSettingsSource, backend_from_env
 
 DEFAULT_RPC_URLS = chains.DEFAULT_RPC_URLS
 RPC_ENV_PREFIX = chains.RPC_ENV_PREFIX
+
+DEFAULT_ENV_FILE = ".env"
+ENV_FILE_ENV_VAR = "OPEN_ALLOCATOR_ENV_FILE"
+
+
+def env_file_path() -> str:
+    """The .env to read. Point it outside the working tree to keep the
+    plaintext file out of the repo an agent has access to."""
+    return os.environ.get(ENV_FILE_ENV_VAR, "").strip() or DEFAULT_ENV_FILE
+
+
+def _with_secret_backend(
+    settings_cls: type[BaseSettings],
+    init_settings: PydanticBaseSettingsSource,
+    env_settings: PydanticBaseSettingsSource,
+    dotenv_settings: PydanticBaseSettingsSource,
+    file_secret_settings: PydanticBaseSettingsSource,
+) -> tuple[PydanticBaseSettingsSource, ...]:
+    return (
+        init_settings,
+        env_settings,
+        SecretBackendSettingsSource(settings_cls, backend_from_env()),
+        DotEnvSettingsSource(
+            settings_cls,
+            env_file=env_file_path(),
+            env_file_encoding="utf-8",
+            case_sensitive=True,
+        ),
+        file_secret_settings,
+    )
 
 
 class AllocatorConfig(BaseSettings):
@@ -19,7 +65,26 @@ class AllocatorConfig(BaseSettings):
         case_sensitive=True,
         extra="ignore",
         populate_by_name=True,
+        env_file=".env",
+        env_file_encoding="utf-8",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return _with_secret_backend(
+            settings_cls,
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
 
     onetx_api_url: str = Field(..., validation_alias="ONE_TX_API_URL")
     onetx_api_key: SecretStr = Field(..., validation_alias="ONE_TX_API_KEY", repr=False)
@@ -32,15 +97,13 @@ class AllocatorConfig(BaseSettings):
         validation_alias="ONE_TX_REFERRAL_FEE_BPS",
     )
     referral_wallet: str | None = Field(None, validation_alias="ONE_TX_REFERRAL_WALLET")
-    signer_mode: Literal[
-        "local-eoa",
-        "remote",
-        "safe",
-        "erc4337-paymaster",
-    ] = Field(
-        "local-eoa",
-        validation_alias="SIGNER_MODE",
-    )
+    # How to sign and submit is three independent axes. SIGNER_MODE is the
+    # deprecated one-enum form; it is expanded onto the axes before validation
+    # and re-derived after, so existing .env files and readers keep working.
+    account: Account = Field("eoa", validation_alias="SIGNER_ACCOUNT")
+    submission: Submission = Field("rpc", validation_alias="SIGNER_SUBMISSION")
+    owner_signer: OwnerSigner = Field("local", validation_alias="SIGNER_OWNER")
+    signer_mode: str | None = Field(None, validation_alias="SIGNER_MODE")
     private_key: SecretStr | None = Field(
         None,
         validation_alias="ONE_TX_PRIVATE_KEY",
@@ -67,9 +130,27 @@ class AllocatorConfig(BaseSettings):
         None,
         validation_alias="REMOTE_SIGNER_ADDRESS",
     )
+    # SAFE_ADDRESS is optional: with owners + threshold + salt the address is
+    # derived counterfactually and is the same on every supported chain, so
+    # nobody has to create a Safe in the UI first. An explicit address still
+    # wins, for Safes that already exist.
     safe_address: str | None = Field(
         None,
         validation_alias="SAFE_ADDRESS",
+    )
+    safe_owners: tuple[str, ...] | None = Field(
+        None,
+        validation_alias="SAFE_OWNERS",
+    )
+    safe_threshold: int | None = Field(
+        None,
+        ge=1,
+        validation_alias="SAFE_THRESHOLD",
+    )
+    safe_salt_nonce: int = Field(
+        0,
+        ge=0,
+        validation_alias="SAFE_SALT_NONCE",
     )
     safe_transaction_service_url: str | None = Field(
         None,
@@ -89,9 +170,18 @@ class AllocatorConfig(BaseSettings):
         validation_alias="SAFE_PROPOSER_CREDENTIAL",
         repr=False,
     )
-    paymaster_provider: Literal["generic-http"] | None = Field(
+    paymaster_provider: Literal["pimlico", "circle", "generic-http"] | None = Field(
         None,
         validation_alias="PAYMASTER_PROVIDER",
+    )
+    # Pimlico's endpoint embeds the chain id, so one bundler URL cannot serve a
+    # multi-chain deployment. The API key is the portable unit: the per-chain
+    # URL is derived from it (see paymaster_registry.pimlico_rpc_url). Being a
+    # SecretStr, it is keyring-able for free and never lands in a repr.
+    pimlico_api_key: SecretStr | None = Field(
+        None,
+        validation_alias="PIMLICO_API_KEY",
+        repr=False,
     )
     paymaster_bundler_url: str | None = Field(
         None,
@@ -149,6 +239,35 @@ class AllocatorConfig(BaseSettings):
     def model_post_init(self, __context: object) -> None:
         self._rpc_overrides = chains.rpc_overrides_from_env(os.environ)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_legacy_signer_mode(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+
+        mode = _first_present(data, "SIGNER_MODE", "signer_mode")
+        if mode is None or (isinstance(mode, str) and mode.strip() == ""):
+            return data
+
+        try:
+            composition = LEGACY_SIGNER_MODES[mode]
+        except (KeyError, TypeError) as error:
+            raise UnknownSignerMode(mode) from error
+
+        for axis, implied in composition._asdict().items():
+            env_name = axis_env_name(axis)
+            explicit = _first_present(data, env_name, axis)
+            if explicit is None:
+                data[env_name] = implied
+            elif explicit != implied:
+                raise ValueError(
+                    f"SIGNER_MODE={mode} implies {env_name}={implied}, "
+                    f"but {env_name}={explicit} was set; "
+                    f"set the axes directly and drop SIGNER_MODE"
+                )
+
+        return data
+
     @field_validator("referral_wallet", mode="before")
     @classmethod
     def _blank_referral_wallet_is_unset(cls, value: object) -> object:
@@ -182,6 +301,18 @@ class AllocatorConfig(BaseSettings):
             return None
         return value
 
+    @field_validator("safe_owners", mode="before")
+    @classmethod
+    def _parse_safe_owners(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped == "":
+                return None
+            # Order is preserved deliberately: it feeds the Safe setup calldata
+            # and therefore the derived address. Sorting would move the Safe.
+            return tuple(item.strip() for item in stripped.split(",") if item.strip())
+        return value
+
     @field_validator("paymaster_supported_chain_ids", mode="before")
     @classmethod
     def _parse_paymaster_supported_chain_ids(cls, value: object) -> object:
@@ -204,72 +335,141 @@ class AllocatorConfig(BaseSettings):
                 "must be set together"
             )
 
-        if self.signer_mode == "local-eoa":
+        # Each axis carries its own requirements, and they compose. A raw local
+        # key is only needed when no other axis supplies the signature: a Safe
+        # signs via its proposer credential, a remote owner via the enclave, and
+        # a 4337 submission via the paymaster adapter.
+        needs_raw_key = (
+            self.account == "eoa"
+            and self.submission == "rpc"
+            and self.owner_signer == "local"
+        )
+        if needs_raw_key:
             if self.private_key is None:
                 raise ValueError(
-                    "ONE_TX_PRIVATE_KEY is required when SIGNER_MODE=local-eoa"
+                    "ONE_TX_PRIVATE_KEY is required for a local-key EOA "
+                    "(SIGNER_ACCOUNT=eoa, SIGNER_SUBMISSION=rpc, SIGNER_OWNER=local)"
                 )
             _validate_private_key(self.private_key.get_secret_value())
-        elif self.signer_mode == "remote":
-            _require_remote_signer_value(
+
+        if self.owner_signer == "remote":
+            _require_axis_value(
                 self.remote_signer_provider,
                 "REMOTE_SIGNER_PROVIDER",
+                "SIGNER_OWNER=remote",
             )
-            _require_remote_signer_value(self.remote_signer_url, "REMOTE_SIGNER_URL")
-            _require_remote_signer_value(
+            _require_axis_value(
+                self.remote_signer_url,
+                "REMOTE_SIGNER_URL",
+                "SIGNER_OWNER=remote",
+            )
+            _require_axis_value(
                 self.remote_signer_credential,
                 "REMOTE_SIGNER_CREDENTIAL",
+                "SIGNER_OWNER=remote",
             )
-            _require_remote_signer_value(
+            _require_axis_value(
                 self.remote_signer_key_id,
                 "REMOTE_SIGNER_KEY_ID",
+                "SIGNER_OWNER=remote",
             )
             _validate_http_url(self.remote_signer_url, "REMOTE_SIGNER_URL")
             if self.remote_signer_address is not None:
                 _validate_address(self.remote_signer_address, "REMOTE_SIGNER_ADDRESS")
-        elif self.signer_mode == "safe":
-            _require_safe_signer_value(self.safe_address, "SAFE_ADDRESS")
-            _require_safe_signer_value(
-                self.safe_transaction_service_url,
-                "SAFE_TRANSACTION_SERVICE_URL",
+
+        if self.account == "safe":
+            # Either name an existing Safe or give the seed to derive one.
+            if self.safe_address is None and self.safe_owners is None:
+                raise ValueError(
+                    "SIGNER_ACCOUNT=safe needs either SAFE_ADDRESS (an existing "
+                    "Safe) or SAFE_OWNERS + SAFE_THRESHOLD (to derive one "
+                    "counterfactually, same address on every supported chain)"
+                )
+            if self.safe_owners is not None:
+                if self.safe_threshold is None:
+                    raise ValueError("SAFE_THRESHOLD is required with SAFE_OWNERS")
+                if self.safe_threshold > len(self.safe_owners):
+                    raise ValueError(
+                        f"SAFE_THRESHOLD ({self.safe_threshold}) exceeds the "
+                        f"number of SAFE_OWNERS ({len(self.safe_owners)})"
+                    )
+                for owner in self.safe_owners:
+                    _validate_address(owner, "SAFE_OWNERS")
+            if self.submission == "rpc":
+                _require_axis_value(
+                    self.safe_transaction_service_url,
+                    "SAFE_TRANSACTION_SERVICE_URL",
+                    "SIGNER_ACCOUNT=safe with SIGNER_SUBMISSION=rpc",
+                )
+                _validate_http_url(
+                    self.safe_transaction_service_url,
+                    "SAFE_TRANSACTION_SERVICE_URL",
+                )
+            _require_axis_value(
+                self.safe_chain_id,
+                "SAFE_CHAIN_ID",
+                "SIGNER_ACCOUNT=safe",
             )
-            _require_safe_signer_value(self.safe_chain_id, "SAFE_CHAIN_ID")
-            _validate_address(self.safe_address, "SAFE_ADDRESS")
-            _validate_http_url(
-                self.safe_transaction_service_url,
-                "SAFE_TRANSACTION_SERVICE_URL",
-            )
+            if self.safe_address is not None:
+                _validate_address(self.safe_address, "SAFE_ADDRESS")
             if self.safe_proposer_address is not None:
                 _validate_address(self.safe_proposer_address, "SAFE_PROPOSER_ADDRESS")
-        elif self.signer_mode == "erc4337-paymaster":
-            _require_paymaster_value(self.paymaster_provider, "PAYMASTER_PROVIDER")
-            _require_paymaster_value(
-                self.paymaster_bundler_url,
-                "PAYMASTER_BUNDLER_URL",
-            )
-            _require_paymaster_value(self.paymaster_url, "PAYMASTER_URL")
-            _require_paymaster_value(
-                self.paymaster_account_address,
-                "PAYMASTER_ACCOUNT_ADDRESS",
-            )
-            _require_paymaster_value(
-                self.paymaster_entry_point,
-                "PAYMASTER_ENTRY_POINT",
-            )
-            _require_paymaster_value(
+
+        if self.submission == "erc4337-paymaster":
+            required = "SIGNER_SUBMISSION=erc4337-paymaster"
+            _require_axis_value(self.paymaster_provider, "PAYMASTER_PROVIDER", required)
+
+            # The gas token is the one thing every provider needs from the user:
+            # it names what to pay in, and nothing can derive that for them.
+            _require_axis_value(
                 self.paymaster_usdc_address,
                 "PAYMASTER_USDC_ADDRESS",
+                required,
             )
-            _validate_http_url(self.paymaster_bundler_url, "PAYMASTER_BUNDLER_URL")
-            _validate_http_url(self.paymaster_url, "PAYMASTER_URL")
-            _validate_address(
-                self.paymaster_account_address,
-                "PAYMASTER_ACCOUNT_ADDRESS",
-            )
-            _validate_address(self.paymaster_entry_point, "PAYMASTER_ENTRY_POINT")
             _validate_address(self.paymaster_usdc_address, "PAYMASTER_USDC_ADDRESS")
 
+            if self.paymaster_provider == "pimlico":
+                _require_axis_value(
+                    self.pimlico_api_key,
+                    "PIMLICO_API_KEY",
+                    "PAYMASTER_PROVIDER=pimlico",
+                )
+            elif self.paymaster_provider == "generic-http":
+                generic = "PAYMASTER_PROVIDER=generic-http"
+                _require_axis_value(
+                    self.paymaster_bundler_url,
+                    "PAYMASTER_BUNDLER_URL",
+                    generic,
+                )
+                _require_axis_value(self.paymaster_url, "PAYMASTER_URL", generic)
+                _require_axis_value(
+                    self.paymaster_account_address,
+                    "PAYMASTER_ACCOUNT_ADDRESS",
+                    generic,
+                )
+                _require_axis_value(
+                    self.paymaster_entry_point,
+                    "PAYMASTER_ENTRY_POINT",
+                    generic,
+                )
+                _validate_http_url(self.paymaster_bundler_url, "PAYMASTER_BUNDLER_URL")
+                _validate_http_url(self.paymaster_url, "PAYMASTER_URL")
+
+            if self.paymaster_account_address is not None:
+                _validate_address(
+                    self.paymaster_account_address,
+                    "PAYMASTER_ACCOUNT_ADDRESS",
+                )
+            if self.paymaster_entry_point is not None:
+                _validate_address(self.paymaster_entry_point, "PAYMASTER_ENTRY_POINT")
+
+        self.signer_mode = legacy_signer_mode(self.composition)
+
         return self
+
+    @property
+    def composition(self) -> SignerComposition:
+        return SignerComposition(self.account, self.submission, self.owner_signer)
 
     def rpc_url(self, chain_id: int) -> str | None:
         return chains.rpc_url(chain_id, self)
@@ -281,7 +481,26 @@ class ReadOnlyOneTxConfig(BaseSettings):
         case_sensitive=True,
         extra="ignore",
         populate_by_name=True,
+        env_file=".env",
+        env_file_encoding="utf-8",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return _with_secret_backend(
+            settings_cls,
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
 
     onetx_api_url: str = Field(..., validation_alias="ONE_TX_API_URL")
     onetx_api_key: SecretStr = Field(..., validation_alias="ONE_TX_API_KEY", repr=False)
@@ -292,19 +511,17 @@ def _validate_private_key(value: str) -> None:
         raise ValueError("ONE_TX_PRIVATE_KEY must be a 32-byte 0x-prefixed hex string")
 
 
-def _require_remote_signer_value(value: object, env_name: str) -> None:
+def _require_axis_value(value: object, env_name: str, required_by: str) -> None:
     if value is None:
-        raise ValueError(f"{env_name} is required when SIGNER_MODE=remote")
+        raise ValueError(f"{env_name} is required when {required_by}")
 
 
-def _require_safe_signer_value(value: object, env_name: str) -> None:
-    if value is None:
-        raise ValueError(f"{env_name} is required when SIGNER_MODE=safe")
-
-
-def _require_paymaster_value(value: object, env_name: str) -> None:
-    if value is None:
-        raise ValueError(f"{env_name} is required when SIGNER_MODE=erc4337-paymaster")
+def _first_present(data: dict[object, object], *keys: str) -> object:
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            return value
+    return None
 
 
 def _validate_http_url(value: str | None, env_name: str) -> None:

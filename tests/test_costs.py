@@ -65,7 +65,10 @@ def test_empty_allocation_returns_none() -> None:
 
 def test_from_allocation_legs_skips_unknown_chain() -> None:
     est = costs.estimate_from_allocation_legs(
-        [{"instrument_id": "known", "usd": 100.0}, {"instrument_id": "ghost", "usd": 5.0}],
+        [
+            {"instrument_id": "known", "usd": 100.0},
+            {"instrument_id": "ghost", "usd": 5.0},
+        ],
         chain_by_instrument={"known": 8453},
         apy_by_instrument={"known": 4.0},
     )

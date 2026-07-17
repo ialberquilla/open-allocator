@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal, Protocol, runtime_checkable
 
 import httpx
 from pydantic import Field
 
 from open_allocator.core.types import FrozenModel, TxStep
+from open_allocator.exec import paymaster_registry
+from open_allocator.exec.composition import composition_from_config
 from open_allocator.exec.signer import Receipt, SignerError
 
 
@@ -141,9 +143,13 @@ class Erc4337PaymasterSigner:
 
     def _required_entry_point(self) -> str:
         if self._entry_point is None:
-            raise PaymasterConfigurationError(
-                "PAYMASTER_ENTRY_POINT is required for ERC-4337 paymaster mode"
-            )
+            # The EntryPoint is a protocol singleton at the same address on every
+            # chain, and the registry knows it — so this is derivable, not a
+            # question for the user. generic-http still requires it in config,
+            # where a self-hosted bundler may be pinned to a different one.
+            return paymaster_registry.ENTRY_POINTS[
+                paymaster_registry.DEFAULT_ENTRY_POINT_VERSION
+            ]
         return self._entry_point
 
     def _required_usdc_address(self) -> str:
@@ -266,8 +272,10 @@ class GenericHttpPaymasterUserOperationAdapter:
         return payload
 
 
-def signer_mode_is_paymaster(config: object | None) -> bool:
-    return getattr(config, "signer_mode", None) == "erc4337-paymaster"
+def submits_via_paymaster(config: object | None) -> bool:
+    if config is None:
+        return False
+    return composition_from_config(config).submission == "erc4337-paymaster"
 
 
 def validate_paymaster_preflight(
@@ -285,17 +293,123 @@ def validate_paymaster_preflight(
     _required_config_value(config, "paymaster_entry_point")
     _required_config_value(config, "paymaster_usdc_address")
 
+    # An explicit allowlist still wins, for pinning a deployment to known chains.
     supported_chain_ids = _supported_chain_ids(config)
-    if supported_chain_ids is not None:
-        for chain_id in chain_ids:
+    provider = paymaster_provider_from_config(config)
+
+    for chain_id in chain_ids:
+        if supported_chain_ids is not None:
             if chain_id not in supported_chain_ids:
                 raise PaymasterUnsupportedChain(chain_id)
+            continue
+        if not paymaster_registry.is_gas_payable(chain_id, provider=provider):
+            raise PaymasterUnsupportedChain(chain_id)
 
     return {chain_id: bundler_url for chain_id in chain_ids}
 
 
+def paymaster_provider_from_config(
+    config: object | None,
+) -> paymaster_registry.PaymasterProviderName:
+    value = getattr(config, "paymaster_provider", None)
+    if value in ("pimlico", "circle"):
+        return value
+    # generic-http and unset both mean "no opinion" — take the default, which
+    # is the provider with the widest chain coverage.
+    return paymaster_registry.DEFAULT_PROVIDER
+
+
+TokenQuoter = Callable[[int], "object | None"]
+
+
+def paymaster_cost_notes(
+    config: object | None,
+    chain_ids: Sequence[int],
+    *,
+    quoter: TokenQuoter | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Per-chain gas facts for preflight: provider, entrypoint, live rate.
+
+    The rate is fetched rather than tabulated because Pimlico bakes its fee into
+    the exchangeRate — there is no static number that is both stable and true.
+    A quote that cannot be fetched degrades to "quoted at submission" rather
+    than failing: not knowing the rate yet is not a reason to block a plan.
+    """
+    provider = paymaster_provider_from_config(config)
+    if quoter is None:
+        quoter = _live_token_quoter(config, provider)
+    notes: list[dict[str, object]] = []
+    for chain_id in chain_ids:
+        row = paymaster_registry.paymaster_chain(chain_id, provider=provider)
+        if row is None:
+            notes.append(
+                {
+                    "chain_id": chain_id,
+                    "gas_payable_in_usdc": False,
+                    "provider": None,
+                }
+            )
+            continue
+        note: dict[str, object] = {
+            "chain_id": chain_id,
+            "gas_payable_in_usdc": True,
+            "provider": row.provider,
+            "entry_point_version": row.entry_point_version,
+        }
+        quote = quoter(chain_id) if quoter is not None else None
+        if quote is not None:
+            note["exchange_rate"] = getattr(quote, "exchange_rate", None)
+            note["paymaster"] = getattr(quote, "paymaster", None)
+        notes.append(note)
+    return tuple(notes)
+
+
+def _live_token_quoter(
+    config: object | None,
+    provider: paymaster_registry.PaymasterProviderName,
+) -> TokenQuoter | None:
+    """A quoter backed by the real Pimlico endpoint, if we can build one."""
+    if config is None or provider != "pimlico":
+        return None
+    api_key = _optional_secret_config_value(config, "pimlico_api_key")
+    usdc = _optional_config_value(config, "paymaster_usdc_address")
+    if api_key is None or usdc is None:
+        return None
+
+    from open_allocator.exec.pimlico import (
+        PimlicoClient,
+        PimlicoError,
+        PimlicoPaymasterAdapter,
+    )
+
+    def quote(chain_id: int) -> object | None:
+        try:
+            adapter = PimlicoPaymasterAdapter(
+                PimlicoClient(chain_id=chain_id, api_key=api_key)
+            )
+            return adapter.token_quote(usdc)
+        except PimlicoError:
+            # Preflight is advisory; a missing quote must not block the plan.
+            return None
+
+    return quote
+
+
 def _adapter_from_config(config: object) -> PaymasterUserOperationAdapter:
     provider = getattr(config, "paymaster_provider", None)
+    if provider == "pimlico":
+        # Imported here rather than at module scope: pimlico_adapter imports the
+        # request/submission types from this module, so a top-level import would
+        # be a cycle.
+        from open_allocator.exec.pimlico_adapter import pimlico_adapter_from_config
+
+        return pimlico_adapter_from_config(config)
+    if provider == "circle":
+        raise PaymasterConfigurationError(
+            "PAYMASTER_PROVIDER=circle is a registry row, not an adapter: no "
+            "Circle client exists yet. Use pimlico (which also covers more "
+            "chains, including Monad) or generic-http."
+        )
     if provider == "generic-http":
         return GenericHttpPaymasterUserOperationAdapter(
             account_address=_required_config_value(config, "paymaster_account_address"),
@@ -505,6 +619,6 @@ __all__ = [
     "PaymasterUserOperationRequest",
     "PaymasterUserOperationSubmission",
     "UserOperationCall",
-    "signer_mode_is_paymaster",
+    "submits_via_paymaster",
     "validate_paymaster_preflight",
 ]

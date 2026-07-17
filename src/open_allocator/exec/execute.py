@@ -20,7 +20,8 @@ from open_allocator.core.types import (
 from open_allocator.exec import chains
 from open_allocator.exec.erc4337_paymaster import (
     PaymasterError,
-    signer_mode_is_paymaster,
+    paymaster_cost_notes,
+    submits_via_paymaster,
     validate_paymaster_preflight,
 )
 from open_allocator.exec.signer import Receipt, Signer
@@ -553,6 +554,20 @@ def _plan_summary(allocation: Allocation, steps: Sequence[TxStep]) -> str:
     )
 
 
+def _paymaster_gas_message(note: Mapping[str, object]) -> str:
+    chain_id = note["chain_id"]
+    provider = note.get("provider")
+    message = f"gas paid in USDC via {provider} on chain {chain_id}"
+    # The provider's fee is inside the quoted rate, so naming the rate is the
+    # only honest way to quote the cost — a flat percentage here would be a
+    # number we made up.
+    if note.get("exchange_rate") is not None:
+        message += " (live quote, provider fee included in rate)"
+    else:
+        message += " (rate quoted at submission, provider fee included)"
+    return message
+
+
 def _preflight(
     address: str,
     step_refs: Sequence[_StepRef],
@@ -569,17 +584,17 @@ def _preflight(
     rpc_urls: dict[int, str] = {}
     checks: list[GasCheck] = []
 
-    if signer_mode_is_paymaster(config):
+    if submits_via_paymaster(config):
         rpc_urls = validate_paymaster_preflight(config, chain_ids)
-        checks.extend(
-            GasCheck(
-                chain_id=chain_id,
-                ok=True,
-                required_wei=0,
-                message=f"USDC paymaster configured on chain {chain_id}",
+        for note in paymaster_cost_notes(config, chain_ids):
+            checks.append(
+                GasCheck(
+                    chain_id=int(note["chain_id"]),
+                    ok=True,
+                    required_wei=0,
+                    message=_paymaster_gas_message(note),
+                )
             )
-            for chain_id in chain_ids
-        )
         return rpc_urls, tuple(checks)
 
     for chain_id in chain_ids:

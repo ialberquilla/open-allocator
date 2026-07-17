@@ -50,17 +50,18 @@ uv run open-allocator --help
 
 ## Configure
 
-Create a 1Tx account and generate an API key at **[app.1tx.fi/settings](https://app.1tx.fi/settings)**, then copy [.env.example](.env.example) to `.env` (or run under `dotenvx`) and set:
+Create a 1Tx account and generate an API key at **[app.1tx.fi/settings](https://app.1tx.fi/settings)**, then copy [.env.example](.env.example) to `.env` and set:
 
 | Variable | Purpose |
 | --- | --- |
 | `ONE_TX_API_URL`, `ONE_TX_API_KEY` | 1Tx API endpoint and key — create the key at [app.1tx.fi/settings](https://app.1tx.fi/settings). |
-| `SIGNER_MODE` | `local-eoa` (default), `remote`, or `safe`. |
-| `ONE_TX_PRIVATE_KEY` | Funded EOA key; required only for `local-eoa`. |
+| `SIGNER_ACCOUNT` | `eoa` (default) or `safe` — what holds the funds. |
+| `SIGNER_SUBMISSION` | `rpc` (default) or `erc4337-paymaster` — how the tx reaches the chain. |
+| `SIGNER_OWNER` | `local` (default) or `remote` — where the signing key lives. |
+| `ONE_TX_PRIVATE_KEY` | Funded EOA key; required only for a local-key EOA over RPC. |
 | `RPC_URL_<chainId>` | Override the built-in public RPC for a chain (required for broadcast). |
 | `ONE_TX_SLIPPAGE_BPS`, `ONE_TX_FAST_TRANSFER` | 1Tx transaction options. |
 
-Secrets may be dotenvx-encrypted at rest; this package does not decrypt `.env` itself. At-rest encryption does not hide values from a process that can read the decrypted runtime environment — a leaked key is only truly out of an agent's reach with a `remote` signer enclave or a Safe multisig.
 
 Governance lives in [policy.yaml](policy.yaml) — the allocator's constitution. It defines `allowed` axes (protocols, chains, `asset_categories`, `stablecoin_only`, assets, curators), `caps` (per-instrument / protocol / curator / chain weight, min TVL, max LLTV, max reward dependence), and `gates` (new-instrument approval, autonomous rebalance, max deploy per cycle). Allowlists are narrowing filters over discovery (`null` = all); they never replace discovery.
 

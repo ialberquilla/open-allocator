@@ -17,6 +17,7 @@ The registered CLI commands are exactly:
 
 <!-- command-inventory:start -->
 - `wallet-status`
+- `safe-address`
 - `list-vaults`
 - `score-vault`
 - `build-allocation`
