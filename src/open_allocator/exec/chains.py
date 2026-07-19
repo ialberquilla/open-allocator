@@ -11,6 +11,10 @@ RPC_ENV_PREFIX = "RPC_URL_"
 class ChainInfo:
     name: str
     rpc_url: str | None
+    # Whether the Safe Singleton Factory reaches this chain, so a Safe derived
+    # from one seed lands on the same address here as everywhere else. False for
+    # non-standard-CREATE chains (zkSync-Era-type), where the guarantee breaks.
+    deterministic_safe: bool = True
 
 
 # Static chain data is display/default-RPC configuration only. It must never be
@@ -22,9 +26,16 @@ DEFAULT_CHAINS: Mapping[int, ChainInfo] = {
     100: ChainInfo("Gnosis", "https://gnosis-rpc.publicnode.com"),
     130: ChainInfo("Unichain", "https://unichain-rpc.publicnode.com"),
     137: ChainInfo("Polygon", "https://polygon-bor-rpc.publicnode.com"),
+    143: ChainInfo("Monad", "https://rpc.monad.xyz"),
     146: ChainInfo("Sonic", "https://sonic-rpc.publicnode.com"),
     250: ChainInfo("Fantom", "https://fantom-rpc.publicnode.com"),
-    324: ChainInfo("zkSync Era", "https://zksync-era-rpc.publicnode.com"),
+    # zkSync Era derives contract addresses differently, so a Safe from the same
+    # seed lands elsewhere here. Scorable and depositable, just not same-address.
+    324: ChainInfo(
+        "zkSync Era",
+        "https://zksync-era-rpc.publicnode.com",
+        deterministic_safe=False,
+    ),
     480: ChainInfo("World Chain", "https://worldchain.drpc.org"),
     1101: ChainInfo("Polygon zkEVM", "https://polygon-zkevm-rpc.publicnode.com"),
     1868: ChainInfo("Soneium", "https://soneium.drpc.org"),
@@ -73,6 +84,19 @@ def chain_name(chain_id: int) -> str:
     if info is not None:
         return info.name
     return f"chain {chain_id}"
+
+
+def supports_deterministic_safe(chain_id: int) -> bool:
+    """Whether a same-address Safe can be derived for this chain.
+
+    Unknown chains are given the benefit of the doubt: this is a capability
+    hint, never a universe gate, and the authoritative check is whether the
+    factory actually has code on the chain (see safe_deployment).
+    """
+    info = DEFAULT_CHAINS.get(chain_id)
+    if info is None:
+        return True
+    return info.deterministic_safe
 
 
 def rpc_overrides_from_env(env: Mapping[str, str]) -> dict[int, str]:

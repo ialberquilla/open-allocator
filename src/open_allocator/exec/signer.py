@@ -9,6 +9,7 @@ from web3 import HTTPProvider, Web3
 from web3.exceptions import ContractLogicError, Web3Exception
 
 from open_allocator.core.types import FrozenModel, TxStep
+from open_allocator.exec.composition import SignerComposition, composition_from_config
 
 
 class Receipt(FrozenModel):
@@ -36,6 +37,16 @@ class Receipt(FrozenModel):
 
 class SignerError(RuntimeError):
     pass
+
+
+class UnsupportedComposition(SignerError):
+    def __init__(self, composition: SignerComposition, reason: str) -> None:
+        self.composition = composition
+        super().__init__(
+            f"unsupported signer composition "
+            f"(account={composition.account}, submission={composition.submission}, "
+            f"owner={composition.owner_signer}): {reason}"
+        )
 
 
 class TransactionBuildError(SignerError):
@@ -135,22 +146,36 @@ def signer_from_config(
     *,
     web3_factory: Web3Factory | None = None,
 ) -> Signer:
-    mode = getattr(config, "signer_mode", None)
-    if mode == "local-eoa":
-        return LocalEoaSigner(config, web3_factory=web3_factory)
-    if mode == "remote":
-        from open_allocator.exec.remote_signer import RemoteSigner
+    composition = composition_from_config(config)
 
-        return RemoteSigner(config, web3_factory=web3_factory)
-    if mode == "safe":
+    if composition.submission == "erc4337-paymaster":
+        from open_allocator.exec.erc4337_paymaster import Erc4337PaymasterSigner
+
+        # safe + erc4337-paymaster works: every Safe this repo derives is
+        # 4337-enabled at setup (safe_deployment.Safe4337Wiring), so the module
+        # is already there to receive validateUserOp. On the 4337 axis "eoa"
+        # names a non-Safe smart account — a userOp has no EOA sender.
+        return Erc4337PaymasterSigner(
+            config,
+            account_type="safe" if composition.account == "safe" else "smart-account",
+        )
+
+    if composition.account == "safe":
+        if composition.owner_signer == "remote":
+            raise UnsupportedComposition(
+                composition,
+                "a Safe owned by a remote signer is not wired up yet (task 06-04)",
+            )
         from open_allocator.exec.safe_signer import SafeSigner
 
         return SafeSigner(config)
-    if mode == "erc4337-paymaster":
-        from open_allocator.exec.erc4337_paymaster import Erc4337PaymasterSigner
 
-        return Erc4337PaymasterSigner(config)
-    raise ValueError(f"unknown signer mode: {mode!r}")
+    if composition.owner_signer == "remote":
+        from open_allocator.exec.remote_signer import RemoteSigner
+
+        return RemoteSigner(config, web3_factory=web3_factory)
+
+    return LocalEoaSigner(config, web3_factory=web3_factory)
 
 
 def _http_web3(rpc_url: str) -> Web3:

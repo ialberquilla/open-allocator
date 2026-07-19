@@ -31,7 +31,7 @@ from open_allocator.core.types import (
     Vault,
     VaultScore,
 )
-from open_allocator.exec import chains
+from open_allocator.exec import chains, safe_deployment
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
 
@@ -621,6 +621,60 @@ def _wallet_status_payload() -> JsonObject:
     }
 
 
+def _safe_seed_from_config(config: AllocatorConfig) -> safe_deployment.SafeSeed:
+    if config.safe_owners is None or config.safe_threshold is None:
+        raise ValueError(
+            "safe-address needs SAFE_OWNERS + SAFE_THRESHOLD to derive the "
+            "counterfactual address"
+        )
+    return safe_deployment.SafeSeed(
+        owners=config.safe_owners,
+        threshold=config.safe_threshold,
+        salt_nonce=config.safe_salt_nonce,
+    )
+
+
+def _safe_address_payload(chain_ids: tuple[int, ...] | None) -> JsonObject:
+    from web3 import HTTPProvider, Web3
+
+    config = AllocatorConfig()
+    if config.account != "safe":
+        raise ValueError("safe-address requires SIGNER_ACCOUNT=safe")
+
+    targets = chain_ids or (
+        (config.safe_chain_id,) if config.safe_chain_id is not None else ()
+    )
+    if not targets:
+        raise ValueError("no chain to report; pass --chain or set SAFE_CHAIN_ID")
+
+    seed = _safe_seed_from_config(config)
+    predicted: str | None = config.safe_address
+    per_chain: list[JsonObject] = []
+
+    for chain_id in targets:
+        entry: JsonObject = {"chain_id": chain_id, "chain": chains.chain_name(chain_id)}
+        try:
+            rpc_url = chains.require_rpc_url(chain_id, config)
+            w3 = Web3(HTTPProvider(rpc_url))
+            status = safe_deployment.deployment_status(w3, seed, chain_id=chain_id)
+            entry["address"] = status.address
+            entry["deployed"] = status.deployed
+            predicted = predicted or status.address
+        except Exception as error:
+            entry["error"] = str(error)
+            entry["deployed"] = None
+        per_chain.append(entry)
+
+    return {
+        "address": predicted,
+        "owners": list(seed.owners),
+        "threshold": seed.threshold,
+        "salt_nonce": seed.salt_nonce,
+        "safe_version": safe_deployment.SAFE_VERSION,
+        "chains": per_chain,
+    }
+
+
 def _positions_payload(address: str | None) -> JsonObject:
     if address is None:
         config = AllocatorConfig()
@@ -931,6 +985,20 @@ def _screen_criteria(
 @json_command
 def wallet_status() -> JsonObject:
     return _wallet_status_payload()
+
+
+@app.command("safe-address")
+@json_command
+def safe_address(
+    chain: Annotated[
+        list[int] | None,
+        typer.Option(
+            "--chain",
+            help="Chain to report; repeatable. Defaults to SAFE_CHAIN_ID.",
+        ),
+    ] = None,
+) -> JsonObject:
+    return _safe_address_payload(tuple(chain) if chain else None)
 
 
 @app.command("list-vaults")

@@ -464,7 +464,14 @@ def test_paymaster_mode_builds_user_operation_without_native_gas_check() -> None
     )
 
     assert report.gas_checks[0].required_wei == 0
-    assert report.gas_checks[0].message == "USDC paymaster configured on chain 8453"
+    # No static surcharge is quoted: Pimlico's fee lives inside the exchangeRate
+    # from pimlico_getTokenQuotes, so preflight names where the cost comes from
+    # rather than inventing a percentage. (The old message claimed "+10%" on
+    # Base and nothing elsewhere, which understated 14 of 16 chains.)
+    assert report.gas_checks[0].message == (
+        "gas paid in USDC via pimlico on chain 8453 "
+        "(rate quoted at submission, provider fee included)"
+    )
     assert len(adapter.requests) == 1
     request = adapter.requests[0]
     assert request.sender == signer.address()

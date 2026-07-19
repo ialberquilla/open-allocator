@@ -267,6 +267,28 @@ def test_safe_signer_config_requires_safe_fields(
     assert missing in str(error.value)
 
 
+def test_a_safe_paying_gas_in_usdc_needs_no_transaction_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_safe_env(monkeypatch)
+    set_valid_paymaster_env(monkeypatch)
+    monkeypatch.delenv("ONE_TX_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("SIGNER_MODE", raising=False)
+    monkeypatch.setenv("SIGNER_ACCOUNT", "safe")
+    monkeypatch.setenv("SIGNER_SUBMISSION", "erc4337-paymaster")
+    monkeypatch.setenv("SIGNER_OWNER", "local")
+    monkeypatch.delenv("SAFE_TRANSACTION_SERVICE_URL")
+
+    # The Safe Transaction Service carries 05-01's propose → co-sign → execute
+    # flow, which a userOp does not use — it goes to the bundler. Requiring the
+    # URL here would demand config for a service this composition never calls.
+    config = AllocatorConfig()
+
+    assert config.account == "safe"
+    assert config.submission == "erc4337-paymaster"
+    assert config.safe_transaction_service_url is None
+
+
 def test_safe_signer_config_validates_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -316,6 +338,88 @@ def test_paymaster_config_requires_paymaster_fields(
         AllocatorConfig()
 
     assert missing in str(error.value)
+
+
+def set_valid_pimlico_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The minimum a Pimlico user should have to supply.
+
+    Deliberately no bundler URL, paymaster URL, account address or entry point:
+    Pimlico derives its endpoint from the key, the Safe from the seed, and the
+    EntryPoint from the registry.
+    """
+    monkeypatch.setenv("ONE_TX_API_URL", "http://localhost:3001/api/v1")
+    monkeypatch.setenv("ONE_TX_API_KEY", "test-api-key")
+    monkeypatch.setenv("SIGNER_ACCOUNT", "safe")
+    monkeypatch.setenv("SIGNER_SUBMISSION", "erc4337-paymaster")
+    monkeypatch.setenv("SIGNER_OWNER", "local")
+    monkeypatch.setenv("SAFE_CHAIN_ID", "8453")
+    monkeypatch.setenv("SAFE_OWNERS", "0x0000000000000000000000000000000000000abc")
+    monkeypatch.setenv("SAFE_THRESHOLD", "1")
+    monkeypatch.setenv("ONE_TX_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("PAYMASTER_PROVIDER", "pimlico")
+    monkeypatch.setenv("PAYMASTER_ACCOUNT_TYPE", "safe")
+    monkeypatch.setenv("PIMLICO_API_KEY", "pim_test_key")
+    monkeypatch.setenv(
+        "PAYMASTER_USDC_ADDRESS",
+        "0x0000000000000000000000000000000000000c0c",
+    )
+
+
+def test_pimlico_needs_no_bundler_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pimlico's endpoint embeds the chain id, so one URL cannot serve a
+    multi-chain deployment — the API key is the unit of config. Requiring a
+    bundler URL here made PAYMASTER_PROVIDER=pimlico unusable."""
+    set_valid_pimlico_env(monkeypatch)
+
+    config = AllocatorConfig()
+
+    assert config.paymaster_provider == "pimlico"
+    assert config.paymaster_bundler_url is None
+
+
+def test_pimlico_requires_its_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_valid_pimlico_env(monkeypatch)
+    monkeypatch.delenv("PIMLICO_API_KEY")
+
+    with pytest.raises(ValidationError) as error:
+        AllocatorConfig()
+
+    assert "PIMLICO_API_KEY" in str(error.value)
+
+
+def test_pimlico_still_requires_the_gas_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing can derive which token the user wants to pay gas in."""
+    set_valid_pimlico_env(monkeypatch)
+    monkeypatch.delenv("PAYMASTER_USDC_ADDRESS")
+
+    with pytest.raises(ValidationError) as error:
+        AllocatorConfig()
+
+    assert "PAYMASTER_USDC_ADDRESS" in str(error.value)
+
+
+def test_generic_http_still_requires_its_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Loosening pimlico's requirements must not loosen generic-http's."""
+    set_valid_paymaster_env(monkeypatch)
+    monkeypatch.delenv("PAYMASTER_BUNDLER_URL")
+
+    with pytest.raises(ValidationError) as error:
+        AllocatorConfig()
+
+    assert "PAYMASTER_BUNDLER_URL" in str(error.value)
+
+
+def test_a_bad_paymaster_account_address_is_still_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Optional for pimlico, but still validated when supplied."""
+    set_valid_pimlico_env(monkeypatch)
+    monkeypatch.setenv("PAYMASTER_ACCOUNT_ADDRESS", "not-an-address")
+
+    with pytest.raises(ValidationError) as error:
+        AllocatorConfig()
+
+    assert "PAYMASTER_ACCOUNT_ADDRESS" in str(error.value)
 
 
 @pytest.mark.parametrize("env_name", ["PAYMASTER_BUNDLER_URL", "PAYMASTER_URL"])

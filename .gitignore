@@ -1,5 +1,4 @@
 # Secrets / local environment
-.env.keys
 .env
 .env.*
 !.env.example
@@ -33,3 +32,4 @@ dist/
 *.swp
 *.swo
 plan*.md
+notes/
