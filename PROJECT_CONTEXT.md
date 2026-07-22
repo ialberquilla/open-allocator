@@ -31,11 +31,13 @@ The intended policy surface includes allowed protocols, chains, assets, and cura
 
 ## Self-Custody Execution Model
 
-Users control the wallet. The v1 signer is a normal EOA; later signer backends can wrap the same transaction plan for a remote signer or Safe multisig.
+Users control the wallet. The signer is composed from three independent axes — what holds the funds (`eoa` or `safe`), how the transaction reaches the chain (`rpc` or `erc4337-paymaster`), and where the key lives (`local` or `remote`).
 
 - 1Tx transaction builders produce calldata.
 - The wallet signs and broadcasts through configured RPC endpoints.
-- The wallet pays native gas on every chain it signs on — source chains for deposits, the position's chain for exits.
+- How gas is paid depends on the submission axis:
+  - `rpc` — the wallet pays native gas on every chain it signs on: source chains for deposits, the position's chain for exits.
+  - `erc4337-paymaster` — gas is paid in USDC by the smart account, so no chain needs native gas. See [docs/gasless-execution.md](docs/gasless-execution.md).
 - USDC is sourced from whichever chain the wallet is funded on; the destination chain is encoded in the `instrumentId` and 1Tx bridges (CCTP) automatically. See [docs/funding-and-bridging.md](docs/funding-and-bridging.md).
 - Execution commands are gated by `--confirm` or explicit `--unsafe` / `--autonomous` flags.
 
@@ -46,3 +48,4 @@ Users control the wallet. The v1 signer is a normal EOA; later signer backends c
 - Policy violations abort before any transaction is built or signed.
 - Agents must announce exact vaults, chains, amounts, risks, and expected transactions before asking for confirmation.
 - ERC-4626 exits use share balances, not USDC value guesses.
+- A smart account submits a plan's steps for one chain as a single atomic operation. This is not an optimisation: the paymaster charges after execution, so batching is what lets an exit pay its gas out of what it just redeemed. Splitting a plan back into one operation per step breaks gasless exits.

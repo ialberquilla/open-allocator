@@ -42,10 +42,18 @@ class PaymasterUserOperationRequest(FrozenModel):
     sender: str
     chain_id: int
     entry_point: str
-    call_data: UserOperationCall
+    # A sequence because a smart account can batch: the calls of one plan ride in
+    # a single operation, so the gas the paymaster pulls in postOp can be paid
+    # out of USDC the same operation just produced.
+    calls: tuple[UserOperationCall, ...] = Field(min_length=1)
     gas_token: Literal["USDC"] = "USDC"
     gas_token_address: str
     account_type: Literal["smart-account", "safe"] = "smart-account"
+
+    @property
+    def call_data(self) -> UserOperationCall:
+        """The first call — the whole operation when it is not a batch."""
+        return self.calls[0]
 
 
 class PaymasterUserOperationSubmission(FrozenModel):
@@ -104,15 +112,33 @@ class Erc4337PaymasterSigner:
         return self._require_adapter().address()
 
     def send(self, tx: TxStep, rpc_url: str) -> Receipt:
+        return self.send_batch((tx,), rpc_url)
+
+    def send_batch(self, steps: Sequence[TxStep], rpc_url: str) -> Receipt:
+        """Every step in one user operation, atomically.
+
+        This is what makes a gasless exit self-funding: the paymaster charges in
+        postOp, after execution, so a batch that redeems into the account can pay
+        its own gas out of the proceeds. Sent one at a time, the first step is an
+        approval that produces nothing and the charge has to come from a balance
+        the account does not have.
+        """
         _ = rpc_url
+        if not steps:
+            raise PaymasterConfigurationError("a user operation needs a step")
+        chain_ids = {step.chain_id for step in steps}
+        if len(chain_ids) != 1:
+            raise PaymasterConfigurationError(
+                f"one user operation cannot span chains {sorted(chain_ids)}"
+            )
+        tx = steps[0]
         request = PaymasterUserOperationRequest(
             sender=self.address(),
             chain_id=tx.chain_id,
             entry_point=self._required_entry_point(),
-            call_data=UserOperationCall(
-                to=tx.to,
-                data=tx.data,
-                value=tx.value,
+            calls=tuple(
+                UserOperationCall(to=step.to, data=step.data, value=step.value)
+                for step in steps
             ),
             gas_token_address=self._required_usdc_address(tx.chain_id),
             account_type=self._account_type,
@@ -124,7 +150,9 @@ class Erc4337PaymasterSigner:
             gas_used=submission.gas_used,
             status=1 if submission.status == "included" else 0,
             from_address=request.sender,
-            to_address=tx.to,
+            # The last step is the action the batch exists for; the ones before
+            # it are approvals clearing its path.
+            to_address=steps[-1].to,
             pending=submission.status == "submitted",
             execution_status="user_operation_submitted",
             safe_tx_hash=(
@@ -310,10 +338,11 @@ def validate_paymaster_preflight(
             "paymaster configuration is required for ERC-4337 paymaster mode"
         )
 
-    bundler_url = _required_config_value(config, "paymaster_bundler_url")
-    _required_config_value(config, "paymaster_url")
-    _required_config_value(config, "paymaster_account_address")
-    _required_config_value(config, "paymaster_entry_point")
+    # Pimlico configures none of these: its endpoint embeds the chain id and is
+    # derived from the API key, the Safe from the seed, the EntryPoint from the
+    # registry. Demanding them here made PAYMASTER_PROVIDER=pimlico unreachable
+    # from execute, even though config validation had stopped requiring them.
+    bundler_urls = _preflight_endpoints(config, chain_ids)
 
     # An explicit allowlist still wins, for pinning a deployment to known chains.
     supported_chain_ids = _supported_chain_ids(config)
@@ -329,6 +358,26 @@ def validate_paymaster_preflight(
         # on its third chain must fail before the first two are broadcast.
         require_usdc_address(config, chain_id)
 
+    return bundler_urls
+
+
+def _preflight_endpoints(
+    config: object,
+    chain_ids: Sequence[int],
+) -> dict[int, str]:
+    if getattr(config, "paymaster_provider", None) == "pimlico":
+        _required_config_value(config, "pimlico_api_key")
+        # Key-free: the real URL carries the API key in its query string, and
+        # this value travels into execution where it could be logged.
+        return {
+            chain_id: paymaster_registry.PIMLICO_RPC_TEMPLATE.format(chain_id=chain_id)
+            for chain_id in chain_ids
+        }
+
+    bundler_url = _required_config_value(config, "paymaster_bundler_url")
+    _required_config_value(config, "paymaster_url")
+    _required_config_value(config, "paymaster_account_address")
+    _required_config_value(config, "paymaster_entry_point")
     return {chain_id: bundler_url for chain_id in chain_ids}
 
 

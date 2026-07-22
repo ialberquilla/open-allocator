@@ -33,3 +33,7 @@ dist/
 *.swo
 plan*.md
 notes/
+
+# Live-run scratch artifacts (real funds; not part of the shipped repo)
+policy-live-*.yaml
+allocation-live-*.json

@@ -28,7 +28,11 @@ from open_allocator.exec.erc4337_paymaster import (
     PaymasterUserOperationSubmission,
     validate_paymaster_preflight,
 )
-from open_allocator.exec.execute import GasCheck, execute_allocation
+from open_allocator.exec.execute import (
+    GasCheck,
+    execute_allocation,
+    supports_batching,
+)
 from open_allocator.exec.remote_signer import (
     GenericHttpRemoteSignerAdapter,
     RemoteSignerPolicyRejected,
@@ -866,3 +870,75 @@ class FakeWeb3:
 
     def to_checksum_address(self, value: str) -> str:
         return Web3.to_checksum_address(value)
+
+
+@dataclass(frozen=True)
+class PimlicoExecutorConfig:
+    """What a Pimlico user actually sets: a key, a Safe, and nothing else."""
+
+    signer_mode: str = "erc4337-paymaster"
+    paymaster_provider: str = "pimlico"
+    paymaster_account_type: str = "safe"
+    pimlico_api_key: str = "pim_test_key"
+
+
+def test_preflight_derives_pimlico_endpoints_from_the_api_key() -> None:
+    """Requiring a bundler URL here made PAYMASTER_PROVIDER=pimlico unreachable
+    from execute: its endpoint embeds the chain id and comes from the key."""
+    endpoints = validate_paymaster_preflight(PimlicoExecutorConfig(), (8453, 42161))
+
+    assert endpoints == {
+        8453: "https://api.pimlico.io/v2/8453/rpc",
+        42161: "https://api.pimlico.io/v2/42161/rpc",
+    }
+    assert not any("pim_test_key" in url for url in endpoints.values())
+
+
+def test_preflight_requires_the_pimlico_key() -> None:
+    with pytest.raises(PaymasterConfigurationError, match="PIMLICO_API_KEY"):
+        validate_paymaster_preflight(
+            PimlicoExecutorConfig(pimlico_api_key=None),  # type: ignore[arg-type]
+            (8453,),
+        )
+
+
+# --- batching at the signer seam --------------------------------------------
+
+
+def test_a_smart_account_puts_a_whole_plan_in_one_operation() -> None:
+    adapter = MockPaymasterAdapter()
+    signer = Erc4337PaymasterSigner(
+        adapter=adapter,
+        entry_point="0x0000000000000000000000000000000000004337",
+        config=PaymasterExecutorConfig(),
+    )
+    approve = paymaster_step(8453).model_copy(update={"kind": "approve"})
+    sell = paymaster_step(8453).model_copy(
+        update={"to": "0x00000000000000000000000000000000000000cc", "kind": "sell"}
+    )
+
+    receipt = signer.send_batch((approve, sell), "rpc://base")
+
+    assert len(adapter.requests) == 1
+    assert [call.to for call in adapter.requests[0].calls] == [approve.to, sell.to]
+    # The action the batch exists for, not the approval clearing its path.
+    assert receipt.to_address == sell.to
+
+
+def test_one_operation_cannot_span_two_chains() -> None:
+    signer = Erc4337PaymasterSigner(
+        adapter=MockPaymasterAdapter(),
+        entry_point="0x0000000000000000000000000000000000004337",
+        config=PaymasterExecutorConfig(),
+    )
+
+    with pytest.raises(PaymasterConfigurationError, match="cannot span chains"):
+        signer.send_batch(
+            (paymaster_step(8453), paymaster_step(42161)),
+            "rpc://base",
+        )
+
+
+def test_an_eoa_signer_is_not_asked_to_batch() -> None:
+    """An EOA has no batching primitive, so the loop must stay sequential."""
+    assert supports_batching(LocalEoaSigner.__new__(LocalEoaSigner)) is False

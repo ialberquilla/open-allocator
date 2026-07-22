@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -17,6 +18,7 @@ from open_allocator.exec import (
 )
 from open_allocator.exec.erc4337_paymaster import (
     PaymasterConfigurationError,
+    PaymasterError,
     PaymasterUnsupportedChain,
     PaymasterUserOperationRequest,
     PaymasterUserOperationSubmission,
@@ -35,6 +37,12 @@ from open_allocator.exec.user_operation import (
 # This is the piece that makes PAYMASTER_PROVIDER=pimlico reachable from the CLI.
 # The lower-level modules (pimlico, user_operation, safe_4337_signature) were each
 # usable on their own; nothing connected them to signer_from_config.
+
+_GAS_LIMIT_PLACEHOLDERS = {
+    "callGasLimit": "0x0",
+    "verificationGasLimit": "0x0",
+    "preVerificationGas": "0x0",
+}
 
 
 class PimlicoUserOperationAdapter:
@@ -57,6 +65,9 @@ class PimlicoUserOperationAdapter:
         module: str = safe_deployment.SAFE_4337_MODULE,
         http_client: httpx.Client | None = None,
         web3_factory: Callable[[str], Web3] | None = None,
+        inclusion_timeout_s: float = 120.0,
+        poll_interval_s: float = 2.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not api_key:
             raise PaymasterConfigurationError(
@@ -92,6 +103,9 @@ class PimlicoUserOperationAdapter:
         self._http_client = http_client
         self._web3_factory = web3_factory or _default_web3
         self._cached_address: str | None = account_address
+        self._inclusion_timeout_s = inclusion_timeout_s
+        self._poll_interval_s = poll_interval_s
+        self._sleep = sleep
 
     def __repr__(self) -> str:
         return "PimlicoUserOperationAdapter(provider=pimlico, key=<redacted>)"
@@ -146,11 +160,10 @@ class PimlicoUserOperationAdapter:
         # is authoritative at submission time and the constant is only a fallback.
         quote = pimlico.token_quote(token)
         calls = paymaster_calls(
-            Call(
-                to=request.call_data.to,
-                data=request.call_data.data,
-                value=request.call_data.value,
-            ),
+            [
+                Call(to=call.to, data=call.data, value=call.value)
+                for call in request.calls
+            ],
             token=token,
             paymaster=quote.paymaster,
         )
@@ -164,6 +177,10 @@ class PimlicoUserOperationAdapter:
             signature=safe_4337_signature.dummy_signature(len(self._owner_keys)),
         )
         user_op.update(_hex_values(pimlico.gas_price()))
+        # pm_getPaymasterStubData rejects a userOp whose gas limits are absent,
+        # but the limits come from an estimate that needs the stub first. Seed
+        # zeros to break the cycle — the estimate below overwrites all three.
+        user_op.update(_GAS_LIMIT_PLACEHOLDERS)
         user_op.update(
             _hex_values(pimlico.estimate_gas(pimlico.stub_data(user_op, token=token)))
         )
@@ -180,15 +197,40 @@ class PimlicoUserOperationAdapter:
         )
 
         user_op_hash = pimlico.send(signed)
-        return PaymasterUserOperationSubmission(
-            user_op_hash=user_op_hash,
-            status="submitted",
-            message=(
-                f"user operation submitted via Pimlico on "
-                f"{chains.chain_name(chain_id)}, gas paid in USDC"
-                + ("" if deployed else "; deploys the Safe in this operation")
-            ),
+        message = (
+            f"user operation submitted via Pimlico on "
+            f"{chains.chain_name(chain_id)}, gas paid in USDC"
+            + ("" if deployed else "; deploys the Safe in this operation")
         )
+
+        # Wait for it: the next operation from this Safe reads the nonce and the
+        # deployment status from the chain, and both are wrong until this one is
+        # mined — the second op re-sends the factory and the EntryPoint rejects
+        # it with AA10. Ops from one sender are sequential whether we like it or
+        # not.
+        included = self._await_inclusion(pimlico, user_op_hash)
+        if included is None:
+            return PaymasterUserOperationSubmission(
+                user_op_hash=user_op_hash,
+                status="submitted",
+                message=f"{message}; still pending after "
+                f"{self._inclusion_timeout_s:.0f}s",
+            )
+        return _submission_from_receipt(user_op_hash, included, message)
+
+    def _await_inclusion(
+        self,
+        pimlico: PimlicoPaymasterAdapter,
+        user_op_hash: str,
+    ) -> Mapping[str, Any] | None:
+        deadline = time.monotonic() + self._inclusion_timeout_s
+        while True:
+            receipt = pimlico.receipt(user_op_hash)
+            if receipt is not None:
+                return receipt
+            if time.monotonic() >= deadline:
+                return None
+            self._sleep(self._poll_interval_s)
 
     def _sender(self, w3: Web3, chain_id: int) -> tuple[str, bool]:
         """The Safe and whether it already exists.
@@ -252,6 +294,44 @@ class PimlicoUserOperationAdapter:
 
     def _web3(self, rpc_url: str) -> Web3:
         return self._web3_factory(rpc_url)
+
+
+def _submission_from_receipt(
+    user_op_hash: str,
+    receipt: Mapping[str, Any],
+    message: str,
+) -> PaymasterUserOperationSubmission:
+    inner = receipt.get("receipt")
+    inner = inner if isinstance(inner, Mapping) else {}
+    if receipt.get("success") is False:
+        # Included and reverted still costs the user gas, so it must not read as
+        # a success anywhere downstream.
+        reason = receipt.get("reason") or "no reason given"
+        raise PaymasterError(
+            f"user operation {user_op_hash} reverted on chain: {reason}"
+        )
+    return PaymasterUserOperationSubmission(
+        user_op_hash=user_op_hash,
+        transaction_hash=_optional_str(inner.get("transactionHash")),
+        status="included",
+        block_number=_optional_hex_int(inner.get("blockNumber")),
+        gas_used=_optional_hex_int(
+            inner.get("gasUsed", receipt.get("actualGasUsed")),
+        ),
+        message=message,
+    )
+
+
+def _optional_str(value: object) -> str | None:
+    return str(value) if isinstance(value, str) and value else None
+
+
+def _optional_hex_int(value: object) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value:
+        return int(value, 16 if value.startswith("0x") else 10)
+    return 0
 
 
 def _default_web3(rpc_url: str) -> Web3:

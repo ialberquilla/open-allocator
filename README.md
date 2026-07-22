@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-338%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-530%20passing-brightgreen.svg)](#development)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
 
 [Install](#install) · [Talking to Your Agent](#talking-to-your-agent) · [Commands](#commands) · [Safety](#safety) · [Disclaimer](#disclaimer)
@@ -28,7 +28,7 @@ This is an end-user allocator, not Morpho's curator-side Allocator role.
 - **Transparent scoring** — every allocation and risk score maps to visible inputs. Unknown fields stay `Unknown` instead of being guessed.
 - **Policy-bounded execution** — allowlists and caps block unsafe proposals before signing. Policy can only tighten, never loosen.
 - **CLI-first** — agents and humans use the same JSON-out commands. Every command prints one JSON object to stdout.
-- **Self-custody** — the wallet signs and broadcasts its own transactions and pays its own gas.
+- **Self-custody, and gasless** — the wallet signs and broadcasts its own transactions. With a Safe smart account it pays gas in **USDC** instead of native tokens, so you fund one chain and never top up ETH anywhere.
 
 ## How It Works
 
@@ -97,6 +97,7 @@ Every command emits one JSON object on stdout; errors emit one JSON object on st
 
 ```bash
 uv run open-allocator wallet-status                 # address, USDC + native-gas readiness per chain
+uv run open-allocator safe-address                  # the derived Safe: same address on every chain
 uv run open-allocator list-vaults --sort score      # discover + score the live universe
 uv run open-allocator score-vault --instrument-id <id>
 uv run open-allocator positions                     # reconcile current on-chain holdings
@@ -125,6 +126,18 @@ uv run open-allocator withdraw  --position <id> --confirm
 
 Without `--confirm`, execution commands return a plan / dry-run report and broadcast nothing. `execute --confirm` is the spend path. Exits are share-denominated (ERC-4626 shares, not USDC guesses).
 
+## Gas in USDC (no native tokens)
+
+Set `SIGNER_ACCOUNT=safe` and `SIGNER_SUBMISSION=erc4337-paymaster` and the allocator runs from a **Safe smart account that pays its own gas in USDC**:
+
+- The Safe is **counterfactual** — derived from your owner list, the same address on every chain, and it deploys itself inside its first operation on each chain. Nothing to create up front.
+- A chain's plan steps go out as **one atomic operation**. Because the paymaster charges after execution, an exit pays its gas out of the USDC it just redeemed — on a chain where the Safe held nothing at all.
+- Cross-chain deposits bridge over CCTP and land the position without deploying anything on the destination.
+
+Net effect: **fund one chain**. Deposits bridge out, exits pay their own way back, and no chain ever needs native gas.
+
+This path has been exercised end to end on Base and Arbitrum mainnet. The model, the traps, and its known limits are in [docs/gasless-execution.md](docs/gasless-execution.md).
+
 ## Agent Operation
 
 Agents start with [AGENT_GUIDE.md](AGENT_GUIDE.md), the operating contract for this repository. Shared architecture and invariants are in [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md); the original implementation plan is in [plan_allocator.md](plan_allocator.md).
@@ -146,7 +159,7 @@ Stage skills and workflow graphs describe how to drive the CLI and review artifa
 
 ```bash
 uv run ruff check
-uv run pytest            # 338 passed, 4 integration tests skipped without live creds
+uv run pytest            # 530 passed, 3 integration tests skipped without live creds
 ```
 
 Unit tests mock 1Tx over `httpx.MockTransport` and the chain over `eth-tester`; no live network is touched. Live API/RPC tests are opt-in behind `@pytest.mark.integration` and explicit credential gates.

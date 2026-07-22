@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, overload, runtime_checkable
+from typing import Any, Literal, Protocol, overload, runtime_checkable
 
 from pydantic import Field
 from web3 import HTTPProvider, Web3
@@ -211,23 +212,25 @@ def execute_allocation(
 
     execution_steps: list[ExecutionStepReport] = []
     receipts: list[Receipt] = []
-    for ref in step_refs:
-        if _store_completed(idempotency_store, ref.idempotency_key):
-            execution_steps.append(
-                ExecutionStepReport(
-                    leg_index=ref.leg_index,
-                    step_index=ref.step_index,
-                    instrument_id=ref.instrument_id,
-                    status="skipped",
-                    step=ref.step,
-                    idempotency_key=ref.idempotency_key,
+    for group in submission_groups(step_refs, idempotency_store, signer):
+        if group.completed:
+            for ref in group.refs:
+                execution_steps.append(
+                    ExecutionStepReport(
+                        leg_index=ref.leg_index,
+                        step_index=ref.step_index,
+                        instrument_id=ref.instrument_id,
+                        status="skipped",
+                        step=ref.step,
+                        idempotency_key=ref.idempotency_key,
+                    )
                 )
-            )
-            _mark_leg_if_complete(ref, step_refs, idempotency_store)
+                _mark_leg_if_complete(ref, step_refs, idempotency_store)
             continue
 
+        ref = group.refs[0]
         try:
-            receipt = signer.send(ref.step, rpc_urls[ref.step.chain_id])
+            receipt = submit_steps(signer, group.refs, rpc_urls[ref.step.chain_id])
         except PaymasterError:
             raise
         except Exception as error:
@@ -254,21 +257,24 @@ def execute_allocation(
                 partial_report=partial_report,
             ) from error
 
+        # One receipt per operation, shared by every step that rode in it: the
+        # batch is atomic, so they all landed in the same transaction or none did.
         receipts.append(receipt)
-        _store_mark_completed(idempotency_store, ref.idempotency_key, receipt)
-        _append_allocation_log(config, ref, receipt)
-        _mark_leg_if_complete(ref, step_refs, idempotency_store)
-        execution_steps.append(
-            ExecutionStepReport(
-                leg_index=ref.leg_index,
-                step_index=ref.step_index,
-                instrument_id=ref.instrument_id,
-                status="sent",
-                step=ref.step,
-                receipt=receipt,
-                idempotency_key=ref.idempotency_key,
+        for member in group.refs:
+            _store_mark_completed(idempotency_store, member.idempotency_key, receipt)
+            _append_allocation_log(config, member, receipt)
+            _mark_leg_if_complete(member, step_refs, idempotency_store)
+            execution_steps.append(
+                ExecutionStepReport(
+                    leg_index=member.leg_index,
+                    step_index=member.step_index,
+                    instrument_id=member.instrument_id,
+                    status="sent",
+                    step=member.step,
+                    receipt=receipt,
+                    idempotency_key=member.idempotency_key,
+                )
             )
-        )
 
     report = ExecutionReport(
         status="in_progress" if in_progress else "success",
@@ -287,6 +293,57 @@ def execute_allocation(
         completed_keys=_completed_keys(step_refs, execution_steps),
     )
     return report
+
+
+@dataclass(frozen=True)
+class SubmissionGroup:
+    """Steps that go out together, and whether they are already done."""
+
+    refs: tuple[Any, ...]
+    completed: bool
+
+
+def supports_batching(signer: object) -> bool:
+    """Whether this signer can put several steps in one transaction.
+
+    A smart account can; an EOA cannot, and must keep sending one at a time.
+    """
+    return callable(getattr(signer, "send_batch", None))
+
+
+def submission_groups(
+    step_refs: Sequence[Any],
+    idempotency_store: object,
+    signer: object,
+) -> list[SubmissionGroup]:
+    """Consecutive steps on one chain, batched when the signer allows it.
+
+    Only consecutive runs are merged, so the order the plan was built in — an
+    approval before the call it clears — survives.
+    """
+    batching = supports_batching(signer)
+    groups: list[SubmissionGroup] = []
+    for ref in step_refs:
+        done = _store_completed(idempotency_store, ref.idempotency_key)
+        last = groups[-1] if groups else None
+        joinable = (
+            last is not None
+            and last.completed == done
+            and (done or batching)
+            and last.refs[-1].step.chain_id == ref.step.chain_id
+        )
+        if joinable and last is not None:
+            groups[-1] = SubmissionGroup((*last.refs, ref), done)
+        else:
+            groups.append(SubmissionGroup((ref,), done))
+    return groups
+
+
+def submit_steps(signer: object, refs: Sequence[Any], rpc_url: str) -> Receipt:
+    steps = [ref.step for ref in refs]
+    if len(steps) == 1:
+        return signer.send(steps[0], rpc_url)  # type: ignore[attr-defined]
+    return signer.send_batch(steps, rpc_url)  # type: ignore[attr-defined]
 
 
 class _StepRef(FrozenModel):

@@ -205,3 +205,32 @@ def test_reconcile_computes_buy_and_sell_deltas() -> None:
     assert diff.total_buy_usd == 30
     assert diff.total_sell_usd == 30
     assert diff.deploy_usdc == 0
+
+
+class MockEmptyWalletClient:
+    """A funded wallet that has not deposited yet — no holdings at all."""
+
+    def balances(self, address: str) -> dict[str, object]:
+        return {
+            "address": address,
+            "balances": [],
+            "totalUsdcUsd": "0",
+        }
+
+    def positions(self, body: dict[str, object]) -> dict[str, object]:
+        return {
+            "address": body.get("address"),
+            "chainId": 8453,
+            "usdcBalance": "0",
+            "positions": [],
+        }
+
+
+def test_read_positions_handles_a_wallet_with_no_holdings() -> None:
+    result = read_positions(MockEmptyWalletClient(), ADDRESS)
+
+    assert result.holdings == ()
+    assert result.idle_balances == ()
+    assert result.total_position_usd == 0
+    assert result.total_idle_usdc == 0
+    assert result.total_usd == 0
