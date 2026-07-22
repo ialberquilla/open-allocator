@@ -213,6 +213,8 @@ class AllocatorConfig(BaseSettings):
         None,
         validation_alias="PAYMASTER_ENTRY_POINT",
     )
+    # Legacy single-chain setting. The gas token comes from chains.USDC_ADDRESSES;
+    # this is only a fallback for chains with no row there.
     paymaster_usdc_address: str | None = Field(
         None,
         validation_alias="PAYMASTER_USDC_ADDRESS",
@@ -235,9 +237,13 @@ class AllocatorConfig(BaseSettings):
     )
 
     _rpc_overrides: dict[int, str] = PrivateAttr(default_factory=dict)
+    _usdc_overrides: dict[int, str] = PrivateAttr(default_factory=dict)
 
     def model_post_init(self, __context: object) -> None:
         self._rpc_overrides = chains.rpc_overrides_from_env(os.environ)
+        self._usdc_overrides = chains.usdc_overrides_from_env(os.environ)
+        for chain_id, address in self._usdc_overrides.items():
+            _validate_address(address, f"{chains.USDC_ENV_PREFIX}{chain_id}")
 
     @model_validator(mode="before")
     @classmethod
@@ -419,14 +425,13 @@ class AllocatorConfig(BaseSettings):
             required = "SIGNER_SUBMISSION=erc4337-paymaster"
             _require_axis_value(self.paymaster_provider, "PAYMASTER_PROVIDER", required)
 
-            # The gas token is the one thing every provider needs from the user:
-            # it names what to pay in, and nothing can derive that for them.
-            _require_axis_value(
-                self.paymaster_usdc_address,
-                "PAYMASTER_USDC_ADDRESS",
-                required,
-            )
-            _validate_address(self.paymaster_usdc_address, "PAYMASTER_USDC_ADDRESS")
+            # The gas token is not demanded here: it is per chain, and no chain
+            # is known until a plan exists. Preflight resolves and fails there.
+            if self.paymaster_usdc_address is not None:
+                _validate_address(
+                    self.paymaster_usdc_address,
+                    "PAYMASTER_USDC_ADDRESS",
+                )
 
             if self.paymaster_provider == "pimlico":
                 _require_axis_value(
@@ -473,6 +478,9 @@ class AllocatorConfig(BaseSettings):
 
     def rpc_url(self, chain_id: int) -> str | None:
         return chains.rpc_url(chain_id, self)
+
+    def usdc_address(self, chain_id: int) -> str | None:
+        return chains.usdc_address(chain_id, self)
 
 
 class ReadOnlyOneTxConfig(BaseSettings):

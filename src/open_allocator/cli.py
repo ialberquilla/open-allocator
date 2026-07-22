@@ -62,10 +62,6 @@ def _write_json(payload: JsonValue, *, err: bool = False) -> None:
     typer.echo(json.dumps(payload, separators=(",", ":")), err=err)
 
 
-def _not_implemented() -> JsonObject:
-    return {"status": "not_implemented"}
-
-
 def _execution_plan(command_name: str) -> JsonObject:
     return {
         "status": "plan_required",
@@ -103,14 +99,6 @@ def json_command(
     if func is None:
         return decorator
     return decorator(func)
-
-
-def _execute_executor() -> JsonObject:
-    return _not_implemented()
-
-
-def _rebalance_executor() -> JsonObject:
-    return _not_implemented()
 
 
 def _withdraw_executor(

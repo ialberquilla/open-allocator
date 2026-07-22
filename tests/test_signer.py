@@ -22,8 +22,11 @@ from open_allocator.core.types import (
 )
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
+    PaymasterConfigurationError,
+    PaymasterUnsupportedChain,
     PaymasterUserOperationRequest,
     PaymasterUserOperationSubmission,
+    validate_paymaster_preflight,
 )
 from open_allocator.exec.execute import GasCheck, execute_allocation
 from open_allocator.exec.remote_signer import (
@@ -411,6 +414,104 @@ def test_paymaster_signer_can_wrap_safe_account_at_signer_seam() -> None:
     assert report.receipts[0].execution_status == "user_operation_submitted"
 
 
+def paymaster_step(chain_id: int) -> TxStep:
+    return TxStep(
+        to="0x00000000000000000000000000000000000000bb",
+        data="0x1234",
+        value=0,
+        chain_id=chain_id,
+        kind="buy",
+    )
+
+
+def test_gas_token_is_resolved_per_chain_not_per_run() -> None:
+    """Resolved once at construction, an allocation paid gas with Base's USDC
+    address on Arbitrum — an approval to a contract that is something else."""
+    adapter = MockPaymasterAdapter()
+    signer = Erc4337PaymasterSigner(
+        adapter=adapter,
+        entry_point="0x0000000000000000000000000000000000004337",
+        config=PaymasterExecutorConfig(),
+    )
+
+    signer.send(paymaster_step(8453), "rpc://base")
+    signer.send(paymaster_step(42161), "rpc://arbitrum")
+
+    assert adapter.requests[0].gas_token_address == (
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    )
+    assert adapter.requests[1].gas_token_address == (
+        "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+    )
+
+
+def test_explicit_gas_token_argument_still_pins_every_chain() -> None:
+    adapter = MockPaymasterAdapter()
+    signer = Erc4337PaymasterSigner(
+        adapter=adapter,
+        entry_point="0x0000000000000000000000000000000000004337",
+        usdc_address="0x0000000000000000000000000000000000000c0c",
+        config=PaymasterExecutorConfig(),
+    )
+
+    signer.send(paymaster_step(8453), "rpc://base")
+
+    assert adapter.requests[0].gas_token_address == (
+        "0x0000000000000000000000000000000000000c0c"
+    )
+
+
+def test_unregistered_chain_names_its_own_override_variable() -> None:
+    adapter = MockPaymasterAdapter()
+    signer = Erc4337PaymasterSigner(
+        adapter=adapter,
+        entry_point="0x0000000000000000000000000000000000004337",
+        config=PaymasterNoLegacyTokenConfig(),
+    )
+
+    with pytest.raises(PaymasterConfigurationError, match="PAYMASTER_USDC_ADDRESS_999"):
+        signer.send(paymaster_step(999), "rpc://nowhere")
+
+
+def test_legacy_single_token_setting_only_covers_unregistered_chains() -> None:
+    """PAYMASTER_USDC_ADDRESS predates the registry; it must not override it."""
+    adapter = MockPaymasterAdapter()
+    signer = Erc4337PaymasterSigner(
+        adapter=adapter,
+        entry_point="0x0000000000000000000000000000000000004337",
+        config=PaymasterExecutorConfig(),
+    )
+
+    signer.send(paymaster_step(8453), "rpc://base")
+    signer.send(paymaster_step(999), "rpc://nowhere")
+
+    assert adapter.requests[0].gas_token_address == (
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    )
+    assert adapter.requests[1].gas_token_address == (
+        "0x0000000000000000000000000000000000000c0c"
+    )
+
+
+def test_preflight_rejects_a_plan_with_a_chain_it_cannot_price_gas_on() -> None:
+    """Before the first broadcast, not on the third leg."""
+    config = PaymasterNoLegacyTokenConfig()
+
+    assert validate_paymaster_preflight(config, (8453,)) == {
+        8453: "https://bundler.example"
+    }
+
+    with pytest.raises(PaymasterConfigurationError, match="PAYMASTER_USDC_ADDRESS_999"):
+        validate_paymaster_preflight(config, (8453, 999))
+
+
+def test_preflight_still_rejects_an_unsupported_chain_first() -> None:
+    config = PaymasterExecutorConfig(paymaster_supported_chain_ids=(8453,))
+
+    with pytest.raises(PaymasterUnsupportedChain):
+        validate_paymaster_preflight(config, (42161,))
+
+
 def test_generic_http_adapter_maps_provider_policy_rejection_to_typed_error() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -578,6 +679,20 @@ class PaymasterExecutorConfig:
     paymaster_entry_point: str = "0x0000000000000000000000000000000000004337"
     paymaster_usdc_address: str = "0x0000000000000000000000000000000000000c0c"
     paymaster_supported_chain_ids: tuple[int, ...] = (8453,)
+
+
+@dataclass(frozen=True)
+class PaymasterNoLegacyTokenConfig:
+    """No legacy token, and chain 999 is allowlisted but has no registry row —
+    the case where the gas token genuinely cannot be resolved."""
+
+    signer_mode: str = "erc4337-paymaster"
+    paymaster_bundler_url: str = "https://bundler.example"
+    paymaster_url: str = "https://paymaster.example"
+    paymaster_account_address: str = SAFE_ADDRESS
+    paymaster_entry_point: str = "0x0000000000000000000000000000000000004337"
+    paymaster_usdc_address: str | None = None
+    paymaster_supported_chain_ids: tuple[int, ...] = (8453, 999)
 
 
 @dataclass

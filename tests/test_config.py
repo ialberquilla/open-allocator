@@ -323,7 +323,6 @@ def test_safe_signer_config_validates_addresses(
         "PAYMASTER_URL",
         "PAYMASTER_ACCOUNT_ADDRESS",
         "PAYMASTER_ENTRY_POINT",
-        "PAYMASTER_USDC_ADDRESS",
     ],
 )
 def test_paymaster_config_requires_paymaster_fields(
@@ -343,9 +342,9 @@ def test_paymaster_config_requires_paymaster_fields(
 def set_valid_pimlico_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The minimum a Pimlico user should have to supply.
 
-    Deliberately no bundler URL, paymaster URL, account address or entry point:
-    Pimlico derives its endpoint from the key, the Safe from the seed, and the
-    EntryPoint from the registry.
+    Deliberately no bundler URL, paymaster URL, account address, entry point or
+    gas token: Pimlico derives its endpoint from the key, the Safe from the seed,
+    the EntryPoint from the registry, and USDC from the per-chain registry.
     """
     monkeypatch.setenv("ONE_TX_API_URL", "http://localhost:3001/api/v1")
     monkeypatch.setenv("ONE_TX_API_KEY", "test-api-key")
@@ -359,10 +358,6 @@ def set_valid_pimlico_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PAYMASTER_PROVIDER", "pimlico")
     monkeypatch.setenv("PAYMASTER_ACCOUNT_TYPE", "safe")
     monkeypatch.setenv("PIMLICO_API_KEY", "pim_test_key")
-    monkeypatch.setenv(
-        "PAYMASTER_USDC_ADDRESS",
-        "0x0000000000000000000000000000000000000c0c",
-    )
 
 
 def test_pimlico_needs_no_bundler_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -387,15 +382,39 @@ def test_pimlico_requires_its_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "PIMLICO_API_KEY" in str(error.value)
 
 
-def test_pimlico_still_requires_the_gas_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Nothing can derive which token the user wants to pay gas in."""
+def test_gas_token_is_derived_per_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One configured address made a multi-chain run impossible: every other
+    chain got the address of whichever chain the user configured."""
     set_valid_pimlico_env(monkeypatch)
-    monkeypatch.delenv("PAYMASTER_USDC_ADDRESS")
 
-    with pytest.raises(ValidationError) as error:
+    config = AllocatorConfig()
+
+    assert config.paymaster_usdc_address is None
+    assert config.usdc_address(8453) == "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    assert config.usdc_address(42161) == "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+
+
+def test_per_chain_gas_token_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_valid_pimlico_env(monkeypatch)
+    monkeypatch.setenv(
+        "PAYMASTER_USDC_ADDRESS_8453",
+        "0x0000000000000000000000000000000000000c0c",
+    )
+
+    config = AllocatorConfig()
+
+    assert config.usdc_address(8453) == "0x0000000000000000000000000000000000000c0c"
+    assert config.usdc_address(42161) == "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+
+
+def test_per_chain_gas_token_override_is_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_pimlico_env(monkeypatch)
+    monkeypatch.setenv("PAYMASTER_USDC_ADDRESS_8453", "not-an-address")
+
+    with pytest.raises(ValueError, match="PAYMASTER_USDC_ADDRESS_8453"):
         AllocatorConfig()
-
-    assert "PAYMASTER_USDC_ADDRESS" in str(error.value)
 
 
 def test_generic_http_still_requires_its_urls(monkeypatch: pytest.MonkeyPatch) -> None:

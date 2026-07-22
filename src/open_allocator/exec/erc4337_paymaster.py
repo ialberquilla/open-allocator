@@ -7,7 +7,7 @@ import httpx
 from pydantic import Field
 
 from open_allocator.core.types import FrozenModel, TxStep
-from open_allocator.exec import paymaster_registry
+from open_allocator.exec import chains, paymaster_registry
 from open_allocator.exec.composition import composition_from_config
 from open_allocator.exec.signer import Receipt, SignerError
 
@@ -81,16 +81,16 @@ class Erc4337PaymasterSigner:
         self._adapter = adapter or (
             _adapter_from_config(config) if config is not None else None
         )
+        self._config = config
         self._account = account
         self._account_type = account_type or _account_type_from_config(config)
         self._entry_point = entry_point or _optional_config_value(
             config,
             "paymaster_entry_point",
         )
-        self._usdc_address = usdc_address or _optional_config_value(
-            config,
-            "paymaster_usdc_address",
-        )
+        # Resolved per transaction, not here: the gas token depends on the chain.
+        # An explicit argument still pins one token for every chain.
+        self._usdc_address = usdc_address
 
     def __repr__(self) -> str:
         if self._adapter is None:
@@ -114,7 +114,7 @@ class Erc4337PaymasterSigner:
                 data=tx.data,
                 value=tx.value,
             ),
-            gas_token_address=self._required_usdc_address(),
+            gas_token_address=self._required_usdc_address(tx.chain_id),
             account_type=self._account_type,
         )
         submission = self._require_adapter().submit_user_operation(request)
@@ -152,12 +152,10 @@ class Erc4337PaymasterSigner:
             ]
         return self._entry_point
 
-    def _required_usdc_address(self) -> str:
-        if self._usdc_address is None:
-            raise PaymasterConfigurationError(
-                "PAYMASTER_USDC_ADDRESS is required for ERC-4337 paymaster mode"
-            )
-        return self._usdc_address
+    def _required_usdc_address(self, chain_id: int) -> str:
+        if self._usdc_address is not None:
+            return self._usdc_address
+        return require_usdc_address(self._config, chain_id)
 
 
 class GenericHttpPaymasterUserOperationAdapter:
@@ -272,6 +270,31 @@ class GenericHttpPaymasterUserOperationAdapter:
         return payload
 
 
+def usdc_address_for_chain(config: object | None, chain_id: int) -> str | None:
+    """The gas token for one chain: registry first, legacy setting as fallback.
+
+    `PAYMASTER_USDC_ADDRESS` assumed a single-chain deployment, so it must not
+    win over a known row — on a multi-chain run it names a token that is
+    something else at that address elsewhere. `PAYMASTER_USDC_ADDRESS_<chain id>`
+    wins over both.
+    """
+    address = chains.usdc_address(chain_id, config)
+    if address is not None:
+        return address
+    return _optional_config_value(config, "paymaster_usdc_address")
+
+
+def require_usdc_address(config: object | None, chain_id: int) -> str:
+    address = usdc_address_for_chain(config, chain_id)
+    if address is None:
+        raise PaymasterConfigurationError(
+            f"no USDC address is known for chain {chain_id} "
+            f"({chains.chain_name(chain_id)}), so gas cannot be paid there; set "
+            f"PAYMASTER_USDC_ADDRESS_{chain_id} to the USDC the paymaster accepts"
+        )
+    return address
+
+
 def submits_via_paymaster(config: object | None) -> bool:
     if config is None:
         return False
@@ -291,7 +314,6 @@ def validate_paymaster_preflight(
     _required_config_value(config, "paymaster_url")
     _required_config_value(config, "paymaster_account_address")
     _required_config_value(config, "paymaster_entry_point")
-    _required_config_value(config, "paymaster_usdc_address")
 
     # An explicit allowlist still wins, for pinning a deployment to known chains.
     supported_chain_ids = _supported_chain_ids(config)
@@ -301,9 +323,11 @@ def validate_paymaster_preflight(
         if supported_chain_ids is not None:
             if chain_id not in supported_chain_ids:
                 raise PaymasterUnsupportedChain(chain_id)
-            continue
-        if not paymaster_registry.is_gas_payable(chain_id, provider=provider):
+        elif not paymaster_registry.is_gas_payable(chain_id, provider=provider):
             raise PaymasterUnsupportedChain(chain_id)
+        # Here rather than at submission: a plan that cannot name the gas token
+        # on its third chain must fail before the first two are broadcast.
+        require_usdc_address(config, chain_id)
 
     return {chain_id: bundler_url for chain_id in chain_ids}
 
@@ -356,6 +380,9 @@ def paymaster_cost_notes(
             "provider": row.provider,
             "entry_point_version": row.entry_point_version,
         }
+        gas_token = usdc_address_for_chain(config, chain_id)
+        if gas_token is not None:
+            note["gas_token_address"] = gas_token
         quote = quoter(chain_id) if quoter is not None else None
         if quote is not None:
             note["exchange_rate"] = getattr(quote, "exchange_rate", None)
@@ -372,8 +399,7 @@ def _live_token_quoter(
     if config is None or provider != "pimlico":
         return None
     api_key = _optional_secret_config_value(config, "pimlico_api_key")
-    usdc = _optional_config_value(config, "paymaster_usdc_address")
-    if api_key is None or usdc is None:
+    if api_key is None:
         return None
 
     from open_allocator.exec.pimlico import (
@@ -383,6 +409,11 @@ def _live_token_quoter(
     )
 
     def quote(chain_id: int) -> object | None:
+        # Per chain: quoting one chain's USDC against another's paymaster prices
+        # a token that chain will not be charged in.
+        usdc = usdc_address_for_chain(config, chain_id)
+        if usdc is None:
+            return None
         try:
             adapter = PimlicoPaymasterAdapter(
                 PimlicoClient(chain_id=chain_id, api_key=api_key)
@@ -619,6 +650,8 @@ __all__ = [
     "PaymasterUserOperationRequest",
     "PaymasterUserOperationSubmission",
     "UserOperationCall",
+    "require_usdc_address",
     "submits_via_paymaster",
+    "usdc_address_for_chain",
     "validate_paymaster_preflight",
 ]
