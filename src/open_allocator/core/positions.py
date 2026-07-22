@@ -186,13 +186,21 @@ def _positions(
         sorted(holdings, key=lambda item: (item.chain_id, item.instrument_id))
     )
     sorted_idle = tuple(sorted(idle_balances, key=lambda item: item.chain_id))
+    # start= matters: an empty sum() is int 0, which has no quantize(). A wallet
+    # with no holdings is the normal state of a freshly funded one.
     total_position_usd = sum(
-        _money_decimal(holding.usd_value, "holding.usd_value")
-        for holding in sorted_holdings
+        (
+            _money_decimal(holding.usd_value, "holding.usd_value")
+            for holding in sorted_holdings
+        ),
+        start=Decimal(0),
     )
     total_idle_usdc = sum(
-        _money_decimal(balance.usd_value, "idle.usd_value")
-        for balance in sorted_idle
+        (
+            _money_decimal(balance.usd_value, "idle.usd_value")
+            for balance in sorted_idle
+        ),
+        start=Decimal(0),
     )
 
     return Positions(

@@ -2,7 +2,7 @@
 
 Use this stage to turn an approved allocation into 1Tx calldata and, only after explicit human approval, sign and broadcast with the configured self-custody signer.
 
-Before announcing, understand the funding model: read [docs/funding-and-bridging.md](../docs/funding-and-bridging.md). In short — a leg's destination chain is encoded in its `instrumentId`, USDC is sourced from whichever chain the wallet is funded on, and 1Tx bridges (CCTP) to the destination automatically. The wallet needs native gas only on the chains it signs on (source chains for deposits; the position's chain for exits), not on every destination.
+Before announcing, understand the funding model: read [docs/funding-and-bridging.md](../docs/funding-and-bridging.md). In short — a leg's destination chain is encoded in its `instrumentId`, USDC is sourced from whichever chain the wallet is funded on, and 1Tx bridges (CCTP) to the destination automatically. Under `rpc` submission the wallet needs native gas on the chains it signs on (source chains for deposits; the position's chain for exits), not on every destination. Under `erc4337-paymaster` it needs none at all: gas is paid in USDC by the smart account, and a chain's steps go out as one batched operation — see [docs/gasless-execution.md](../docs/gasless-execution.md).
 
 ## Runnable Workflow
 
@@ -45,5 +45,5 @@ Before announcing, understand the funding model: read [docs/funding-and-bridging
 
 - Transaction-plan parity with the approved allocation.
 - Announcement completeness.
-- Native gas readiness and failure modes.
+- Gas readiness and failure modes, in whichever asset the submission axis pays in.
 - Checkpoint and allocation-log integrity.

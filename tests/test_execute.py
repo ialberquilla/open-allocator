@@ -31,6 +31,7 @@ from open_allocator.exec.execute import (
     GasPreflightError,
     PolicyCheckFailed,
     execute_allocation,
+    submission_groups,
 )
 from open_allocator.exec.signer import Receipt
 
@@ -624,3 +625,63 @@ def test_live_tiny_base_deposit_skips_without_creds_or_explicit_gate() -> None:
         )
 
     assert report.status in {"success", "in_progress"}
+
+
+# --- grouping steps into operations -----------------------------------------
+
+
+class _FakeRef:
+    def __init__(self, chain_id: int, key: str) -> None:
+        self.step = TxStep(
+            to="0x" + "11" * 20,
+            data="0x",
+            value=0,
+            chain_id=chain_id,
+            kind="buy",
+        )
+        self.idempotency_key = key
+
+
+class _Batching:
+    def send(self, step: object, rpc_url: str) -> None: ...
+
+    def send_batch(self, steps: object, rpc_url: str) -> None: ...
+
+
+class _Sequential:
+    def send(self, step: object, rpc_url: str) -> None: ...
+
+
+def _group_sizes(
+    refs: list[_FakeRef],
+    signer: object,
+    store: object = None,
+) -> list[int]:
+    return [len(g.refs) for g in submission_groups(refs, store, signer)]
+
+
+def test_consecutive_steps_on_one_chain_ride_in_one_operation() -> None:
+    refs = [_FakeRef(8453, "a"), _FakeRef(8453, "b")]
+
+    assert _group_sizes(refs, _Batching()) == [2]
+
+
+def test_an_eoa_signer_still_sends_one_step_at_a_time() -> None:
+    refs = [_FakeRef(8453, "a"), _FakeRef(8453, "b")]
+
+    assert _group_sizes(refs, _Sequential()) == [1, 1]
+
+
+def test_a_plan_is_never_batched_across_chains() -> None:
+    """One operation belongs to one chain — that limit is inherent."""
+    refs = [_FakeRef(8453, "a"), _FakeRef(8453, "b"), _FakeRef(42161, "c")]
+
+    assert _group_sizes(refs, _Batching()) == [2, 1]
+
+
+def test_already_completed_steps_do_not_join_a_live_batch() -> None:
+    refs = [_FakeRef(8453, "done"), _FakeRef(8453, "todo")]
+
+    sizes = _group_sizes(refs, _Batching(), {"done": True})
+
+    assert sizes == [1, 1]

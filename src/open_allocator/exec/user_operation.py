@@ -116,13 +116,13 @@ def batched_user_op_calldata(calls: Sequence[Call]) -> str:
 
 
 def paymaster_calls(
-    action: Call,
+    actions: Call | Sequence[Call],
     *,
     token: str,
     paymaster: str,
     approval_amount: int = MAX_UINT256,
 ) -> tuple[Call, ...]:
-    """The action, with the paymaster's USDC approval riding in front of it.
+    """The actions, with the paymaster's USDC approval riding in front of them.
 
     Pimlico's ERC-20 paymaster pulls the token from the smart account in postOp
     rather than being prefunded, so without an allowance the op reverts. Sending
@@ -132,8 +132,14 @@ def paymaster_calls(
     Defaults to an unlimited approval: the paymaster is a fixed, audited
     contract, and re-approving on every op costs gas the user pays in USDC. Pass
     an exact amount to scope it per-op instead.
+
+    Several actions ride together so the charge in postOp can be paid out of
+    whatever the batch itself produced.
     """
-    return (approval_call(token, paymaster, approval_amount), action)
+    batch = (actions,) if isinstance(actions, Call) else tuple(actions)
+    if not batch:
+        raise ValueError("a user operation needs at least one action")
+    return (approval_call(token, paymaster, approval_amount), *batch)
 
 
 def build_user_operation(

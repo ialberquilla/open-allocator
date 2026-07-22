@@ -23,6 +23,8 @@ from open_allocator.exec.execute import (
     _store_mark_completed,
     _tx_step,
     _write_checkpoint,
+    submission_groups,
+    submit_steps,
 )
 from open_allocator.exec.signer import Receipt, Signer
 
@@ -101,23 +103,27 @@ def withdraw(
 
     execution_steps: list[ExecutionStepReport] = []
     receipts: list[Receipt] = []
-    for ref in step_refs:
-        if _store_completed(idempotency_store, ref.idempotency_key):
-            execution_steps.append(
-                ExecutionStepReport(
-                    leg_index=ref.leg_index,
-                    step_index=ref.step_index,
-                    instrument_id=ref.instrument_id,
-                    status="skipped",
-                    step=ref.step,
-                    idempotency_key=ref.idempotency_key,
+    for group in submission_groups(step_refs, idempotency_store, signer):
+        if group.completed:
+            for ref in group.refs:
+                execution_steps.append(
+                    ExecutionStepReport(
+                        leg_index=ref.leg_index,
+                        step_index=ref.step_index,
+                        instrument_id=ref.instrument_id,
+                        status="skipped",
+                        step=ref.step,
+                        idempotency_key=ref.idempotency_key,
+                    )
                 )
-            )
-            _mark_withdraw_if_complete(ref, step_refs, idempotency_store)
+                _mark_withdraw_if_complete(ref, step_refs, idempotency_store)
             continue
 
+        ref = group.refs[0]
         try:
-            receipt = signer.send(ref.step, rpc_urls[ref.step.chain_id])
+            # The approval and the sell in one operation: the paymaster charges
+            # in postOp, so the redeemed USDC pays for the gas that redeemed it.
+            receipt = submit_steps(signer, group.refs, rpc_urls[ref.step.chain_id])
         except Exception as error:
             partial_report = ExecutionReport(
                 status="failed",
@@ -143,20 +149,21 @@ def withdraw(
             ) from error
 
         receipts.append(receipt)
-        _store_mark_completed(idempotency_store, ref.idempotency_key, receipt)
-        _append_allocation_log(config, ref, receipt)
-        _mark_withdraw_if_complete(ref, step_refs, idempotency_store)
-        execution_steps.append(
-            ExecutionStepReport(
-                leg_index=ref.leg_index,
-                step_index=ref.step_index,
-                instrument_id=ref.instrument_id,
-                status="sent",
-                step=ref.step,
-                receipt=receipt,
-                idempotency_key=ref.idempotency_key,
+        for member in group.refs:
+            _store_mark_completed(idempotency_store, member.idempotency_key, receipt)
+            _append_allocation_log(config, member, receipt)
+            _mark_withdraw_if_complete(member, step_refs, idempotency_store)
+            execution_steps.append(
+                ExecutionStepReport(
+                    leg_index=member.leg_index,
+                    step_index=member.step_index,
+                    instrument_id=member.instrument_id,
+                    status="sent",
+                    step=member.step,
+                    receipt=receipt,
+                    idempotency_key=member.idempotency_key,
+                )
             )
-        )
 
     report = WithdrawExecutionReport(
         status="in_progress" if in_progress else "success",

@@ -14,6 +14,7 @@ from open_allocator.exec import paymaster_registry, safe_4337_signature, safe_de
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
     PaymasterConfigurationError,
+    PaymasterError,
     PaymasterUnsupportedChain,
     PaymasterUserOperationRequest,
     UserOperationCall,
@@ -33,6 +34,7 @@ VAULT = Web3.to_checksum_address("0x" + "cc" * 20)
 API_KEY = "pim_secret_key"
 SAFE = Web3.to_checksum_address("0x" + "5a" * 20)
 USER_OP_HASH = "0x" + "ab" * 32
+TX_HASH = "0x" + "cd" * 32
 
 OWNER_KEY = "0x" + "11" * 32
 OWNER = Account.from_key(OWNER_KEY).address
@@ -75,6 +77,16 @@ class FakeEndpoint:
                 "paymasterData": "0x" + USDC[2:].lower(),
             },
             "eth_sendUserOperation": USER_OP_HASH,
+            "eth_getUserOperationReceipt": {
+                "userOpHash": USER_OP_HASH,
+                "success": True,
+                "actualGasUsed": "0x1234",
+                "receipt": {
+                    "transactionHash": TX_HASH,
+                    "blockNumber": "0x64",
+                    "gasUsed": "0x1234",
+                },
+            },
         }
         self.replies.update(overrides)
         self.calls: list[dict[str, Any]] = []
@@ -164,6 +176,7 @@ def _adapter(
     deployed: bool = True,
     seed: SafeSeed | None = None,
     account_address: str | None = SAFE,
+    inclusion_timeout_s: float = 120.0,
 ) -> PimlicoUserOperationAdapter:
     w3 = FakeWeb3(nonce=nonce, deployed=deployed)
     return PimlicoUserOperationAdapter(
@@ -174,6 +187,9 @@ def _adapter(
         rpc_urls={BASE: "https://base.invalid"},
         http_client=endpoint.client(),
         web3_factory=lambda url: w3,
+        poll_interval_s=0,
+        sleep=lambda _seconds: None,
+        inclusion_timeout_s=inclusion_timeout_s,
     )
 
 
@@ -182,7 +198,7 @@ def _request(chain_id: int = BASE) -> PaymasterUserOperationRequest:
         sender=SAFE,
         chain_id=chain_id,
         entry_point=safe_4337_signature.paymaster_registry.ENTRY_POINT_V07,
-        call_data=UserOperationCall(to=VAULT, data="0xdeadbeef", value=0),
+        calls=(UserOperationCall(to=VAULT, data="0xdeadbeef", value=0),),
         gas_token_address=USDC,
         account_type="safe",
     )
@@ -196,7 +212,7 @@ def test_submit_sends_a_signed_user_operation() -> None:
     submission = _adapter(endpoint).submit_user_operation(_request())
 
     assert submission.user_op_hash == USER_OP_HASH
-    assert submission.status == "submitted"
+    assert submission.status == "included"
     assert bytes.fromhex(endpoint.sent_user_op()["signature"][2:]) != b""
 
 
@@ -483,3 +499,93 @@ def test_the_entry_point_defaults_to_the_registrys_v07() -> None:
     question for the user — but a Safe cannot use v0.8, so the default matters."""
     signer = Erc4337PaymasterSigner(adapter=object(), entry_point=None)
     assert signer._required_entry_point() == paymaster_registry.ENTRY_POINT_V07  # noqa: SLF001
+
+
+# --- waiting for inclusion --------------------------------------------------
+
+
+def test_submission_reports_the_transaction_not_just_the_user_op_hash() -> None:
+    submission = _adapter(FakeEndpoint()).submit_user_operation(_request())
+
+    assert submission.status == "included"
+    assert submission.transaction_hash == TX_HASH
+    assert submission.block_number == 0x64
+    assert submission.gas_used == 0x1234
+
+
+def test_a_reverted_operation_is_not_reported_as_a_success() -> None:
+    endpoint = FakeEndpoint(
+        eth_getUserOperationReceipt={
+            "userOpHash": USER_OP_HASH,
+            "success": False,
+            "reason": "AA33 reverted",
+            "receipt": {"transactionHash": TX_HASH},
+        }
+    )
+
+    with pytest.raises(PaymasterError, match="reverted on chain: AA33 reverted"):
+        _adapter(endpoint).submit_user_operation(_request())
+
+
+def test_a_pending_operation_degrades_to_submitted_rather_than_hanging() -> None:
+    """The next op needs this one mined, but a slow bundler is not a failure."""
+    endpoint = FakeEndpoint(eth_getUserOperationReceipt=None)
+
+    submission = _adapter(endpoint, inclusion_timeout_s=0).submit_user_operation(
+        _request()
+    )
+
+    assert submission.status == "submitted"
+    assert submission.transaction_hash is None
+    assert "still pending" in (submission.message or "")
+
+
+# --- batching ---------------------------------------------------------------
+
+
+def _batch_request() -> PaymasterUserOperationRequest:
+    return PaymasterUserOperationRequest(
+        sender=SAFE,
+        chain_id=BASE,
+        entry_point=safe_4337_signature.paymaster_registry.ENTRY_POINT_V07,
+        calls=(
+            UserOperationCall(to=USDC, data="0xaaaaaaaa", value=0),
+            UserOperationCall(to=VAULT, data="0xbbbbbbbb", value=0),
+        ),
+        gas_token_address=USDC,
+        account_type="safe",
+    )
+
+
+def test_a_batch_goes_out_as_one_user_operation() -> None:
+    """The point of batching: postOp charges after execution, so a batch that
+    redeems into the account pays its own gas out of the proceeds."""
+    endpoint = FakeEndpoint()
+
+    adapter = _adapter(endpoint)
+    adapter.submit_user_operation(_batch_request())
+
+    assert endpoint.methods().count("eth_sendUserOperation") == 1
+    call_data = endpoint.sent_user_op()["callData"]
+    assert "aaaaaaaa" in call_data
+    assert "bbbbbbbb" in call_data
+
+
+def test_a_batch_still_carries_exactly_one_paymaster_approval() -> None:
+    endpoint = FakeEndpoint()
+
+    _adapter(endpoint).submit_user_operation(_batch_request())
+
+    approvals = endpoint.sent_user_op()["callData"].count("095ea7b3")
+    assert approvals == 1
+
+
+def test_a_request_needs_at_least_one_call() -> None:
+    with pytest.raises(ValueError, match="calls"):
+        PaymasterUserOperationRequest(
+            sender=SAFE,
+            chain_id=BASE,
+            entry_point=safe_4337_signature.paymaster_registry.ENTRY_POINT_V07,
+            calls=(),
+            gas_token_address=USDC,
+        )

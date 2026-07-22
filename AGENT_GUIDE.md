@@ -10,6 +10,7 @@ This is the operating contract for agents and humans working in this repository.
 - Never hardcode protocol, chain, or instrument universes; discover from 1Tx and narrow by policy.
 - Do not sign, broadcast, rebalance, or withdraw without first announcing the exact action and obtaining the required confirmation.
 - Frame APY as descriptive, not predictive.
+- Never split a chain's plan steps into separate smart-account operations; they are batched deliberately (see [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) safety invariants).
 
 ## Command Inventory
 
@@ -40,6 +41,8 @@ Use this loop for deposits and new books.
 
 1. Load policy and signer configuration.
 2. Run `wallet-status` and check wallet address, USDC, and native gas balances.
+   Under `SIGNER_SUBMISSION=erc4337-paymaster` there is no native gas to check —
+   gas is paid in USDC by the smart account ([docs/gasless-execution.md](docs/gasless-execution.md)).
 3. Run `list-vaults` to discover the full live 1Tx universe.
 4. Run `score-vault` over candidate instruments and keep unknown fields visible.
 5. Run `build-allocation` to create a weighted, policy-conformant proposal.
@@ -61,7 +64,9 @@ Use this loop for deposits and new books.
 ## Withdraw Loop
 
 1. Identify the position and its share balance.
-2. Check liquidity, withdrawal constraints, gas, and any cross-chain timing.
+2. Check liquidity, withdrawal constraints, gas, and any cross-chain timing. A gasless
+   exit funds itself from the redeem and needs nothing pre-positioned on the chain,
+   but its proceeds must exceed its gas.
 3. Announce the share amount, expected destination asset, chain, risks, and transactions.
 4. Wait for approval, then run `withdraw --confirm`.
 
