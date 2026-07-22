@@ -30,7 +30,6 @@ COMMANDS = [
 ]
 
 EXECUTION_COMMANDS = {"execute", "rebalance", "withdraw"}
-STUB_EXECUTION_COMMANDS: set[str] = set()
 EXECUTION_SURFACE_COMMANDS = {
     "wallet-status",
     "build-tx",
@@ -68,28 +67,6 @@ def parse_single_stdout_value(stdout: str) -> object:
     assert stdout.endswith("\n")
     assert stdout.count("\n") == 1
     return json.loads(stdout)
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        command
-        for command in COMMANDS
-        if command
-        not in READ_ONLY_COMMANDS | ALLOCATION_COMMANDS | EXECUTION_SURFACE_COMMANDS
-    ],
-)
-def test_remaining_stub_commands_output_one_json_object(command: str) -> None:
-    result = runner.invoke(cli.app, [command])
-
-    assert result.exit_code == 0
-    assert result.stderr == ""
-    payload = parse_single_stdout_object(result.stdout)
-
-    if command in STUB_EXECUTION_COMMANDS:
-        assert payload["status"] == "plan_required"
-    else:
-        assert payload == {"status": "not_implemented"}
 
 
 def set_read_only_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1703,11 +1680,3 @@ def test_execution_commands_without_confirmation_do_not_call_executor(
     }
 
 
-def test_execution_commands_with_confirmation_remain_no_op_stubs() -> None:
-    for command in STUB_EXECUTION_COMMANDS:
-        result = runner.invoke(cli.app, [command, "--confirm"])
-
-        assert result.exit_code == 0
-        assert parse_single_stdout_object(result.stdout) == {
-            "status": "not_implemented"
-        }
