@@ -77,5 +77,7 @@ executable only when both are present.
 A complete execution announcement (see [AGENT_GUIDE.md](../AGENT_GUIDE.md)) must
 name the **source chain(s)** the USDC comes from, the **destination chain(s)** the
 instruments live on, whether any leg **bridges**, and the **native-gas assets**
-required on each chain that will be signed. Bridged legs are `in_progress` until
-the destination mint settles — checkpoint and resume idempotently, never blind-retry.
+required on each chain that will be signed. A bridged leg is handed to 1Tx once its
+source-chain transaction lands; 1Tx settles the destination mint. Confirm the landed
+position with `positions` rather than re-running the leg — checkpoint and resume
+idempotently, never blind-retry.
