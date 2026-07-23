@@ -34,6 +34,23 @@ Together with cross-chain buys, whose destination-side gas is paid by whoever
 relays the CCTP message, a user only ever needs USDC on the chain they choose to
 fund. Deposits bridge out; exits pay their own way back.
 
+## Who settles what
+
+A cross-chain buy has two legs and one owner each. The allocator signs and
+submits the **source-chain** leg, and reports on that: it returns once that
+transaction lands, and `in_progress` reflects what the 1Tx build response said.
+
+The **destination** leg — relaying the CCTP message, minting on the far side, and
+depositing into the vault — belongs to 1Tx. The allocator does not poll Circle's
+attestation or track the message, by design; delegating it is the point of
+building on 1Tx. Read the landed position with `positions`, which reports what is
+actually on chain rather than what a bridge promised.
+
+What the allocator does owe you is the truth about its own submission: an
+operation that has settled nothing — a Safe transaction awaiting threshold
+signatures, a user operation the bundler has not included — reports
+`in_progress`, never `success`.
+
 **This only works batched.** Sent one step at a time, the first operation is an
 approval that produces no USDC, and `postOp` reverts `AA50 / TransferFromFailed()`
 against an account with a zero balance. Splitting a plan into one operation per
@@ -100,9 +117,6 @@ Facts below were observed on chain, not derived from a spec:
   half-done, but the position stays put.
 - **One operation belongs to one chain.** A plan spanning chains is still one
   operation per chain; only contiguous same-chain runs merge.
-- **A cross-chain buy is reported complete when its source-chain transaction
-  lands**, while the destination leg is still in flight. `in_progress` reflects
-  what the 1Tx build response said, not the state of the CCTP message.
 - **An N-of-M Safe cannot use this path.** A user operation is signed in one
   shot, with no propose→co-sign round trip, so it needs threshold-many keys
   present. Use `safe` + `rpc` submission to collect signatures instead.
