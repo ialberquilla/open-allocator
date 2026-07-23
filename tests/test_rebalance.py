@@ -325,3 +325,47 @@ def test_confirmed_rebalance_sells_before_buys_and_retries_from_store() -> None:
     assert retry_client.sell_bodies == []
     assert [body["instrumentId"] for body in retry_client.buy_bodies] == ["vault-b"]
     assert [sent[0].data for sent in retry_signer.sent] == ["0xbuy-retry"]
+
+
+@dataclass
+class PendingRebalanceSigner:
+    """A Safe below its threshold: every leg is proposed, none broadcast."""
+
+    sent: list[TxStep] = field(default_factory=list)
+
+    def address(self) -> str:
+        return ADDRESS
+
+    def send(self, tx: TxStep, rpc_url: str) -> Receipt:
+        self.sent.append(tx)
+        return Receipt(
+            transaction_hash="0xproposal",
+            block_number=0,
+            gas_used=0,
+            status=0,
+            from_address=ADDRESS,
+            to_address=tx.to,
+            pending=True,
+            execution_status="safe_proposed",
+        )
+
+
+def test_a_proposed_rebalance_is_not_reported_as_a_completed_rebalance() -> None:
+    """The book has not moved until the co-signers execute the proposals."""
+    current = positions_snapshot(holding("vault-a", "80"), holding("vault-b", "20"))
+    target = allocation(("vault-a", 0.5), ("vault-b", 0.5))
+
+    report = execute_rebalance(
+        MockRebalanceClient([response("0xsell")], [response("0xbuy")]),
+        PendingRebalanceSigner(),
+        current,
+        target,
+        policy(),
+        confirm=True,
+        known_instruments=known("vault-a", "vault-b"),
+        config=Config(),
+    )
+
+    assert report.status == "in_progress"
+    assert report.in_progress is True
+    assert any("awaiting threshold" in message for message in report.messages)

@@ -591,14 +591,25 @@ def _wallet_status_payload() -> JsonObject:
     with OneTxClient(config) as client:
         balances_response = client.balances(address)
 
+    from open_allocator.exec.erc4337_paymaster import submits_via_paymaster
+
     balances_payload = _normalize_balances_response(balances_response)
+    # Which readiness question to ask depends on how the transaction reaches the
+    # chain. A smart account paying gas in USDC holds no native token anywhere by
+    # design, so asking for a native balance answers a question this wallet never
+    # has to satisfy.
+    gas_status = (
+        _paymaster_gas_status
+        if submits_via_paymaster(config)
+        else _native_gas_status
+    )
     balances = []
     for balance in balances_payload["balances"]:
         chain_id = int(balance["chain_id"])
         balances.append(
             {
                 **balance,
-                **_native_gas_status(address, chain_id, config),
+                **gas_status(address, chain_id, config),
             }
         )
 
@@ -744,6 +755,7 @@ def _native_gas_status(address: str, chain_id: int, config: object) -> JsonObjec
     rpc_url = chains.rpc_url(chain_id, config)
     if rpc_url is None:
         return {
+            "gas_mode": "native",
             "rpc_available": False,
             "rpc_executable": False,
             "native_gas_balance_wei": None,
@@ -760,6 +772,7 @@ def _native_gas_status(address: str, chain_id: int, config: object) -> JsonObjec
         balance_wei = int(Web3(HTTPProvider(rpc_url)).eth.get_balance(address))
     except Exception as error:
         return {
+            "gas_mode": "native",
             "rpc_available": True,
             "rpc_executable": False,
             "native_gas_balance_wei": None,
@@ -773,6 +786,7 @@ def _native_gas_status(address: str, chain_id: int, config: object) -> JsonObjec
 
     gas_available = balance_wei >= required_wei
     return {
+        "gas_mode": "native",
         "rpc_available": True,
         "rpc_executable": True,
         "native_gas_balance_wei": balance_wei,
@@ -782,6 +796,62 @@ def _native_gas_status(address: str, chain_id: int, config: object) -> JsonObjec
         "not_executable": not gas_available,
         "not_executable_reasons": [] if gas_available else ["insufficient_native_gas"],
     }
+
+
+def _paymaster_gas_status(_address: str, chain_id: int, config: object) -> JsonObject:
+    """Readiness on a chain whose gas is paid in USDC by the smart account.
+
+    There is no native balance to have: the paymaster fronts the native gas and
+    pulls USDC, and an exit funds itself from what it redeems, so a chain where
+    the account holds nothing at all is still executable. What decides it is
+    whether the paymaster can price this chain, whether its gas token is known,
+    and whether an RPC exists to read the account's nonce and deployment status.
+
+    USDC balance is deliberately not part of the verdict — it is already on the
+    row, and requiring it would mark exactly the self-funding exits unusable.
+    """
+    from open_allocator.exec.erc4337_paymaster import (
+        PaymasterError,
+        PaymasterUnsupportedChain,
+        usdc_address_for_chain,
+        validate_paymaster_preflight,
+    )
+
+    reasons: list[str] = []
+    message: str | None = None
+
+    rpc_url = chains.rpc_url(chain_id, config)
+    if rpc_url is None:
+        reasons.append("missing_rpc")
+
+    gas_token: str | None = None
+    try:
+        validate_paymaster_preflight(config, (chain_id,))
+        gas_token = usdc_address_for_chain(config, chain_id)
+    except PaymasterUnsupportedChain as error:
+        reasons.append("chain_not_gas_payable")
+        message = str(error)
+    except PaymasterError as error:
+        reasons.append("paymaster_not_configured")
+        message = str(error)
+
+    status: JsonObject = {
+        "gas_mode": "usdc_paymaster",
+        "gas_token": "USDC",
+        "gas_token_address": gas_token,
+        "rpc_available": rpc_url is not None,
+        "rpc_executable": rpc_url is not None,
+        # Not zero — inapplicable. This account never holds a native token.
+        "native_gas_balance_wei": None,
+        "native_gas_required_wei": 0,
+        "native_gas_available": None,
+        "executable": not reasons,
+        "not_executable": bool(reasons),
+        "not_executable_reasons": reasons,
+    }
+    if message is not None:
+        status["message"] = message
+    return status
 
 
 def _policy_candidate_vaults(

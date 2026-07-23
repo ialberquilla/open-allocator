@@ -276,6 +276,8 @@ def execute_allocation(
                 )
             )
 
+    unconfirmed = pending_receipt_messages(receipts)
+    in_progress = in_progress or bool(unconfirmed)
     report = ExecutionReport(
         status="in_progress" if in_progress else "success",
         policy_result=policy_result,
@@ -284,7 +286,7 @@ def execute_allocation(
         receipts=tuple(receipts),
         gas_checks=gas_checks,
         in_progress=in_progress,
-        messages=messages,
+        messages=(*messages, *unconfirmed),
     )
     _write_checkpoint(
         config,
@@ -337,6 +339,45 @@ def submission_groups(
         else:
             groups.append(SubmissionGroup((ref,), done))
     return groups
+
+
+def pending_receipt_messages(
+    receipts: Sequence[Receipt | Mapping[str, object]],
+) -> tuple[str, ...]:
+    """One message per receipt that was submitted but has no on-chain result.
+
+    A Safe transaction awaiting co-signers and a user operation the bundler has
+    not included yet are both real submissions that have settled nothing, so a
+    report carrying either must not read as a completed spend.
+
+    The idempotency key is still marked completed: the submission happened, and
+    re-running must not propose or send it a second time. What changes is what
+    the report claims — `in_progress`, never `success`.
+    """
+    messages: list[str] = []
+    for receipt in receipts:
+        # Signers hand back a Receipt; the mapping form is what a raw adapter
+        # response looks like before it is validated.
+        if not _attr(receipt, "pending"):
+            continue
+        tx_hash = _attr(receipt, "transaction_hash", "transactionHash")
+        execution_status = _attr(receipt, "execution_status", "executionStatus")
+        if execution_status == "safe_proposed":
+            messages.append(
+                f"Safe transaction {tx_hash} is proposed and awaiting "
+                "threshold signatures/execution"
+            )
+        elif execution_status == "user_operation_submitted":
+            messages.append(
+                f"user operation {tx_hash} was submitted but is not confirmed "
+                "on chain"
+            )
+        else:
+            messages.append(
+                f"transaction {tx_hash} was submitted but is not confirmed "
+                "on chain"
+            )
+    return tuple(messages)
 
 
 def submit_steps(signer: object, refs: Sequence[Any], rpc_url: str) -> Receipt:
@@ -929,4 +970,5 @@ __all__ = [
     "PolicyCheckFailed",
     "TransactionPlanError",
     "execute_allocation",
+    "pending_receipt_messages",
 ]

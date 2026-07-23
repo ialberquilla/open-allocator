@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -79,11 +80,40 @@ def documented_cli_commands() -> list[str]:
     )
 
 
+def tracked_files() -> frozenset[Path] | None:
+    """Every file a fresh clone gets, or None when git cannot say.
+
+    Existence in this working tree proves nothing about the shipped repo: the
+    planning notes are deliberately gitignored, so a doc that links to one reads
+    fine here and 404s for everybody else.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return frozenset(
+        (REPO_ROOT / name).resolve()
+        for name in result.stdout.split("\0")
+        if name
+    )
+
+
+def _is_tracked_dir(path: Path, tracked: frozenset[Path]) -> bool:
+    """Directory links (`schemas/`, `docs/`) ship when anything inside them does."""
+    return any(candidate.is_relative_to(path) for candidate in tracked)
+
+
 def markdown_files() -> list[Path]:
+    tracked = tracked_files()
     return [
         path
         for path in REPO_ROOT.rglob("*.md")
         if not any(part in SKIPPED_DOC_DIRS for part in path.parts)
+        and (tracked is None or path.resolve() in tracked)
     ]
 
 
@@ -95,9 +125,10 @@ def test_per_agent_files_are_thin_pointers_to_agent_guide() -> None:
         assert len(content.splitlines()) <= 4
 
 
-def test_relative_markdown_links_point_to_existing_files() -> None:
+def test_relative_markdown_links_point_to_files_a_fresh_clone_has() -> None:
     missing_links: list[str] = []
     link_pattern = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+    tracked = tracked_files()
 
     for markdown_file in markdown_files():
         content = markdown_file.read_text()
@@ -113,7 +144,12 @@ def test_relative_markdown_links_point_to_existing_files() -> None:
             target_without_anchor = target.split("#", maxsplit=1)[0]
             target_without_query = target_without_anchor.split("?", maxsplit=1)[0]
             linked_path = (markdown_file.parent / target_without_query).resolve()
-            if not linked_path.exists():
+            shipped = (
+                linked_path.exists()
+                if tracked is None
+                else linked_path in tracked or _is_tracked_dir(linked_path, tracked)
+            )
+            if not shipped:
                 relative_file = markdown_file.relative_to(REPO_ROOT)
                 missing_links.append(f"{relative_file}: {target}")
 

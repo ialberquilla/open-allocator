@@ -23,6 +23,7 @@ from open_allocator.exec.execute import (
     _store_mark_completed,
     _tx_step,
     _write_checkpoint,
+    pending_receipt_messages,
     submission_groups,
     submit_steps,
 )
@@ -165,6 +166,8 @@ def withdraw(
                 )
             )
 
+    unconfirmed = pending_receipt_messages(receipts)
+    in_progress = in_progress or bool(unconfirmed)
     report = WithdrawExecutionReport(
         status="in_progress" if in_progress else "success",
         withdraw_plan=withdraw_plan,
@@ -174,7 +177,7 @@ def withdraw(
         receipts=tuple(receipts),
         gas_checks=gas_checks,
         in_progress=in_progress,
-        messages=messages,
+        messages=(*messages, *unconfirmed),
     )
     _write_checkpoint(
         config,

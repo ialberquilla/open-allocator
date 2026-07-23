@@ -2,7 +2,7 @@
 
 `open-allocator` is an agent-operated, CLI-first DeFi yield allocator. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes only after explicit approval.
 
-This file is the shared architecture source of truth. Agent operating rules live in [AGENT_GUIDE.md](AGENT_GUIDE.md); the full plan lives in [plan_allocator.md](plan_allocator.md).
+This file is the shared architecture source of truth. Agent operating rules live in [AGENT_GUIDE.md](AGENT_GUIDE.md).
 
 ## Architecture
 

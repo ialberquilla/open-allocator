@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -685,3 +686,107 @@ def test_already_completed_steps_do_not_join_a_live_batch() -> None:
     sizes = _group_sizes(refs, _Batching(), {"done": True})
 
     assert sizes == [1, 1]
+
+
+@dataclass
+class PendingSigner:
+    """A signer whose submission settles nothing on chain.
+
+    Both real cases look like this: a Safe below its threshold returns a
+    proposal awaiting co-signers, and a user operation the bundler has not
+    included before the poll expires returns a hash and nothing else.
+    """
+
+    execution_status: str = "safe_proposed"
+    sent: list[TxStep] = field(default_factory=list)
+
+    def address(self) -> str:
+        return "0x0000000000000000000000000000000000000001"
+
+    def send(self, tx: TxStep, rpc_url: str) -> Receipt:
+        self.sent.append(tx)
+        return Receipt(
+            transaction_hash="0xproposal",
+            block_number=0,
+            gas_used=0,
+            status=0,
+            from_address=self.address(),
+            to_address=tx.to,
+            pending=True,
+            execution_status=self.execution_status,  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
+class CheckpointConfig(Config):
+    checkpoint_dir: object = None
+
+
+def _pending_report(
+    signer: PendingSigner,
+    *,
+    store: dict[str, object] | None = None,
+    config: object | None = None,
+) -> Any:
+    client = MockOneTxClient([buy_response(tx(3, "0xbuy", type_="deposit"))])
+    return execute_allocation(
+        client,
+        signer,
+        allocation("base-morpho-usdc"),
+        permissive_policy(),
+        confirm=True,
+        known_instruments=[vault("base-morpho-usdc")],
+        config=config or Config(),
+        idempotency_store=store,
+    )
+
+
+def test_a_proposed_safe_transaction_is_not_reported_as_success() -> None:
+    """Below threshold nothing is broadcast; success would be a lie."""
+    report = _pending_report(PendingSigner())
+
+    assert report.status == "in_progress"
+    assert report.in_progress is True
+    assert any("awaiting threshold" in message for message in report.messages)
+
+
+def test_an_unincluded_user_operation_is_not_reported_as_success() -> None:
+    """Submitted to the bundler is not the same as mined."""
+    report = _pending_report(PendingSigner(execution_status="user_operation_submitted"))
+
+    assert report.status == "in_progress"
+    assert any("not confirmed on chain" in message for message in report.messages)
+
+
+def test_a_pending_step_is_still_marked_so_a_rerun_does_not_resubmit() -> None:
+    """The submission happened; re-running must not propose it twice."""
+    store: dict[str, object] = {}
+
+    _pending_report(PendingSigner(), store=store)
+
+    assert "leg:0:base-morpho-usdc:step:0" in store
+
+
+def test_a_pending_execution_checkpoints_in_progress_not_completed(
+    tmp_path: Any,
+) -> None:
+    """Resume must not read an unsettled run as a finished one."""
+    report = _pending_report(
+        PendingSigner(),
+        config=CheckpointConfig(checkpoint_dir=tmp_path),
+    )
+
+    written = list(tmp_path.glob("*.json"))
+    payloads = [json.loads(path.read_text()) for path in written]
+    statuses = {payload["status"] for payload in payloads}
+
+    assert report.status == "in_progress"
+    assert statuses == {"in_progress"}
+
+
+def test_a_mined_receipt_still_reports_success() -> None:
+    """The pending path must not drag confirmed executions with it."""
+    report = _pending_report(MockSigner())  # type: ignore[arg-type]
+
+    assert report.status == "success"
+    assert report.in_progress is False

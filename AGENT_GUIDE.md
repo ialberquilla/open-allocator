@@ -40,9 +40,12 @@ Every command must print one JSON object to stdout. Errors must print one JSON o
 Use this loop for deposits and new books.
 
 1. Load policy and signer configuration.
-2. Run `wallet-status` and check wallet address, USDC, and native gas balances.
-   Under `SIGNER_SUBMISSION=erc4337-paymaster` there is no native gas to check —
-   gas is paid in USDC by the smart account ([docs/gasless-execution.md](docs/gasless-execution.md)).
+2. Run `wallet-status` and check wallet address, USDC, and gas readiness per chain.
+   Each row names the gas model it was judged under in `gas_mode`: `native` reports a
+   native balance, `usdc_paymaster` reports none to hold — gas is paid in USDC by the
+   smart account, and a chain with no USDC at all is still executable because an exit
+   funds itself ([docs/gasless-execution.md](docs/gasless-execution.md)). Read
+   `executable` and `not_executable_reasons`, never a native balance alone.
 3. Run `list-vaults` to discover the full live 1Tx universe.
 4. Run `score-vault` over candidate instruments and keep unknown fields visible.
 5. Run `build-allocation` to create a weighted, policy-conformant proposal.
