@@ -1680,3 +1680,72 @@ def test_execution_commands_without_confirmation_do_not_call_executor(
     }
 
 
+
+
+def set_paymaster_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    config = SimpleNamespace(
+        onetx_api_url="http://localhost:3001/api/v1",
+        onetx_api_key="test-api-key",
+        account="safe",
+        submission="erc4337-paymaster",
+        owner_signer="local",
+        paymaster_provider="pimlico",
+        pimlico_api_key="pim_test",
+        paymaster_supported_chain_ids=None,
+        paymaster_usdc_address=None,
+        _rpc_overrides={8453: "rpc://base", 999999: "rpc://missing"},
+        _usdc_overrides={},
+        idempotency_store_path=None,
+    )
+    monkeypatch.setattr(cli, "AllocatorConfig", lambda: config)
+    return config
+
+
+def test_wallet_status_does_not_demand_native_gas_when_gas_is_paid_in_usdc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Safe holds no native token anywhere — that is the feature, not a fault.
+
+    A native-balance verdict marked every chain not executable while the gasless
+    path was working on mainnet, which tells the agent to go fund ETH.
+    """
+    set_paymaster_config(monkeypatch)
+    ExecutionOneTxClient.instances = []
+    ExecutionOneTxClient.build_buy_bodies = []
+    monkeypatch.setattr(cli, "OneTxClient", ExecutionOneTxClient)
+    monkeypatch.setattr(cli, "signer_from_config", lambda _config: ExecutionSignerSpy())
+    monkeypatch.setattr(
+        cli,
+        "_native_gas_status",
+        lambda *_args: pytest.fail("native gas must not be checked in paymaster mode"),
+    )
+
+    result = runner.invoke(cli.app, ["wallet-status"])
+
+    assert result.exit_code == 0
+    base = parse_single_stdout_object(result.stdout)["balances"][0]
+    assert base["chain_id"] == 8453
+    assert base["gas_mode"] == "usdc_paymaster"
+    assert base["executable"] is True
+    assert base["not_executable_reasons"] == []
+    assert base["native_gas_balance_wei"] is None
+    assert base["gas_token_address"] is not None
+
+
+def test_wallet_status_flags_a_chain_the_paymaster_cannot_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not executable here means "no USDC gas on this chain", not "no ETH"."""
+    set_paymaster_config(monkeypatch)
+    ExecutionOneTxClient.instances = []
+    ExecutionOneTxClient.build_buy_bodies = []
+    monkeypatch.setattr(cli, "OneTxClient", ExecutionOneTxClient)
+    monkeypatch.setattr(cli, "signer_from_config", lambda _config: ExecutionSignerSpy())
+
+    result = runner.invoke(cli.app, ["wallet-status"])
+
+    assert result.exit_code == 0
+    unsupported = parse_single_stdout_object(result.stdout)["balances"][1]
+    assert unsupported["chain_id"] == 999999
+    assert unsupported["executable"] is False
+    assert unsupported["not_executable_reasons"] == ["chain_not_gas_payable"]

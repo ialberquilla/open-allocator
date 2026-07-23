@@ -270,3 +270,42 @@ def test_zero_rounding_partial_withdraw_is_rejected() -> None:
             permissive_policy(),
             amount="0.99",
         )
+
+
+@dataclass
+class PendingWithdrawSigner:
+    """A Safe below its threshold: the exit is proposed, never broadcast."""
+
+    sent: list[TxStep] = field(default_factory=list)
+
+    def address(self) -> str:
+        return ADDRESS
+
+    def send(self, tx: TxStep, rpc_url: str) -> Receipt:
+        self.sent.append(tx)
+        return Receipt(
+            transaction_hash="0xproposal",
+            block_number=0,
+            gas_used=0,
+            status=0,
+            from_address=ADDRESS,
+            to_address=tx.to,
+            pending=True,
+            execution_status="safe_proposed",
+        )
+
+
+def test_a_proposed_exit_is_not_reported_as_a_completed_withdrawal() -> None:
+    """Nothing has been redeemed until the co-signers execute it."""
+    report = withdraw(
+        MockWithdrawClient([sell_response(expectedUsdc="99.50")]),
+        PendingWithdrawSigner(),
+        holding(share_balance="74.999123"),
+        permissive_policy(),
+        confirm=True,
+        config=Config(),
+    )
+
+    assert report.status == "in_progress"
+    assert report.in_progress is True
+    assert any("awaiting threshold" in message for message in report.messages)

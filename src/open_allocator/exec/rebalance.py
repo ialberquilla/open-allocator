@@ -39,6 +39,7 @@ from open_allocator.exec.execute import (
     _tx_step,
     _vaults_by_id,
     _write_checkpoint,
+    pending_receipt_messages,
 )
 from open_allocator.exec.signer import Receipt, Signer
 
@@ -183,6 +184,8 @@ def execute_rebalance(
             )
         )
 
+    unconfirmed = pending_receipt_messages(receipts)
+    in_progress = in_progress or bool(unconfirmed)
     report = RebalanceExecutionReport(
         status="in_progress" if in_progress else "success",
         rebalance_plan=rebalance_plan,
@@ -192,7 +195,7 @@ def execute_rebalance(
         receipts=tuple(receipts),
         gas_checks=gas_checks,
         in_progress=in_progress,
-        messages=messages,
+        messages=(*messages, *unconfirmed),
     )
     _write_checkpoint(
         config,

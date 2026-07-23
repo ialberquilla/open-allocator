@@ -8,6 +8,7 @@ Use checkpoints to make long allocation flows auditable and resumable. Checkpoin
 - Before waiting for human approval: status `awaiting_human` with the exact artifact being approved.
 - After confirmed execution: status `completed` with execution/withdraw/rebalance report and completed idempotency keys.
 - On partial failure or in-progress cross-chain state: status `failed` or `in_progress` with completed step keys and messages.
+- A submission that has settled nothing on chain — a Safe transaction awaiting threshold signatures, a user operation the bundler has not included — also checkpoints `in_progress`, never `completed`. The step keys are still recorded so a resume does not submit it twice; the report's messages name what is unconfirmed.
 
 ## What To Store
 

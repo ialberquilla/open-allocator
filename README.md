@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-530%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-539%20passing-brightgreen.svg)](#development)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
 
 [Install](#install) · [Talking to Your Agent](#talking-to-your-agent) · [Commands](#commands) · [Safety](#safety) · [Disclaimer](#disclaimer)
@@ -140,7 +140,7 @@ This path has been exercised end to end on Base and Arbitrum mainnet. The model,
 
 ## Agent Operation
 
-Agents start with [AGENT_GUIDE.md](AGENT_GUIDE.md), the operating contract for this repository. Shared architecture and invariants are in [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md); the original implementation plan is in [plan_allocator.md](plan_allocator.md).
+Agents start with [AGENT_GUIDE.md](AGENT_GUIDE.md), the operating contract for this repository. Shared architecture and invariants are in [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md).
 
 Stage skills and workflow graphs describe how to drive the CLI and review artifacts:
 
@@ -159,7 +159,7 @@ Stage skills and workflow graphs describe how to drive the CLI and review artifa
 
 ```bash
 uv run ruff check
-uv run pytest            # 530 passed, 3 integration tests skipped without live creds
+uv run pytest            # 539 passed, 3 integration tests skipped without live creds
 ```
 
 Unit tests mock 1Tx over `httpx.MockTransport` and the chain over `eth-tester`; no live network is touched. Live API/RPC tests are opt-in behind `@pytest.mark.integration` and explicit credential gates.
