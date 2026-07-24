@@ -13,6 +13,14 @@
 
 </div>
 
+<div align="center">
+
+![OpenAllocator demo — a plain-language allocation request returns a policy-clean, confirmation-gated $10k book](docs/media/demo.gif)
+
+<sub>A plain-language ask → a policy-clean $10k book, the honest "this passed set is a Morpho-on-Base monoculture" finding, and a proposal artifact that signs nothing without your go-ahead. · ▶ **[Watch a full run](docs/media/demo-full-run.mp4)**</sub>
+
+</div>
+
 `open-allocator` is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://app.1tx.fi/) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.
 
 **This is portfolio construction, not yield-chasing.** Most "auto-yield" tools sweep funds into whatever APY is highest this hour. `open-allocator` does what a professional asset allocator does — it builds a diversified allocation across explicit risk/reward metrics (Sharpe, volatility, drawdown), risk tiers, and real portfolio structures (`core_satellite`, `risk_parity`/`inverse_vol`, `sleeves`, `ladder`), bounded by an explicit policy — and runs it through an agent instead of a desk. High APY is a risk input, never the objective.
