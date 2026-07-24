@@ -11,10 +11,6 @@
 
 [Install](#install) · [Talking to Your Agent](#talking-to-your-agent) · [Commands](#commands) · [Safety](#safety) · [Disclaimer](#disclaimer)
 
-</div>
-
-<div align="center">
-
 ![OpenAllocator demo — a plain-language allocation request returns a policy-clean, confirmation-gated $10k book](docs/media/demo.gif)
 
 <sub>A plain-language ask → a policy-clean $10k book, the honest "this passed set is a Morpho-on-Base monoculture" finding, and a proposal artifact that signs nothing without your go-ahead. · ▶ **[Watch a full run](docs/media/demo-full-run.mp4)**</sub>
@@ -28,6 +24,8 @@
 This is an end-user allocator, not Morpho's curator-side Allocator role.
 
 > APY is descriptive, not predictive. Rates move, rewards end, liquidity changes, and smart-contract risk remains. Every metric here is yield-path only — never principal, depeg, bridge, or contract-loss risk.
+
+---
 
 ## Why It Exists
 
@@ -61,8 +59,6 @@ flowchart TB
       VS["validate schemas"] --> EF["enforce policy"] --> BP["build tx plan"] --> SB["sign + broadcast<br/>confirmation-gated"]
     end
 ```
-
-The executor never runs agent-authored code — it only consumes a validated artifact.
 
 ## Install
 
@@ -204,6 +200,8 @@ Unit tests mock 1Tx over `httpx.MockTransport` and the chain over `eth-tester`; 
 Layout: `src/open_allocator/core` (allocation, scoring, policy, risk metrics, strategies, screening, backtest, positions, checkpoints), `src/open_allocator/exec` (1Tx client, signers, executor, RPC registry), `schemas/` (JSON artifact contracts), `skills/` + `workflows/` (agent instruction layer), `docs/` (reference notes).
 
 The live 1Tx risk-factor field refresh remains credential-gated; see [docs/onetx-analysis-fields.md](docs/onetx-analysis-fields.md).
+
+---
 
 ## Disclaimer
 
