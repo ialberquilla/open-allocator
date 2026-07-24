@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-539%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-542%20passing-brightgreen.svg)](#development)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
 
 [Install](#install) · [Talking to Your Agent](#talking-to-your-agent) · [Commands](#commands) · [Safety](#safety) · [Disclaimer](#disclaimer)
@@ -38,6 +38,23 @@ The system has two planes:
 - **Execution plane (deterministic).** Python in `open_allocator.core` and `open_allocator.exec` validates schemas, enforces policy, builds transaction plans, and blocks unsafe execution. The executor never runs agent-authored code.
 
 A decision leaves the research plane only as a **validated artifact** — explicit weights or a named+parameterized strategy — and must pass `check-policy` before any transaction is built.
+
+```mermaid
+flowchart TB
+    subgraph RP["Research / decision plane — agentic, read-only"]
+      direction LR
+      D["discover<br/>list-vaults"] --> SC["score"] --> SN["screen"] --> BT["backtest"] --> PR["propose weights<br/>build-allocation"]
+    end
+    PR -->|"validated artifact<br/>(explicit weights or named strategy)"| G{"check-policy<br/>block-only gate"}
+    G -->|violation| X["abort<br/>no transaction built"]
+    G -->|pass| EP
+    subgraph EP["Execution plane — deterministic, policy-bounded"]
+      direction LR
+      VS["validate schemas"] --> EF["enforce policy"] --> BP["build tx plan"] --> SB["sign + broadcast<br/>confirmation-gated"]
+    end
+```
+
+The executor never runs agent-authored code — it only consumes a validated artifact.
 
 ## Install
 
@@ -130,11 +147,23 @@ Without `--confirm`, execution commands return a plan / dry-run report and broad
 
 Set `SIGNER_ACCOUNT=safe` and `SIGNER_SUBMISSION=erc4337-paymaster` and the allocator runs from a **Safe smart account that pays its own gas in USDC**:
 
+```mermaid
+flowchart LR
+    F["Fund ONE chain<br/>USDC only, no ETH"] --> SA["Counterfactual Safe<br/>same address on every chain<br/>deploys itself on first op"]
+    SA -->|same-chain buy| DEP["Deposit<br/>one atomic op<br/>gas paid in USDC"]
+    SA -->|cross-chain buy| BR["Bridge over CCTP<br/>1Tx settles the destination mint"]
+    DEP -->|exit| EX["Batched exit<br/>redeems USDC, pays its own gas<br/>on a chain that held nothing"]
+    BR --> POS["positions<br/>reports what actually landed"]
+```
+
+
 - The Safe is **counterfactual** — derived from your owner list, the same address on every chain, and it deploys itself inside its first operation on each chain. Nothing to create up front.
 - A chain's plan steps go out as **one atomic operation**. Because the paymaster charges after execution, an exit pays its gas out of the USDC it just redeemed — on a chain where the Safe held nothing at all.
-- Cross-chain deposits bridge over CCTP and land the position without deploying anything on the destination.
+- Cross-chain deposits bridge over CCTP without deploying anything on the destination.
 
 Net effect: **fund one chain**. Deposits bridge out, exits pay their own way back, and no chain ever needs native gas.
+
+A cross-chain buy has two legs with one owner each. The allocator signs, submits, and reports the **source-chain** leg — `execute` returns once that transaction lands. Relaying the CCTP message and minting on the far side is **1Tx's to settle**; the allocator does not poll the bridge by design. Read what actually landed with `positions`. An operation that has settled nothing — a bundler hasn't included the user-op, a Safe is awaiting signatures — reports `in_progress`, never `success`.
 
 This path has been exercised end to end on Base and Arbitrum mainnet. The model, the traps, and its known limits are in [docs/gasless-execution.md](docs/gasless-execution.md).
 
@@ -159,7 +188,7 @@ Stage skills and workflow graphs describe how to drive the CLI and review artifa
 
 ```bash
 uv run ruff check
-uv run pytest            # 539 passed, 3 integration tests skipped without live creds
+uv run pytest            # 542 passed, 3 integration tests skipped without live creds
 ```
 
 Unit tests mock 1Tx over `httpx.MockTransport` and the chain over `eth-tester`; no live network is touched. Live API/RPC tests are opt-in behind `@pytest.mark.integration` and explicit credential gates.
