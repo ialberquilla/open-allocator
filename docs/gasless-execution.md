@@ -10,46 +10,19 @@ everything here: an EOA holds its own native gas and cannot batch.
 
 ## The model
 
-- The Safe is **counterfactual**. Its address comes from `SAFE_OWNERS` +
-  `SAFE_THRESHOLD` + `SAFE_SALT_NONCE`, so it is the same on every chain reached
-  by the Safe Singleton Factory, and nobody has to create it in a UI first.
-  `open-allocator safe-address` prints it.
-- It **deploys itself inside its first user operation on each chain** — EntryPoint
-  v0.7 `factory`/`factoryData`. There is no separate deployment step, and no chain
-  needs the Safe to exist before funds are sent to it.
-- Gas is paid in **USDC**, pulled from the Safe by the paymaster. The owner key
-  signs and never needs to hold anything.
-- A whole plan's steps for one chain ride in **one user operation**, batched
-  atomically through MultiSendCallOnly.
+The Safe is **counterfactual** (address from `SAFE_OWNERS` + `SAFE_THRESHOLD` +
+`SAFE_SALT_NONCE`, the same on every chain the Safe Singleton Factory reaches;
+`open-allocator safe-address` prints it) and **deploys itself inside its first user
+operation on each chain** via EntryPoint v0.7 `factory`/`factoryData` — no separate
+deployment step. Gas is paid in **USDC**, pulled from the Safe by the paymaster in
+`postOp`, which runs *after* execution, so an operation that produces USDC can pay
+for itself. A plan's steps for one chain ride in **one user operation**, batched
+atomically through MultiSendCallOnly.
 
-## Fund one chain
-
-The paymaster charges in `postOp`, which runs *after* the operation executes.
-So an operation that produces USDC can pay for itself out of what it just
-produced. That is what makes an exit self-funding: the batch approves the yield
-token, redeems the position, and the redeemed USDC covers the gas — on a chain
-where the Safe held **nothing** beforehand, not even a deployment.
-
-Together with cross-chain buys, whose destination-side gas is paid by whoever
-relays the CCTP message, a user only ever needs USDC on the chain they choose to
-fund. Deposits bridge out; exits pay their own way back.
-
-## Who settles what
-
-A cross-chain buy has two legs and one owner each. The allocator signs and
-submits the **source-chain** leg, and reports on that: it returns once that
-transaction lands, and `in_progress` reflects what the 1Tx build response said.
-
-The **destination** leg — relaying the CCTP message, minting on the far side, and
-depositing into the vault — belongs to 1Tx. The allocator does not poll Circle's
-attestation or track the message, by design; delegating it is the point of
-building on 1Tx. Read the landed position with `positions`, which reports what is
-actually on chain rather than what a bridge promised.
-
-What the allocator does owe you is the truth about its own submission: an
-operation that has settled nothing — a Safe transaction awaiting threshold
-signatures, a user operation the bundler has not included — reports
-`in_progress`, never `success`.
+The narrative — fund one chain, who settles a cross-chain leg, why it must be
+batched — is in the README's [Gas in USDC](../README.md#gas-in-usdc-no-native-tokens)
+section. What follows is the engineering behind it: what was observed on chain, the
+traps, and the limits.
 
 **This only works batched.** Sent one step at a time, the first operation is an
 approval that produces no USDC, and `postOp` reverts `AA50 / TransferFromFailed()`
