@@ -15,6 +15,17 @@ caps:
   max_weight_per_protocol: 0.50
   max_weight_per_curator: 0.40
   max_weight_per_chain: 0.70
+  # Sector = yield source (variable-rate lending / savings rate / fixed rate /
+  # private credit / basis / LP fee), sourced from 1Tx discovery.
+  #
+  # Left unbinding at 1.00 on purpose. Every live instrument on today's shelf is
+  # VARIABLE_RATE_LENDING, so any real cap here would leave capital unplaceable
+  # and report `caps_binding:unallocatable_weight` rather than diversify
+  # anything — the shelf, not the policy, is the binding constraint. The
+  # effective-sector count is reported by `simulate` regardless, so the
+  # monoculture is visible before signing either way. Tighten to ~0.60 in the
+  # same commit that puts a second sector on the shelf.
+  max_weight_per_sector: 1.00
   min_instrument_tvl_usd: 50_000
   max_reward_dependence: 0.50      # cap emissions-driven APY dependence
 gates:

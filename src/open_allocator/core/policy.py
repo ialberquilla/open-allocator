@@ -13,6 +13,7 @@ from open_allocator.core.types import (
     Policy,
     Vault,
     curator_bucket,
+    sector_bucket,
 )
 
 PolicyScalar: TypeAlias = str | int | float | bool | None
@@ -138,6 +139,7 @@ def _check_caps(
     protocol_weights: defaultdict[str, float] = defaultdict(float)
     curator_weights: defaultdict[str, float] = defaultdict(float)
     chain_weights: defaultdict[int, float] = defaultdict(float)
+    sector_weights: defaultdict[str, float] = defaultdict(float)
 
     for leg in allocation.legs:
         instrument_weights[leg.instrument_id] += leg.weight
@@ -149,6 +151,7 @@ def _check_caps(
             leg.weight
         )
         chain_weights[vault.chain_id] += leg.weight
+        sector_weights[sector_bucket(vault.sector)] += leg.weight
 
     caps = policy.caps
     _check_weight_cap(
@@ -175,6 +178,16 @@ def _check_caps(
         chain_weights,
         violations,
     )
+    # Absent = not enforced. The dimension is still reported by simulate/
+    # concentration, so an unset cap cannot hide a monoculture — it only
+    # declines to block one.
+    if caps.max_weight_per_sector is not None:
+        _check_weight_cap(
+            "max_weight_per_sector",
+            caps.max_weight_per_sector,
+            sector_weights,
+            violations,
+        )
 
 
 def _check_weight_cap(

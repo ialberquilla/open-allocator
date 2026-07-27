@@ -74,6 +74,7 @@ def _to_vault(instrument: object) -> Vault:
         chain_id=int(_required(instrument, "chain_id", "chainId")),
         asset=str(_required(instrument, "asset", "token_symbol", "tokenSymbol")),
         asset_category=_optional_text(instrument, "asset_category", "assetCategory"),
+        sector=_optional_text(instrument, "sector"),
         is_stablecoin=_optional_bool(instrument, "is_stablecoin", "isStablecoin"),
         apy=float(_required(instrument, "apy", "current_apy", "currentApy")),
         tvl_usd=float(_required(instrument, "tvl_usd", "tvlUsd", "tvl")),

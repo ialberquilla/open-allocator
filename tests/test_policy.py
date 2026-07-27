@@ -140,6 +140,15 @@ PASSING_CASES = [
         id="max_weight_per_chain",
     ),
     pytest.param(
+        allocation((("vault-a", 0.2, 20), ("vault-b", 0.3, 30)), total_usd=50),
+        policy(policy_caps=caps(max_weight_per_sector=0.5)),
+        (
+            vault(sector="VARIABLE_RATE_LENDING"),
+            vault(instrument_id="vault-b", sector="SAVINGS_RATE"),
+        ),
+        id="max_weight_per_sector",
+    ),
+    pytest.param(
         allocation(),
         policy(policy_caps=caps(min_instrument_tvl_usd=10_000_000)),
         (vault(),),
@@ -267,6 +276,19 @@ FAILING_CASES = [
         0.5,
         0.6,
         id="max_weight_per_chain",
+    ),
+    pytest.param(
+        allocation((("vault-a", 0.3, 30), ("vault-b", 0.3, 30)), total_usd=60),
+        policy(policy_caps=caps(max_weight_per_sector=0.5)),
+        (
+            vault(sector="VARIABLE_RATE_LENDING"),
+            vault(instrument_id="vault-b", sector="VARIABLE_RATE_LENDING"),
+        ),
+        "max_weight_per_sector",
+        "VARIABLE_RATE_LENDING",
+        0.5,
+        0.6,
+        id="max_weight_per_sector",
     ),
     pytest.param(
         allocation(),
@@ -506,3 +528,49 @@ def test_policy_result_rejects_ok_true_with_violations() -> None:
 
     with pytest.raises(ValueError, match="ok must be true only"):
         PolicyResult(ok=True, violations=failing.violations)
+
+
+def test_unclassified_sectors_share_one_bucket_and_trip_the_cap_together() -> None:
+    # The load-bearing decision: an unclassified sector is an unmeasured
+    # concentration, not a distinct sleeve. Two unknowns must collide so the
+    # dimension fails closed when upstream has not labelled the shelf.
+    result = check(
+        allocation((("vault-a", 0.3, 30), ("vault-b", 0.3, 30)), total_usd=60),
+        policy(policy_caps=caps(max_weight_per_sector=0.5)),
+        (vault(sector=None), vault(instrument_id="vault-b", sector=None)),
+    )
+
+    assert result.ok is False
+    item = violation(result, "max_weight_per_sector")
+    assert item.entity == "__unknown_sector__"
+    assert item.actual == pytest.approx(0.6)
+
+
+def test_unknown_curators_still_get_their_own_buckets() -> None:
+    # The mirror-image contrast that keeps the two rules from being "fixed"
+    # into agreement: undisclosed curators must NOT collide.
+    result = check(
+        allocation((("vault-a", 0.3, 30), ("vault-b", 0.3, 30)), total_usd=60),
+        policy(policy_caps=caps(max_weight_per_curator=0.5)),
+        (
+            vault(curator=None),
+            vault(instrument_id="vault-b", curator=None),
+        ),
+    )
+
+    assert result.ok is True
+
+
+def test_absent_sector_cap_is_not_enforced() -> None:
+    # Optional by design: existing policy files predate the axis and must keep
+    # loading and passing rather than silently acquiring a new blocking rule.
+    result = check(
+        allocation((("vault-a", 0.6, 60), ("vault-b", 0.4, 40)), total_usd=100),
+        policy(policy_caps=caps(max_weight_per_sector=None)),
+        (
+            vault(sector="VARIABLE_RATE_LENDING"),
+            vault(instrument_id="vault-b", sector="VARIABLE_RATE_LENDING"),
+        ),
+    )
+
+    assert result.ok is True

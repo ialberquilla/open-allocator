@@ -448,3 +448,80 @@ def test_pins_summing_over_one_are_rejected() -> None:
             1_000,
             overrides={"vault-a": 0.6, "vault-b": 0.6},
         )
+
+
+def test_sector_cap_clamps_weight_and_reports_the_unplaceable_remainder() -> None:
+    # A monoculture shelf with a binding sector cap: the allocator must refuse
+    # to place the excess rather than quietly ignore the dimension.
+    vaults = [
+        vault(instrument_id="vault-a", sector="VARIABLE_RATE_LENDING"),
+        vault(
+            instrument_id="vault-b",
+            protocol="aave",
+            curator="curator-b",
+            sector="VARIABLE_RATE_LENDING",
+        ),
+    ]
+
+    allocation = build_allocation(
+        [scored(vaults[0], 0.8), scored(vaults[1], 0.7)],
+        10_000,
+        caps={"max_weight_per_sector": 0.6},
+    )
+
+    assert sum(leg.weight for leg in allocation.legs) == pytest.approx(0.6)
+    assert any(
+        warning.startswith("caps_binding:unallocatable_weight")
+        for warning in allocation.metadata["warnings"]
+    )
+
+
+def test_sector_cap_lets_a_two_sleeve_shelf_stay_fully_invested() -> None:
+    vaults = [
+        vault(instrument_id="vault-a", sector="VARIABLE_RATE_LENDING"),
+        vault(
+            instrument_id="vault-b",
+            protocol="sky",
+            curator="curator-b",
+            sector="SAVINGS_RATE",
+        ),
+    ]
+
+    allocation = build_allocation(
+        [scored(vaults[0], 0.8), scored(vaults[1], 0.7)],
+        10_000,
+        caps={"max_weight_per_sector": 0.6},
+    )
+
+    assert sum(leg.weight for leg in allocation.legs) == pytest.approx(1.0)
+    assert all(leg.weight <= 0.6 + 1e-9 for leg in allocation.legs)
+
+
+def test_unclassified_sectors_bind_the_cap_collectively() -> None:
+    vaults = [
+        vault(instrument_id="vault-a", sector=None),
+        vault(instrument_id="vault-b", protocol="aave", curator="curator-b"),
+    ]
+
+    allocation = build_allocation(
+        [scored(vaults[0], 0.8), scored(vaults[1], 0.7)],
+        10_000,
+        caps={"max_weight_per_sector": 0.6},
+    )
+
+    assert sum(leg.weight for leg in allocation.legs) == pytest.approx(0.6)
+
+
+def test_omitted_sector_cap_leaves_allocation_unchanged() -> None:
+    vaults = [
+        vault(instrument_id="vault-a", sector=None),
+        vault(instrument_id="vault-b", protocol="aave", curator="curator-b"),
+    ]
+
+    allocation = build_allocation(
+        [scored(vaults[0], 0.8), scored(vaults[1], 0.7)],
+        10_000,
+    )
+
+    assert sum(leg.weight for leg in allocation.legs) == pytest.approx(1.0)
+    assert allocation.metadata["caps"]["max_weight_per_sector"] == 1.0

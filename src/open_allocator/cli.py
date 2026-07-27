@@ -1317,11 +1317,16 @@ def simulate(
     benchmark: Annotated[str | None, typer.Option("--benchmark")] = None,
 ) -> JsonObject:
     allocation = _read_allocation(allocation_path)
+    # Discovery supplies the sector labels; without it the output would show
+    # yield and stability but say nothing about how many sleeves the capital
+    # actually sits in.
+    vaults = _discover_vaults(enrich=False)
     with OneTxClient(ReadOnlyOneTxConfig()) as client:
         return simulate_core.simulate(
             client,
             allocation,
             benchmark=benchmark,
+            vaults=vaults,
         ).model_dump(mode="json")
 
 

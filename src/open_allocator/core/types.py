@@ -33,6 +33,25 @@ def curator_bucket(instrument_id: str, curator: TextRiskValue) -> str:
     return str(curator)
 
 
+UNKNOWN_SECTOR = "__unknown_sector__"
+
+
+def sector_bucket(sector: str | None) -> str:
+    """Cap bucket key for a vault's sector (yield source).
+
+    Deliberately the mirror image of :func:`curator_bucket`. An undisclosed
+    curator is not evidence that two instruments share one, so each unknown
+    gets its own bucket. An *unclassified sector* is the opposite: it is an
+    unmeasured concentration, and a diversification cap must not read silence
+    as diversity. So every unknown lands in one shared bucket and they trip the
+    sector cap collectively — the dimension fails closed, loudly, instead of
+    quietly becoming a no-op when the upstream field is missing.
+    """
+    if sector is None or sector == Unknown or sector == "":
+        return UNKNOWN_SECTOR
+    return str(sector)
+
+
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -43,6 +62,10 @@ class Vault(FrozenModel):
     chain_id: int
     asset: str
     asset_category: str | None = None
+    # Yield source ("how this pays"), sourced from 1Tx discovery — never
+    # hardcoded here, per the Dynamic Universe Rule. None = upstream has not
+    # classified it; see sector_bucket for what that costs.
+    sector: str | None = None
     is_stablecoin: bool | None = None
     apy: float
     tvl_usd: float = Field(ge=0)
@@ -141,6 +164,10 @@ class PolicyCaps(FrozenModel):
     max_weight_per_protocol: float = Field(ge=0, le=1)
     max_weight_per_curator: float = Field(ge=0, le=1)
     max_weight_per_chain: float = Field(ge=0, le=1)
+    # Optional so existing policy files keep loading. Absent = the sector
+    # dimension is not enforced (the allocator treats it as 1.0); it is still
+    # always *reported*, so an unset cap cannot hide a monoculture.
+    max_weight_per_sector: float | None = Field(default=None, ge=0, le=1)
     min_instrument_tvl_usd: float = Field(ge=0)
     max_reward_dependence: float = Field(ge=0, le=1)
 
