@@ -102,6 +102,11 @@
           "minimum": 0,
           "maximum": 1
         },
+        "max_weight_per_sector": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
         "min_instrument_tvl_usd": {
           "type": "number",
           "minimum": 0

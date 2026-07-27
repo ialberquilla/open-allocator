@@ -4,8 +4,13 @@ from typing import Any
 
 import pytest
 
-from open_allocator.core.simulate import analyze, compare, simulate
-from open_allocator.core.types import Allocation, AllocationLeg
+from open_allocator.core.simulate import (
+    analyze,
+    compare,
+    sector_concentration,
+    simulate,
+)
+from open_allocator.core.types import Allocation, AllocationLeg, Vault
 from open_allocator.exec.client import (
     CompareResult,
     PortfolioAnalysis,
@@ -228,3 +233,94 @@ def test_simulate_output_is_marked_descriptive() -> None:
         "principalUsd": 1_000,
         "benchmark": "USD_INDEX",
     }
+
+
+def sector_vault(instrument_id: str, sector: str | None) -> Vault:
+    return Vault(
+        instrument_id=instrument_id,
+        protocol="morpho",
+        chain_id=8453,
+        asset="USDC",
+        sector=sector,
+        apy=0.04,
+        tvl_usd=1_000_000,
+    )
+
+
+def test_effective_sectors_is_one_for_a_monoculture() -> None:
+    book = allocation(("vault-a", 0.5), ("vault-b", 0.5))
+    vaults = [
+        sector_vault("vault-a", "VARIABLE_RATE_LENDING"),
+        sector_vault("vault-b", "VARIABLE_RATE_LENDING"),
+    ]
+
+    result = sector_concentration(book, vaults)
+
+    assert [item.key for item in result.items] == ["VARIABLE_RATE_LENDING"]
+    assert result.effective_sectors == pytest.approx(1.0)
+    assert result.top_weight_bps == 10000
+    assert result.unclassified_weight_bps == 0
+
+
+def test_effective_sectors_counts_an_even_two_way_split_as_two() -> None:
+    book = allocation(("vault-a", 0.5), ("vault-b", 0.5))
+    vaults = [
+        sector_vault("vault-a", "VARIABLE_RATE_LENDING"),
+        sector_vault("vault-b", "SAVINGS_RATE"),
+    ]
+
+    assert sector_concentration(book, vaults).effective_sectors == pytest.approx(2.0)
+
+
+def test_unclassified_legs_collapse_into_one_bucket_and_are_reported() -> None:
+    # Three unlabelled instruments must read as one unmeasured sleeve, not
+    # three — otherwise a missing upstream field would look like diversity.
+    book = allocation(("vault-a", 1 / 3), ("vault-b", 1 / 3), ("vault-c", 1 / 3))
+    vaults = [
+        sector_vault("vault-a", None),
+        sector_vault("vault-b", None),
+        sector_vault("vault-c", None),
+    ]
+
+    result = sector_concentration(book, vaults)
+
+    assert result.effective_sectors == pytest.approx(1.0)
+    assert result.unclassified_weight_bps == 10000
+
+
+def test_legs_missing_from_the_universe_are_treated_as_unclassified() -> None:
+    book = allocation(("vault-a", 0.5), ("vault-b", 0.5))
+    vaults = [sector_vault("vault-a", "SAVINGS_RATE")]
+
+    result = sector_concentration(book, vaults)
+
+    assert result.effective_sectors == pytest.approx(2.0)
+    assert result.unclassified_weight_bps == 5000
+
+
+def test_sector_weights_reuse_the_same_bps_split_sent_to_the_api() -> None:
+    client = MockPortfolioClient()
+    book = allocation(
+        ("vault-a", 0.333333),
+        ("vault-b", 0.333333),
+        ("vault-c", 0.333334),
+    )
+    vaults = [
+        sector_vault("vault-a", "SAVINGS_RATE"),
+        sector_vault("vault-b", "SAVINGS_RATE"),
+        sector_vault("vault-c", "VARIABLE_RATE_LENDING"),
+    ]
+
+    result = analyze(client, book, vaults)
+
+    assert result.sector_concentration is not None
+    assert sum(item.weight_bps for item in result.sector_concentration.items) == 10000
+    assert dict(
+        (item.key, item.weight_bps) for item in result.sector_concentration.items
+    ) == {"SAVINGS_RATE": 6666, "VARIABLE_RATE_LENDING": 3334}
+
+
+def test_sector_view_is_absent_not_empty_when_no_universe_is_supplied() -> None:
+    result = analyze(MockPortfolioClient(), allocation(("vault-a", 1.0)))
+
+    assert result.sector_concentration is None

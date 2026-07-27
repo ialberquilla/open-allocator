@@ -17,6 +17,7 @@ from open_allocator.core.types import (
     Vault,
     VaultScore,
     curator_bucket,
+    sector_bucket,
 )
 
 RiskPresetName = Literal["conservative", "balanced", "aggressive"]
@@ -49,6 +50,7 @@ class _Caps:
     max_weight_per_protocol: float = 1.0
     max_weight_per_curator: float = 1.0
     max_weight_per_chain: float = 1.0
+    max_weight_per_sector: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -375,6 +377,7 @@ def _caps(caps: Mapping[str, object] | object | None) -> _Caps:
         max_weight_per_protocol=_cap(caps, "max_weight_per_protocol", "protocol"),
         max_weight_per_curator=_cap(caps, "max_weight_per_curator", "curator"),
         max_weight_per_chain=_cap(caps, "max_weight_per_chain", "chain"),
+        max_weight_per_sector=_cap(caps, "max_weight_per_sector", "sector"),
     )
 
 
@@ -532,6 +535,7 @@ def _capacity(
         caps.max_weight_per_curator
         - totals["curator"][_key(records[index], "curator")],
         caps.max_weight_per_chain - totals["chain"][_key(records[index], "chain")],
+        caps.max_weight_per_sector - totals["sector"][_key(records[index], "sector")],
     )
 
 
@@ -544,6 +548,7 @@ def _dimension_totals(
         "protocol": defaultdict(float),
         "curator": defaultdict(float),
         "chain": defaultdict(float),
+        "sector": defaultdict(float),
     }
     for record, weight in zip(records, weights, strict=True):
         for dimension in totals:
@@ -570,6 +575,8 @@ def _key(record: ScoredVault, dimension: str) -> str:
         return curator_bucket(record.vault.instrument_id, record.vault.curator)
     if dimension == "chain":
         return str(record.vault.chain_id)
+    if dimension == "sector":
+        return sector_bucket(record.vault.sector)
     raise ValueError(f"unknown cap dimension: {dimension}")
 
 
@@ -579,6 +586,7 @@ def _cap_items(caps: _Caps) -> tuple[tuple[str, float], ...]:
         ("protocol", caps.max_weight_per_protocol),
         ("curator", caps.max_weight_per_curator),
         ("chain", caps.max_weight_per_chain),
+        ("sector", caps.max_weight_per_sector),
     )
 
 
@@ -716,6 +724,7 @@ def _metadata(
             "max_weight_per_protocol": caps.max_weight_per_protocol,
             "max_weight_per_curator": caps.max_weight_per_curator,
             "max_weight_per_chain": caps.max_weight_per_chain,
+            "max_weight_per_sector": caps.max_weight_per_sector,
         },
         "warnings": sorted(set(warnings)),
     }
