@@ -13,7 +13,7 @@ import typer
 from open_allocator.core import allocator as allocation_core
 from open_allocator.core import backtest as backtest_core
 from open_allocator.core import costs as costs_core
-from open_allocator.core import eligibility, universe
+from open_allocator.core import eligibility, metrics, universe
 from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
 from open_allocator.core import riskmetrics as riskmetrics_core
@@ -39,6 +39,15 @@ JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonObject = dict[str, Any]
 P = ParamSpec("P")
 R = TypeVar("R", bound=JsonValue)
+
+# History window for every command that fetches metrics.
+#
+# Must exceed `diversify.MIN_OVERLAP` (60), the *shared* days a pair needs
+# before it is scored at all: below that every pair is unmeasured, unmeasured
+# fails closed to "one bet", and `caps.min_effective_positions` becomes
+# impossible to satisfy rather than merely strict. Single-instrument metrics
+# (coefficient of variation, reward dependence) read the same window.
+HISTORY_DAYS = 180
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -130,7 +139,7 @@ def _discover_vaults_from_client(
 ) -> list[Vault]:
     vaults = universe.discover(client)
     if enrich:
-        return enrich_vaults(client, vaults, days=30)
+        return enrich_vaults(client, vaults, days=HISTORY_DAYS)
     return vaults
 
 
@@ -331,9 +340,7 @@ def _withdraw_idempotency_store(
 
 def _allocation_scope(allocation: Allocation) -> str:
     payload = allocation.model_dump(mode="json")
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -348,9 +355,7 @@ def _rebalance_scope(
         "target": target.model_dump(mode="json"),
         "min_trade_usd": min_trade_usd,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -363,9 +368,7 @@ def _withdraw_scope(
         "position": position.model_dump(mode="json"),
         "amount": amount,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -599,9 +602,7 @@ def _wallet_status_payload() -> JsonObject:
     # design, so asking for a native balance answers a question this wallet never
     # has to satisfy.
     gas_status = (
-        _paymaster_gas_status
-        if submits_via_paymaster(config)
-        else _native_gas_status
+        _paymaster_gas_status if submits_via_paymaster(config) else _native_gas_status
     )
     balances = []
     for balance in balances_payload["balances"]:
@@ -967,9 +968,7 @@ def _parse_strategy_params(params: list[str] | None) -> dict[str, Any] | None:
     for item in params:
         key, sep, raw = item.partition("=")
         if not sep or not key.strip():
-            raise ValueError(
-                f"--strategy-param must be 'key=value', got: {item!r}"
-            )
+            raise ValueError(f"--strategy-param must be 'key=value', got: {item!r}")
         parsed[key.strip()] = _coerce_scalar(raw.strip())
     return parsed
 
@@ -1082,10 +1081,7 @@ def list_vaults(
     elif sort == VaultSort.SCORE:
         vaults.sort(key=lambda vault: scores[vault.instrument_id].score, reverse=True)
 
-    return [
-        _vault_summary(vault, scores[vault.instrument_id])
-        for vault in vaults
-    ]
+    return [_vault_summary(vault, scores[vault.instrument_id]) for vault in vaults]
 
 
 @app.command("score-vault")
@@ -1214,9 +1210,7 @@ def build_allocation(
         )
 
     if amount is None:
-        raise ValueError(
-            "amount required: pass --amount or set amount_usd in the spec"
-        )
+        raise ValueError("amount required: pass --amount or set amount_usd in the spec")
 
     policy = load_policy(policy_path)
     discovered = _discover_vaults(enrich=True)
@@ -1319,9 +1313,14 @@ def simulate(
     allocation = _read_allocation(allocation_path)
     # Discovery supplies the sector labels; without it the output would show
     # yield and stability but say nothing about how many sleeves the capital
-    # actually sits in.
-    vaults = _discover_vaults(enrich=False)
+    # actually sits in. The dated history on top is what turns that label into
+    # a measurement — one extra bulk call, not one per instrument.
     with OneTxClient(ReadOnlyOneTxConfig()) as client:
+        vaults = metrics.attach_series(
+            client,
+            _discover_vaults_from_client(client, enrich=False),
+            days=HISTORY_DAYS,
+        )
         return simulate_core.simulate(
             client,
             allocation,

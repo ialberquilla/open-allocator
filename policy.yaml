@@ -12,9 +12,17 @@ allowed:
   curators: null               # null/omitted = any curator
 caps:
   max_weight_per_instrument: 0.30  # no single pool > 30%
-  max_weight_per_protocol: 0.50
+  # Chain is the diversifying axis, protocol largely is not: measured on live
+  # instruments, only protocol+chain+asset *together* co-moves, while the same
+  # protocol on a different chain is uncorrelated. So the chain cap is the
+  # tighter of the two.
+  max_weight_per_protocol: 0.60
+  # NOTE: not a control we currently have. `curator` arrives Unknown from
+  # discovery, and curator_bucket gives each unknown its own bucket (an
+  # undisclosed curator is not evidence two vaults share one), so this cap does
+  # not bind until discovery surfaces curators.
   max_weight_per_curator: 0.40
-  max_weight_per_chain: 0.70
+  max_weight_per_chain: 0.60
   # Sector = yield source (variable-rate lending / savings rate / fixed rate /
   # private credit / basis / LP fee), sourced from 1Tx discovery.
   #
@@ -26,6 +34,18 @@ caps:
   # monoculture is visible before signing either way. Tighten to ~0.60 in the
   # same commit that puts a second sector on the shelf.
   max_weight_per_sector: 1.00
+  # The measured counterpart to the caps above: a floor on the effective number
+  # of independent positions, computed from the instruments' own APY history
+  # rather than from their labels. A ceiling on a label can be satisfied by
+  # holding many names for one position; this cannot.
+  #
+  # 3.0 rejects taking the highest APYs on offer and accepts a spread of the
+  # same width across distinct protocol/chain/asset cells.
+  #
+  # Unmeasurable allocations FAIL this rather than passing it — see
+  # policy._check_diversification. Instruments too new to score are charged as
+  # fully correlated, so a basket of fresh high-APY pools will not clear it.
+  min_effective_positions: 3.0
   min_instrument_tvl_usd: 50_000
   max_reward_dependence: 0.50      # cap emissions-driven APY dependence
 gates:

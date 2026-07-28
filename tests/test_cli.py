@@ -1,6 +1,8 @@
 import json
 import os
+import random
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -72,6 +74,33 @@ def parse_single_stdout_value(stdout: str) -> object:
 def set_read_only_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ONE_TX_API_URL", "http://localhost:3001/api/v1")
     monkeypatch.setenv("ONE_TX_API_KEY", "test-api-key")
+
+
+def metric_points(instrument_id: str, days: int) -> list[dict[str, Any]]:
+    """A deterministic, per-instrument-decorrelated daily APY series.
+
+    An empty series is not a neutral fixture: ``caps.min_effective_positions``
+    is measured *across* instruments and fails closed, so no history means "we
+    could not measure this" and every allocation violates. Seeding from the
+    instrument id keeps the series reproducible and independent between
+    instruments.
+    """
+    rng = random.Random(instrument_id)
+    start = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    level = 5.0
+    points = []
+    for index in range(days):
+        level += rng.random() - 0.5
+        points.append(
+            {
+                "timestamp": (start + timedelta(days=index))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "apy": level,
+                "tvl_usd": 10_000_000.0,
+            }
+        )
+    return points
 
 
 def instrument(**overrides: Any) -> dict[str, Any]:
@@ -223,7 +252,10 @@ def install_mock_onetx_client(
         ) -> list[dict[str, object]]:
             self.calls += 1
             return [
-                {"instrumentId": instrument_id, "metrics": []}
+                {
+                    "instrumentId": instrument_id,
+                    "metrics": metric_points(instrument_id, days),
+                }
                 for instrument_id in instrument_ids
             ]
 
@@ -329,7 +361,10 @@ class ExecutionOneTxClient:
         days: int,
     ) -> list[dict[str, object]]:
         return [
-            {"instrumentId": instrument_id, "metrics": []}
+            {
+                "instrumentId": instrument_id,
+                "metrics": metric_points(instrument_id, days),
+            }
             for instrument_id in instrument_ids
         ]
 
@@ -402,7 +437,10 @@ class RebalanceOneTxClient:
         days: int,
     ) -> list[dict[str, object]]:
         return [
-            {"instrumentId": instrument_id, "metrics": []}
+            {
+                "instrumentId": instrument_id,
+                "metrics": metric_points(instrument_id, days),
+            }
             for instrument_id in instrument_ids
         ]
 
@@ -1678,8 +1716,6 @@ def test_execution_commands_without_confirmation_do_not_call_executor(
         "command": command,
         "requires": "--confirm or explicit --unsafe/--autonomous",
     }
-
-
 
 
 def set_paymaster_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:

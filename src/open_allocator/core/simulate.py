@@ -5,6 +5,7 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Literal, Protocol
 
+from open_allocator.core import diversify
 from open_allocator.core.types import (
     UNKNOWN_SECTOR,
     Allocation,
@@ -21,9 +22,7 @@ from open_allocator.exec.client import (
     SimulationResult,
 )
 
-DESCRIPTIVE_LABEL: Literal["descriptive-not-predictive"] = (
-    "descriptive-not-predictive"
-)
+DESCRIPTIVE_LABEL: Literal["descriptive-not-predictive"] = "descriptive-not-predictive"
 
 
 class SectorItem(FrozenModel):
@@ -58,6 +57,9 @@ class PortfolioScorecard(FrozenModel):
     concentration_flags: tuple[ConcentrationLimitFlag, ...]
     # None when no universe was supplied — absent, not "diversified".
     sector_concentration: SectorConcentration | None = None
+    # The measured view. None when the universe carries no dated history —
+    # again absent, never "diversified".
+    diversification: diversify.DiversificationReport | None = None
 
 
 class PortfolioComparison(FrozenModel):
@@ -70,6 +72,7 @@ class PortfolioSimulation(FrozenModel):
     label: Literal["descriptive-not-predictive"] = DESCRIPTIVE_LABEL
     simulation: SimulationResult
     sector_concentration: SectorConcentration | None = None
+    diversification: diversify.DiversificationReport | None = None
 
 
 class _PortfolioClient(Protocol):
@@ -118,6 +121,27 @@ def sector_concentration(
     )
 
 
+def diversification(
+    allocation: Allocation,
+    vaults: Sequence[Vault],
+) -> diversify.DiversificationReport | None:
+    """Measured diversification for an allocation, or None if unmeasurable.
+
+    Returns None when no held instrument carries dated history — an allocation
+    we cannot measure reports nothing rather than a number that would read as
+    a clean bill of health.
+    """
+    weights_bps = {leg.instrument_id: leg_bps for leg, leg_bps in _leg_bps(allocation)}
+    series_by_id = {
+        vault.instrument_id: dict(vault.apy_daily)
+        for vault in vaults
+        if vault.instrument_id in weights_bps and vault.apy_daily
+    }
+    if not series_by_id:
+        return None
+    return diversify.report(weights_bps, diversify.co_movement_matrix(series_by_id))
+
+
 def analyze(
     client: _PortfolioClient,
     allocation: Allocation,
@@ -131,6 +155,9 @@ def analyze(
         concentration_flags=analysis.concentration.limit_flags,
         sector_concentration=(
             sector_concentration(allocation, vaults) if vaults is not None else None
+        ),
+        diversification=(
+            diversification(allocation, vaults) if vaults is not None else None
         ),
     )
 
@@ -167,6 +194,9 @@ def simulate(
         simulation=simulation,
         sector_concentration=(
             sector_concentration(allocation, vaults) if vaults is not None else None
+        ),
+        diversification=(
+            diversification(allocation, vaults) if vaults is not None else None
         ),
     )
 
@@ -218,6 +248,7 @@ __all__ = [
     "SectorItem",
     "analyze",
     "compare",
+    "diversification",
     "sector_concentration",
     "simulate",
 ]

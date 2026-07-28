@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import UTC, date, datetime
 from math import sqrt
 
 from pydantic import BaseModel
@@ -8,6 +9,43 @@ from pydantic import BaseModel
 from open_allocator.core.types import Unknown, Vault
 
 _MISSING = object()
+
+
+def attach_series(client: object, vaults: Iterable[Vault], days: int) -> list[Vault]:
+    """Attach history only, in a single bulk call.
+
+    :func:`enrich` additionally fetches one ``instrument_analysis`` per vault,
+    which is a request per instrument. Callers that only need the series — the
+    measured diversification view in :mod:`open_allocator.core.diversify` is
+    the reason this exists — should not pay for ~50 round trips to learn what
+    one bulk response already carries.
+    """
+    vault_list = list(vaults)
+    if not vault_list:
+        return []
+
+    metrics_by_id = {
+        str(_required(item, "instrument_id", "instrumentId")): item
+        for item in _metric_items(
+            client.metrics_bulk(
+                tuple(vault.instrument_id for vault in vault_list), days
+            )
+        )
+    }
+
+    attached: list[Vault] = []
+    for vault in vault_list:
+        points = _metric_points(metrics_by_id.get(vault.instrument_id))
+        attached.append(
+            vault.model_copy(
+                update={
+                    "apy_series": _series(points, "apy"),
+                    "apy_daily": _daily_series(points, "apy"),
+                    "tvl_usd_series": _series(points, "tvl_usd", "tvlUsd", "tvl"),
+                }
+            )
+        )
+    return attached
 
 
 def enrich(client: object, vaults: Iterable[Vault], days: int) -> list[Vault]:
@@ -31,6 +69,7 @@ def enrich(client: object, vaults: Iterable[Vault], days: int) -> list[Vault]:
 
         updates: dict[str, object] = {
             "apy_series": apy_series,
+            "apy_daily": _daily_series(metric_points, "apy"),
             "tvl_usd_series": tvl_series,
             "apy_stability": _preserve_known(
                 _coefficient_of_variation(apy_series), vault.apy_stability
@@ -100,6 +139,48 @@ def _series(points: Sequence[object], *names: str) -> tuple[float, ...]:
         if value is not None:
             values.append(value)
     return tuple(values)
+
+
+def _daily_series(
+    points: Sequence[object],
+    *names: str,
+) -> tuple[tuple[date, float], ...]:
+    """Last observation per UTC date, oldest first.
+
+    The feed writes more often than daily for some instruments and once a day
+    for others, so a bare index into ``apy_series`` is not a date. Keeping the
+    date is what lets two instruments be compared on the days they were both
+    observed. Points without a parseable timestamp are dropped rather than
+    given a guessed one.
+    """
+    by_date: dict[date, tuple[datetime, float]] = {}
+    for point in points:
+        value = _number(_value(point, *names))
+        if value is None:
+            continue
+        moment = _timestamp(point)
+        if moment is None:
+            continue
+        seen = by_date.get(moment.date())
+        if seen is None or moment >= seen[0]:
+            by_date[moment.date()] = (moment, value)
+    return tuple((day, value) for day, (_, value) in sorted(by_date.items()))
+
+
+def _timestamp(point: object) -> datetime | None:
+    raw = _value(point, "timestamp", "date", "day")
+    if raw is _MISSING or raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, date):
+        return datetime(raw.year, raw.month, raw.day, tzinfo=UTC)
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _coefficient_of_variation(series: Sequence[float]) -> float | object:
