@@ -200,3 +200,36 @@ def test_universe_module_has_no_hardcoded_protocol_or_chain_literals() -> None:
     for literal in forbidden_literals:
         assert literal not in source
     assert "open_allocator.exec.chains" not in source
+
+
+def test_an_instrument_missing_a_required_field_is_skipped_not_fatal() -> None:
+    """One unpriceable row must not take the whole shelf down."""
+    healthy = instrument()
+    broken = instrument(instrumentId="mid-sync", currentApy=None)
+
+    vaults, skipped = universe.discover_instruments(StubClient([healthy, broken]))
+
+    assert [vault.instrument_id for vault in vaults] == [healthy["instrumentId"]]
+    assert [item.instrument_id for item in skipped] == ["mid-sync"]
+    assert "apy" in skipped[0].reason
+
+
+def test_skipped_instruments_keep_their_identity() -> None:
+    broken = instrument(instrumentId="known-id", tvl=None)
+
+    _, skipped = universe.discover_instruments(StubClient([broken]))
+
+    assert skipped[0].instrument_id == "known-id"
+
+
+def test_an_unidentifiable_instrument_is_reported_by_position() -> None:
+    _, skipped = universe.discover_instruments(StubClient([{"protocol": "x"}]))
+
+    assert skipped[0].instrument_id == "<unidentified:index=0>"
+
+
+def test_discover_still_returns_only_vaults() -> None:
+    """The old signature keeps working for callers that do not want skips."""
+    payloads = [instrument(), instrument(instrumentId="b", tvl=None)]
+
+    assert len(universe.discover(StubClient(payloads))) == 1

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from math import ceil
 from typing import TYPE_CHECKING
 
-from open_allocator.core import riskmetrics
+from open_allocator.core import diversify, riskmetrics
 from open_allocator.core.types import Unknown
 
 if TYPE_CHECKING:
@@ -19,7 +19,13 @@ _DEFAULT_VOL_FLOOR = 0.1
 
 # Composite strategies may reference these as sleeve sub-strategies; recursion
 # into other composites is rejected to keep dispatch finite and auditable.
-_FLAT_NAMES = ("score_weighted", "equal_weight", "risk_parity", "inverse_vol")
+_FLAT_NAMES = (
+    "score_weighted",
+    "equal_weight",
+    "risk_parity",
+    "inverse_vol",
+    "decorrelated",
+)
 
 # Default score-tier ladder for `sleeves`/`ladder`: (name, min_score, max_score,
 # target_weight). Ranges are [min, max); the top tier's max is > 1 to include 1.
@@ -93,9 +99,7 @@ def _score_weighted(
     for record in records:
         score_component = max(0.0, record.score.score) ** ctx.score_power
         apy_component = (
-            max(0.0, record.vault.apy) / max_positive_apy
-            if max_positive_apy
-            else 0.0
+            max(0.0, record.vault.apy) / max_positive_apy if max_positive_apy else 0.0
         )
         raw.append(score_component * (1 + ctx.apy_weight * apy_component))
 
@@ -152,6 +156,137 @@ def _risk_parity(
     return weights, warnings
 
 
+def _decorrelated(
+    records: Sequence[ScoredVault],
+    ctx: StrategyContext,
+) -> StrategyResult:
+    """Score-weighted, then tilted away from positions that move together.
+
+    Every other strategy here ranks instruments one at a time, so a shelf full
+    of near-duplicates produces a book that scores well and holds one bet. This
+    one prices each candidate against what is already in the book, using the
+    measured co-movement in :mod:`open_allocator.core.diversify` rather than
+    protocol/chain/sector labels — labels are what
+    :data:`~open_allocator.core.types.PolicyCaps.min_effective_positions`
+    exists to stop trusting.
+
+    Two stages, both deterministic:
+
+    - **Selection** (only when ``top_n`` is given): greedily take the candidate
+      with the highest ``base_weight * (1 - strongest correlation to anything
+      already selected)``, so the second copy of a position is worth much less
+      than the first.
+    - **Weighting**: divide each base weight by that instrument's *correlation
+      load* — the summed positive correlation to the rest of the book,
+      including itself. An instrument duplicating three others carries roughly
+      a quarter of the weight its score alone would earn.
+
+    Params: ``top_n`` (select this many, default = keep all and only re-weight),
+    ``unknown_correlation`` (what an unmeasurable pair counts as, default 1.0 —
+    fully correlated, matching the fail-closed rule in ``diversify`` and
+    ``policy``).
+
+    Degrades rather than blocking. Construction is advisory here; the binding
+    check is the policy layer. With no history at all this reduces exactly to
+    ``score_weighted`` plus a warning, instead of collapsing to a single leg.
+    """
+    top_n = _int_param(ctx.params, "top_n", None, minimum=1)
+    unknown_correlation = _float_param(
+        ctx.params, "unknown_correlation", 1.0, minimum=0.0, maximum=1.0
+    )
+
+    base, warnings = _score_weighted(records, ctx)
+    base = _normalize(base)
+
+    series_by_id = {
+        record.vault.instrument_id: dict(record.vault.apy_daily)
+        for record in records
+        if record.vault.apy_daily
+    }
+    if not series_by_id:
+        return base, [*warnings, "decorrelated:no_history:using_score_weights"]
+
+    matrix = diversify.co_movement_matrix(series_by_id)
+    unmeasured = len(records) - len(series_by_id)
+    if unmeasured:
+        warnings.append(f"decorrelated:unmeasured_instruments={unmeasured}")
+
+    def correlation(left: int, right: int) -> float:
+        if left == right:
+            return 1.0
+        key = tuple(
+            sorted(
+                (
+                    records[left].vault.instrument_id,
+                    records[right].vault.instrument_id,
+                )
+            )
+        )
+        pair = matrix.get(key)
+        if pair is None or pair.correlation is None:
+            return unknown_correlation
+        return pair.correlation
+
+    candidates = [index for index, weight in enumerate(base) if weight > _EPSILON]
+    if not candidates:
+        return base, warnings
+
+    selected = _select_decorrelated(records, base, candidates, correlation, top_n)
+    if top_n is not None:
+        warnings.append(f"decorrelated:top_n={top_n}:kept={len(selected)}")
+
+    weights = [0.0 for _ in records]
+    for index in selected:
+        # Positive correlation only: a negatively correlated pair genuinely
+        # hedges, and letting it *reduce* the load would pay an instrument
+        # twice for the same diversification the selection stage already
+        # rewarded. Self-correlation keeps the load at >= 1.
+        load = sum(max(correlation(index, other), 0.0) for other in selected)
+        weights[index] = base[index] / load if load > _EPSILON else base[index]
+
+    return weights, warnings
+
+
+def _select_decorrelated(
+    records: Sequence[ScoredVault],
+    base: Sequence[float],
+    candidates: Sequence[int],
+    correlation: Callable[[int, int], float],
+    top_n: int | None,
+) -> list[int]:
+    """Greedy pick by base weight discounted by redundancy against the book."""
+    if top_n is None or top_n >= len(candidates):
+        return list(candidates)
+
+    remaining = list(candidates)
+    seed = min(remaining, key=lambda i: (-base[i], records[i].vault.instrument_id))
+    selected = [seed]
+    remaining.remove(seed)
+
+    while len(selected) < top_n and remaining:
+        merits = {
+            index: base[index]
+            * (1.0 - max(correlation(index, other) for other in selected))
+            for index in remaining
+        }
+        best = min(
+            remaining,
+            key=lambda i: (-merits[i], -base[i], records[i].vault.instrument_id),
+        )
+        # Everything left duplicates the book (or is unmeasurable and charged
+        # as such). Diversification has nothing more to say, so fall back to
+        # base preference rather than picking arbitrarily.
+        if merits[best] <= _EPSILON:
+            best = min(
+                remaining,
+                key=lambda i: (-base[i], records[i].vault.instrument_id),
+            )
+        selected.append(best)
+        remaining.remove(best)
+
+    return selected
+
+
 # --- composite strategies --------------------------------------------------
 
 
@@ -168,13 +303,9 @@ def _core_satellite(
     ctx: StrategyContext,
 ) -> StrategyResult:
     count = len(records)
-    core_weight = _float_param(
-        ctx.params, "core_weight", 0.8, minimum=0.0, maximum=1.0
-    )
+    core_weight = _float_param(ctx.params, "core_weight", 0.8, minimum=0.0, maximum=1.0)
     core_selector = _flat_param(ctx.params, "core_selector", "score_weighted")
-    satellite_selector = _flat_param(
-        ctx.params, "satellite_selector", "score_weighted"
-    )
+    satellite_selector = _flat_param(ctx.params, "satellite_selector", "score_weighted")
     default_core_count = ceil(count / 2)
     core_count = _int_param(
         ctx.params, "core_count", default_core_count, minimum=0, maximum=count
@@ -227,9 +358,7 @@ def _allocate_buckets(
     warnings: list[str] = []
 
     active = [
-        bucket
-        for bucket in buckets
-        if bucket.indices and bucket.target > _EPSILON
+        bucket for bucket in buckets if bucket.indices and bucket.target > _EPSILON
     ]
     for bucket in buckets:
         if bucket.target > _EPSILON and not bucket.indices:
@@ -368,6 +497,7 @@ STRATEGIES: dict[str, StrategyFn] = {
     "equal_weight": _equal_weight,
     "risk_parity": _risk_parity,
     "inverse_vol": _risk_parity,
+    "decorrelated": _decorrelated,
     "core_satellite": _core_satellite,
     "sleeves": _sleeves,
     "ladder": _sleeves,

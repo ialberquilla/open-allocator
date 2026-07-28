@@ -137,7 +137,18 @@ def _discover_vaults_from_client(
     *,
     enrich: bool = False,
 ) -> list[Vault]:
-    vaults = universe.discover(client)
+    vaults, skipped = universe.discover_instruments(client)
+    if skipped:
+        # stderr, not stdout: every command's stdout is one JSON object and
+        # callers parse it. A shrunk universe still has to be visible — an
+        # instrument silently missing looks exactly like one that never existed.
+        _write_json(
+            {
+                "warning": "skipped_instruments",
+                "instruments": [s.model_dump() for s in skipped],
+            },
+            err=True,
+        )
     if enrich:
         return enrich_vaults(client, vaults, days=HISTORY_DAYS)
     return vaults

@@ -5,12 +5,39 @@ from collections.abc import Iterable, Mapping, Sequence
 from pydantic import BaseModel
 
 from open_allocator.core import eligibility
-from open_allocator.core.types import Policy, Unknown, Vault
+from open_allocator.core.types import FrozenModel, Policy, Unknown, Vault
 
 _MISSING = object()
 
 
+class SkippedInstrument(FrozenModel):
+    """An instrument the API served that could not be read as a :class:`Vault`."""
+
+    instrument_id: str
+    reason: str
+
+
 def discover(client: object, policy: object | None = None) -> list[Vault]:
+    vaults, _ = discover_instruments(client, policy)
+    return vaults
+
+
+def discover_instruments(
+    client: object,
+    policy: object | None = None,
+) -> tuple[list[Vault], tuple[SkippedInstrument, ...]]:
+    """Discover the universe, reporting instruments that could not be read.
+
+    An instrument missing a required field is **skipped, not fatal**. Upstream
+    serves rows whose metrics are absent — a freshly re-provisioned instrument
+    is live with a null APY until its first sync lands — and one such row used
+    to raise, taking the entire shelf down with it. A row we cannot price is
+    one instrument we cannot offer, not an outage.
+
+    Skips are returned rather than swallowed: an instrument that quietly
+    vanishes from the universe is indistinguishable from one that was never
+    there, and callers need to be able to say which happened.
+    """
     response = client.list_instruments()
     instruments = list(_instrument_items(response))
 
@@ -21,12 +48,31 @@ def discover(client: object, policy: object | None = None) -> list[Vault]:
         response = client.list_instruments(limit=limit, offset=offset + limit)
         instruments.extend(_instrument_items(response))
 
-    vaults = [_to_vault(instrument) for instrument in instruments]
+    vaults: list[Vault] = []
+    skipped: list[SkippedInstrument] = []
+    for position, instrument in enumerate(instruments):
+        try:
+            vaults.append(_to_vault(instrument))
+        except (ValueError, TypeError) as error:
+            skipped.append(
+                SkippedInstrument(
+                    instrument_id=_identify(instrument, position),
+                    reason=str(error),
+                )
+            )
 
-    if policy is None:
-        return vaults
+    if policy is not None:
+        vaults = [vault for vault in vaults if _allowed(vault, policy)]
 
-    return [vault for vault in vaults if _allowed(vault, policy)]
+    return vaults, tuple(skipped)
+
+
+def _identify(instrument: object, position: int) -> str:
+    """Best-effort id for an instrument we already failed to parse."""
+    found = _value(instrument, "instrument_id", "instrumentId")
+    if found is _MISSING or found is None:
+        return f"<unidentified:index={position}>"
+    return str(found)
 
 
 def seen_protocols(vaults: Iterable[Vault]) -> tuple[str, ...]:
