@@ -6,7 +6,7 @@ from typing import TypeAlias
 
 from pydantic import Field, model_validator
 
-from open_allocator.core import eligibility
+from open_allocator.core import diversify, eligibility
 from open_allocator.core.types import (
     Allocation,
     FrozenModel,
@@ -79,6 +79,7 @@ def check(
     }
     _check_allowlists(allocation_model, policy_model, allocated_vaults, violations)
     _check_caps(allocation_model, policy_model, allocated_vaults, violations)
+    _check_diversification(allocation_model, policy_model, allocated_vaults, violations)
     _check_quality_caps(allocated_vaults, policy_model, violations)
     _check_gates(allocation_model, policy_model, violations)
 
@@ -187,6 +188,62 @@ def _check_caps(
             caps.max_weight_per_sector,
             sector_weights,
             violations,
+        )
+
+
+def _check_diversification(
+    allocation: Allocation,
+    policy: Policy,
+    vault_by_id: Mapping[str, Vault],
+    violations: list[PolicyViolation],
+) -> None:
+    """Enforce the measured effective-position floor.
+
+    Distinct from the weight caps in two ways that matter. It is a **floor**
+    over the whole allocation rather than a ceiling on one bucket, and it is
+    computed from history rather than from labels — so an allocation cannot
+    pass it by holding twelve names that move as one.
+
+    When the cap is set and the history needed to evaluate it is absent, that
+    is a violation in its own right rather than a pass. A policy demanding
+    measured diversification is not satisfied by an allocator that did not
+    measure; the alternative is a cap that silently stops binding whenever the
+    caller forgets to attach series, which is exactly the failure mode
+    `max_weight_per_curator` is already in.
+    """
+    floor = policy.caps.min_effective_positions
+    if floor is None:
+        return
+
+    weights_bps = {
+        leg.instrument_id: int(round(leg.weight * 10_000))
+        for leg in allocation.legs
+        if leg.weight > 0
+    }
+    if not weights_bps:
+        return
+
+    series_by_id = {
+        instrument_id: dict(vault.apy_daily)
+        for instrument_id, vault in vault_by_id.items()
+        if instrument_id in weights_bps and vault.apy_daily
+    }
+    if not series_by_id:
+        violations.append(
+            _violation(
+                "min_effective_positions:unmeasurable",
+                "allocation",
+                floor,
+                "no instrument carries dated history",
+            )
+        )
+        return
+
+    matrix = diversify.co_movement_matrix(series_by_id)
+    actual = diversify.effective_positions(weights_bps, matrix)
+    if actual < floor - _EPSILON:
+        violations.append(
+            _violation("min_effective_positions", "allocation", floor, actual)
         )
 
 

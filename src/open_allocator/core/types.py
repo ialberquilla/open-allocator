@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import date
 from enum import StrEnum
 from typing import Literal, TypeAlias
 
@@ -71,6 +72,14 @@ class Vault(FrozenModel):
     tvl_usd: float = Field(ge=0)
     apy_series: tuple[float, ...] = ()
     tvl_usd_series: tuple[float, ...] = ()
+    # The same APY history, resampled to one observation per UTC date and
+    # keeping the date. ``apy_series`` is raw feed observations at whatever
+    # cadence upstream wrote them, and that cadence differs between instruments
+    # — so position k of two series is not the same moment in time. Anything
+    # comparing instruments to each other (see
+    # :mod:`open_allocator.core.diversify`) must align on dates and use this;
+    # single-instrument path metrics may keep using ``apy_series``.
+    apy_daily: tuple[tuple[date, float], ...] = ()
     curator: TextRiskValue = Unknown
     reward_dependence: NumericRiskValue = Unknown
     oracle: TextRiskValue = Unknown
@@ -110,11 +119,14 @@ class VaultScore(FrozenModel):
                 return self
             raise ValueError("all-unknown factors require a zero score")
 
-        reconstructed = sum(
-            factor.normalized_value * factor.weight
-            for factor in known_factors
-            if factor.normalized_value is not None
-        ) / total_weight
+        reconstructed = (
+            sum(
+                factor.normalized_value * factor.weight
+                for factor in known_factors
+                if factor.normalized_value is not None
+            )
+            / total_weight
+        )
         if not math.isclose(self.score, reconstructed, rel_tol=1e-9, abs_tol=1e-9):
             raise ValueError("score is not reconstructable from known factors")
         return self
@@ -168,6 +180,13 @@ class PolicyCaps(FrozenModel):
     # dimension is not enforced (the allocator treats it as 1.0); it is still
     # always *reported*, so an unset cap cannot hide a monoculture.
     max_weight_per_sector: float | None = Field(default=None, ge=0, le=1)
+    # Floor, not a ceiling — the only cap here shaped that way, because
+    # diversification is a property of the whole allocation rather than of any
+    # one bucket. Measured from the instruments' own APY history (see
+    # `core.diversify`), so unlike the weight caps above it cannot be satisfied
+    # by spreading capital across labels that move together. Optional; absent =
+    # not enforced, and it is reported either way.
+    min_effective_positions: float | None = Field(default=None, ge=0)
     min_instrument_tvl_usd: float = Field(ge=0)
     max_reward_dependence: float = Field(ge=0, le=1)
 

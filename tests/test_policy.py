@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import random
 from collections.abc import Iterable
+from datetime import date, timedelta
 
 import pytest
 
@@ -574,3 +576,92 @@ def test_absent_sector_cap_is_not_enforced() -> None:
     )
 
     assert result.ok is True
+
+
+def _dated(
+    values: Iterable[float], *, start_day: int = 1
+) -> tuple[tuple[date, float], ...]:
+    return tuple(
+        (date(2026, 1, 1) + timedelta(days=start_day + index), value)
+        for index, value in enumerate(values)
+    )
+
+
+def _walk(count: int, *, seed: int) -> list[float]:
+    rng = random.Random(seed)
+    level = 5.0
+    values = []
+    for _ in range(count):
+        level += rng.random() - 0.5
+        values.append(level)
+    return values
+
+
+def test_absent_effective_positions_floor_is_not_enforced() -> None:
+    result = check(
+        allocation((("vault-a", 0.5, 50), ("vault-b", 0.5, 50)), total_usd=100),
+        policy(policy_caps=caps(min_effective_positions=None)),
+        (vault(), vault(instrument_id="vault-b")),
+    )
+
+    assert result.ok is True
+
+
+def test_effective_positions_floor_blocks_positions_that_move_together() -> None:
+    shared = _dated(_walk(120, seed=1))
+    result = check(
+        allocation((("vault-a", 0.5, 50), ("vault-b", 0.5, 50)), total_usd=100),
+        policy(policy_caps=caps(min_effective_positions=1.5)),
+        (
+            vault(apy_daily=shared),
+            vault(instrument_id="vault-b", apy_daily=shared),
+        ),
+    )
+
+    found = violation(result, "min_effective_positions")
+    assert found.limit == 1.5
+    assert found.actual == pytest.approx(1.0)
+
+
+def test_effective_positions_floor_passes_decoupled_positions() -> None:
+    result = check(
+        allocation((("vault-a", 0.5, 50), ("vault-b", 0.5, 50)), total_usd=100),
+        policy(policy_caps=caps(min_effective_positions=1.5)),
+        (
+            vault(apy_daily=_dated(_walk(120, seed=1))),
+            vault(instrument_id="vault-b", apy_daily=_dated(_walk(120, seed=2))),
+        ),
+    )
+
+    assert result.ok is True
+
+
+def test_effective_positions_floor_fails_closed_without_history() -> None:
+    """A policy demanding measured diversification is not satisfied by not measuring."""
+    result = check(
+        allocation((("vault-a", 0.5, 50), ("vault-b", 0.5, 50)), total_usd=100),
+        policy(policy_caps=caps(min_effective_positions=1.5)),
+        (vault(), vault(instrument_id="vault-b")),
+    )
+
+    found = violation(result, "min_effective_positions:unmeasurable")
+    assert found.actual == "no instrument carries dated history"
+
+
+def test_unmeasurable_legs_cannot_buy_diversification() -> None:
+    """A leg with no history is charged as correlated, not counted as a new bet."""
+    result = check(
+        allocation(
+            (("vault-a", 0.34, 34), ("vault-b", 0.33, 33), ("vault-c", 0.33, 33)),
+            total_usd=100,
+        ),
+        policy(policy_caps=caps(min_effective_positions=2.5)),
+        (
+            vault(apy_daily=_dated(_walk(120, seed=1))),
+            vault(instrument_id="vault-b", apy_daily=_dated(_walk(120, seed=2))),
+            vault(instrument_id="vault-c"),
+        ),
+    )
+
+    found = violation(result, "min_effective_positions")
+    assert found.actual < 2.5

@@ -107,6 +107,11 @@
           "minimum": 0,
           "maximum": 1
         },
+        "min_effective_positions": {
+          "description": "Floor on the measured effective number of independent positions, computed from instrument APY history. Unlike the max_weight_per_* caps this is a lower bound over the whole allocation and cannot be satisfied by spreading capital across labels that move together. Null or absent = not enforced.",
+          "type": ["number", "null"],
+          "minimum": 0
+        },
         "min_instrument_tvl_usd": {
           "type": "number",
           "minimum": 0
