@@ -32,6 +32,7 @@ from open_allocator.core.types import (
     VaultScore,
 )
 from open_allocator.exec import chains, safe_deployment
+from open_allocator.exec import gas as gas_module
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
 
@@ -172,6 +173,31 @@ def _filter_vaults(
 
 def _score_by_instrument(vaults: list[Vault]) -> dict[str, VaultScore]:
     return {vault.instrument_id: score_vault_model(vault) for vault in vaults}
+
+
+def _live_cost_params(
+    allocation: Allocation,
+    chain_by_instrument: Mapping[str, int],
+    source_chain_id: int | None,
+) -> costs_core.CostParams:
+    """Cost params with gas priced from live chain state where possible.
+
+    Only the *source* chain's gas is charged (every deposit signs there), but the
+    source may be inferred from the legs, so price every chain the allocation
+    touches and let ``CostParams`` pick. A failed read is not fatal: the params
+    fall back to static constants and the estimate reports
+    ``gas_priced_live: false`` rather than passing a guess off as a measurement.
+    """
+    chain_ids = [
+        chain_id
+        for chain_id in (
+            chain_by_instrument.get(leg.instrument_id) for leg in allocation.legs
+        )
+        if chain_id is not None
+    ]
+    if source_chain_id is not None:
+        chain_ids.append(source_chain_id)
+    return costs_core.CostParams(gas=gas_module.live_pricing(chain_ids))
 
 
 def _read_allocation(path: Path) -> Allocation:
@@ -1246,11 +1272,13 @@ def build_allocation(
         apy_weight=apy_weight,
     )
     result = policy_core.check(allocation, policy, discovered)
+    chain_by_instrument = {v.instrument_id: v.chain_id for v in discovered}
     cost_estimate = costs_core.estimate_from_allocation_legs(
         [leg.model_dump() for leg in allocation.legs],
-        chain_by_instrument={v.instrument_id: v.chain_id for v in discovered},
+        chain_by_instrument=chain_by_instrument,
         apy_by_instrument={v.instrument_id: v.apy for v in discovered},
         source_chain_id=source_chain_id,
+        params=_live_cost_params(allocation, chain_by_instrument, source_chain_id),
     )
     return _allocation_payload_with_policy_result(
         allocation,

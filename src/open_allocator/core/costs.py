@@ -11,8 +11,17 @@ The model is intentionally simple and conservative, not a gas oracle:
 
 - **Gas** is charged per signed transaction on the *source* chain, because with
   a self-custody EOA every deposit (approve + buy) signs on the chain the USDC
-  is sourced from (see ``docs/funding-and-bridging.md``). L1 (Ethereum mainnet)
-  is an order of magnitude pricier per tx than an L2.
+  is sourced from (see ``docs/funding-and-bridging.md``). Priced from **live**
+  chain gas when a :class:`GasPricing` is supplied (see
+  ``open_allocator.exec.gas``), and from a static per-chain-class fallback only
+  when it is not.
+
+  The fallback exists to keep this module pure and offline-runnable; it is not a
+  substitute for live pricing. A *constant* gas price cannot be calibrated
+  correct — measured 2026-07-30, a flat ``$0.03``/tx L2 figure was 8.4x too high
+  on Base and 5.4x too high on Arbitrum, while a flat ``$0.20``/tx L1 figure was
+  2.7x too high at a 0.109 gwei base fee and would be ~50x too *low* at a
+  historically ordinary 15 gwei. Whenever the number matters, pass live pricing.
 - **Bridge fee** applies only to legs whose destination chain differs from the
   source chain: 1Tx routes those over CCTP fast-transfer, whose fee is a few
   basis points of the bridged notional.
@@ -26,12 +35,46 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-# Per-signed-tx gas cost in USD, calibrated from operator observation:
-# L2 deposits land around $0.01-0.03; an Ethereum-mainnet tx is $0.20 or more.
-DEFAULT_L2_GAS_USD_PER_TX = 0.03
-DEFAULT_L1_GAS_USD_PER_TX = 0.20
+# Static per-signed-tx gas cost in USD. FALLBACK ONLY — used when no live
+# GasPricing is supplied. Re-calibrated 2026-07-30 from real receipts rather
+# than operator recollection: a Base ERC-4626 op measured $0.0036 and an
+# Arbitrum one $0.0056, against a previous constant of $0.03. See the module
+# docstring for why any constant here is wrong in one direction or the other.
+DEFAULT_L2_GAS_USD_PER_TX = 0.006
+DEFAULT_L1_GAS_USD_PER_TX = 0.08
 # Chains priced at the L1 rate. Ethereum mainnet today; extend as needed.
 DEFAULT_L1_CHAIN_IDS = frozenset({1})
+
+# Gas units for one signed deposit-side tx. Measured 2026-07-30 on a real Base
+# ERC-4626 call (186,751 gas, tx 0x4640d9b1...a245) and rounded up. Deliberately
+# the *heavier* of the two txs in a leg — an ERC-20 approve is roughly a quarter
+# of this — so a leg's gas is over- rather than under-stated.
+DEFAULT_GAS_UNITS_PER_TX = 190_000
+
+_WEI_PER_ETH = 10**18
+
+
+@dataclass(frozen=True)
+class GasPricing:
+    """Live gas pricing: chain gas prices in wei plus one ETH/USD quote.
+
+    Every chain this allocator reaches pays gas in ETH, so a single ETH/USD
+    quote serves all of them. ``gas_price_wei`` is keyed by chain id; a chain
+    absent from it falls back to the static constants, which is the honest
+    behaviour when a read failed — silently substituting another chain's price
+    would be worse than admitting the gap.
+    """
+
+    gas_price_wei: Mapping[int, int]
+    eth_usd: float
+    gas_units_per_tx: int = DEFAULT_GAS_UNITS_PER_TX
+
+    def usd_per_tx(self, chain_id: int) -> float | None:
+        """USD for one signed tx on ``chain_id``, or None if unpriced."""
+        price = self.gas_price_wei.get(chain_id)
+        if price is None or self.eth_usd <= 0:
+            return None
+        return self.gas_units_per_tx * price / _WEI_PER_ETH * self.eth_usd
 
 
 @dataclass(frozen=True)
@@ -39,6 +82,8 @@ class CostParams:
     l2_gas_usd_per_tx: float = DEFAULT_L2_GAS_USD_PER_TX
     l1_gas_usd_per_tx: float = DEFAULT_L1_GAS_USD_PER_TX
     l1_chain_ids: frozenset[int] = DEFAULT_L1_CHAIN_IDS
+    # Live pricing when available; None falls back to the constants above.
+    gas: GasPricing | None = None
     # A deposit is approve + buy; two signed txs per leg on the source chain.
     txs_per_leg: int = 2
     # Circle CCTP v2 fast-transfer fee on bridged notional (always fast mode).
@@ -51,11 +96,19 @@ class CostParams:
     uneconomic_cost_pct: float = 3.0
 
     def gas_usd_per_tx(self, chain_id: int) -> float:
+        if self.gas is not None:
+            live = self.gas.usd_per_tx(chain_id)
+            if live is not None:
+                return live
         return (
             self.l1_gas_usd_per_tx
             if chain_id in self.l1_chain_ids
             else self.l2_gas_usd_per_tx
         )
+
+    def gas_priced_live(self, chain_id: int) -> bool:
+        """Whether ``chain_id``'s gas came from a live read, not the fallback."""
+        return self.gas is not None and self.gas.usd_per_tx(chain_id) is not None
 
 
 @dataclass(frozen=True)
@@ -82,13 +135,18 @@ class CostEstimate:
     bridged_leg_count: int
     leg_count: int
     verdict: str
+    # False when the source chain's gas came from the static fallback rather
+    # than a live read. Surfaced because a fallback-priced gas number should not
+    # be read with the same confidence as a measured one.
+    gas_priced_live: bool = True
 
-    def as_metadata(self) -> dict[str, float | int | str]:
+    def as_metadata(self) -> dict[str, float | int | str | bool]:
         """Flat, schema-safe scalar dict for allocation ``metadata``."""
-        data: dict[str, float | int | str] = {
+        data: dict[str, float | int | str | bool] = {
             "source_chain_id": self.source_chain_id,
             "deploy_usd": self.deploy_usd,
             "gas_cost_usd": self.gas_cost_usd,
+            "gas_priced_live": self.gas_priced_live,
             "bridge_fee_usd": self.bridge_fee_usd,
             "total_expected_cost_usd": self.total_expected_cost_usd,
             "max_slippage_usd": self.max_slippage_usd,
@@ -109,6 +167,30 @@ class CostEstimate:
         if self.verdict == "ok":
             return None
         return f"viability:{self.verdict}:cost_pct={self.cost_pct_of_deploy:.2f}"
+
+
+def min_economic_leg_usd(
+    chain_id: int,
+    *,
+    params: CostParams | None = None,
+    max_gas_pct_of_leg: float = 0.10,
+) -> float:
+    """Smallest leg size on ``chain_id`` whose gas stays under a share of it.
+
+    A gas-aware dust floor. ``min_position_usd`` is a flat number the caller
+    picks, which is fine while every chain costs the same fraction of a cent and
+    wrong the moment an Ethereum leg is priced at a normal base fee: the same
+    $250 leg is negligible-cost at 0.109 gwei and ~4% gas at 15 gwei.
+
+    Expressed as a *share of the leg* rather than an absolute so it scales with
+    gas instead of needing recalibration. The default 0.10% is deliberately
+    loose — this is a floor to stop absurd legs, not an optimiser.
+    """
+    params = params or CostParams()
+    leg_gas = params.txs_per_leg * params.gas_usd_per_tx(chain_id)
+    if max_gas_pct_of_leg <= 0:
+        raise ValueError("max_gas_pct_of_leg must be positive")
+    return leg_gas / (max_gas_pct_of_leg / 100)
 
 
 def default_source_chain_id(legs: Sequence[LegInput]) -> int:
@@ -193,6 +275,7 @@ def estimate(
         bridged_leg_count=len(bridged),
         leg_count=len(priced),
         verdict=verdict,
+        gas_priced_live=params.gas_priced_live(source),
     )
 
 
@@ -227,10 +310,13 @@ def estimate_from_allocation_legs(
 
 
 __all__ = [
+    "DEFAULT_GAS_UNITS_PER_TX",
     "CostEstimate",
     "CostParams",
+    "GasPricing",
     "LegInput",
     "default_source_chain_id",
     "estimate",
     "estimate_from_allocation_legs",
+    "min_economic_leg_usd",
 ]
