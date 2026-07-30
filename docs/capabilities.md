@@ -98,6 +98,15 @@ answers "am I actually holding more than one bet". Neither subsumes the other.
 `net_apy_pct_year1`, `breakeven_days`, `verdict`) and `metadata.warnings`, which
 name every cap that clamped, every policy exclusion, and every empty sleeve.
 
+Gas in that block is priced from **live** chain state — the source chain's gas
+price and an on-chain Chainlink ETH/USD feed — and `cost_estimate.gas_priced_live`
+reports whether that succeeded. When it is `false` the estimate fell back to a
+static per-chain-class constant, which is an order of magnitude only: a constant
+is several times too high on an L2 at a low base fee and an order of magnitude
+too low on mainnet at a normal one. `core.costs.min_economic_leg_usd()` derives a
+gas-aware minimum leg size from the same pricing, for when a flat
+`--min-position-usd` would be wrong on an expensive chain.
+
 Advisory narrowing before construction: `screen` and the `--min-sharpe`,
 `--max-drawdown`, `--max-reward-dependence`, `--min-history-days`,
 `--screen-curator`, `--min-tvl-usd`, `--max-positions`, `--min-position-usd`

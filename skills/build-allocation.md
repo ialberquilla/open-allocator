@@ -61,6 +61,15 @@ notional, max slippage, `cost_pct_of_deploy`, `net_apy_pct_year1`,
 non-`ok` verdict also raises a `viability:<verdict>` warning. This is the
 net-of-cost check the 1Tx gross simulation cannot give — read it before
 recommending a deploy, especially at small sizes where fixed costs dominate.
+
+**Check `gas_priced_live` before quoting any gas figure.** `true` means gas was
+priced from the source chain's live gas price and an on-chain ETH/USD feed.
+`false` means a live read failed and the estimate fell back to a static
+per-chain-class constant — still usable as an order of magnitude, but do not
+present it as measured, and say so if `breakeven_days` is load-bearing in the
+recommendation. A constant cannot be right across regimes: the same fallback is
+several times too high on an L2 at a low base fee and an order of magnitude too
+low on mainnet at a normal one.
 Pass `--source-chain-id <id>` (the chain the wallet's USDC sits on, from
 `wallet-status`) for an accurate bridge count; it defaults to the chain holding
 the largest share of the deploy.
