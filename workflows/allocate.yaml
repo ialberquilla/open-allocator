@@ -50,6 +50,7 @@ stages:
     review_focus:
       - policy_candidate_filter
       - allocation_concentration
+      - strategy_choice
     human_approval_default: false
   - stage: backtest_allocation
     skill: skills/agentic-allocation.md
@@ -68,6 +69,8 @@ stages:
       - advisory-risk-review
     review_focus:
       - concentration
+      - measured_diversification
+      - metric_coverage
       - reward_dependence
       - liquidity
       - apy_descriptive
