@@ -17,9 +17,11 @@
 
 </div>
 
-`open-allocator` is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://app.1tx.fi/) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.
+OpenAllocator is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://app.1tx.fi/) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.
 
-**This is portfolio construction, not yield-chasing.** Most "auto-yield" tools sweep funds into whatever APY is highest this hour. `open-allocator` does what a professional asset allocator does — it builds a diversified allocation across explicit risk/reward metrics (Sharpe, volatility, drawdown), risk tiers, and real portfolio structures (`core_satellite`, `risk_parity`/`inverse_vol`, `sleeves`, `ladder`), bounded by an explicit policy — and runs it through an agent instead of a desk. High APY is a risk input, never the objective.
+**This is portfolio construction, not yield-chasing.** Most "auto-yield" tools sweep funds into whatever APY is highest this hour. OpenAllocator does what a professional asset allocator does — it builds an allocation across explicit risk/reward metrics (Sharpe, volatility, drawdown), quality tiers, and real portfolio structures (`decorrelated`, `core_satellite`, `risk_parity`/`inverse_vol`, `sleeves`, `ladder`), bounded by an explicit policy — and runs it through an agent instead of a desk. High APY is a risk input, never the objective.
+
+**It does not pick your trade-off for you.** Independence and yield pull against each other, so the allocator exposes both controls and *measures* what your choice cost — per run, on the shelf as it stands that day. Want the top rates? That is a knob. Want the most independent book the shelf allows? Also a knob. See [docs/capabilities.md](docs/capabilities.md) for the full surface.
 
 This is an end-user allocator, not Morpho's curator-side Allocator role.
 
@@ -29,7 +31,8 @@ This is an end-user allocator, not Morpho's curator-side Allocator role.
 
 ## Why It Exists
 
-- **Professional allocation, not APY-chasing** — risk/reward metrics, risk tiers, and portfolio strategies (`core_satellite`, `risk_parity`, `sleeves`, `ladder`) — the way an allocator builds a book, not a sweep to the top rate.
+- **Professional allocation, not APY-chasing** — risk/reward metrics, quality tiers, and portfolio strategies (`decorrelated`, `core_satellite`, `risk_parity`, `sleeves`, `ladder`) — the way an allocator builds a book, not a sweep to the top rate.
+- **Diversification measured, not labelled** — a ceiling on a protocol or chain label can be satisfied by holding many names that are really one bet. So the policy also carries a *floor* on the effective number of independent positions, computed from the instruments' own history, and it fails closed when independence can't be measured.
 - **Dynamic discovery** — no hardcoded protocol or chain universe; new networks and instruments are picked up automatically from 1Tx.
 - **Transparent scoring** — every allocation and risk score maps to visible inputs. Unknown fields stay `Unknown` instead of being guessed.
 - **Policy-bounded execution** — allowlists and caps block unsafe proposals before signing. Policy can only tighten, never loosen.
@@ -88,7 +91,7 @@ Governance lives in [policy.yaml](policy.yaml) — the allocator's constitution.
 
 ## Talking to Your Agent
 
-`open-allocator` is a harness: you don't type CLI commands, your **agent** does. Point a coding agent (Claude Code, Cursor, or any agent that can run a shell) at this repo — it reads [AGENT_GUIDE.md](AGENT_GUIDE.md) and the [skills](#agent-operation) — and then you drive everything in plain language. The agent translates your intent into the JSON-out commands below, and every spend stays confirmation-gated.
+OpenAllocator is a harness: you don't type CLI commands, your **agent** does. Point a coding agent (Claude Code, Cursor, or any agent that can run a shell) at this repo — it reads [AGENT_GUIDE.md](AGENT_GUIDE.md) and the [skills](#agent-operation) — and then you drive everything in plain language. The agent translates your intent into the JSON-out commands below, and every spend stays confirmation-gated.
 
 **Discover & analyze** (read-only)
 
@@ -134,7 +137,26 @@ uv run open-allocator backtest  --allocation allocation.json       # daily-compo
 uv run open-allocator check-policy --allocation allocation.json    # block-only policy gate
 ```
 
-`build-allocation` supports risk presets, allocation strategies (`--strategy`), advisory screening flags, `--exclude`, pinned weights (`--pin id=weight`), and a full [allocation-spec](schemas/allocation-spec.schema.json) via `--spec`. Available strategies: `score_weighted` (default), `equal_weight`, `risk_parity`/`inverse_vol`, `core_satellite`, and `sleeves`/`ladder`.
+`build-allocation` supports risk presets, allocation strategies (`--strategy`, parameterized with repeatable `--strategy-param key=value`), advisory screening flags, `--exclude`, pinned weights (`--pin id=weight`), and a full [allocation-spec](schemas/allocation-spec.schema.json) via `--spec`.
+
+### Choosing a construction rule
+
+Each strategy answers a different question. None of them is the right default for everyone:
+
+| Ask | Strategy | Mechanism |
+| --- | --- | --- |
+| Highest scored yield | `score_weighted` (default) | Composite score, tilted by `--apy-weight` / `--score-power` |
+| Most independent book | `decorrelated` | Weight divided by measured correlation load; `top_n` adds greedy selection |
+| A risk budget you declare | `sleeves` / `ladder` | Score-tiered buckets, each with a target weight and its own sub-strategy |
+| No opinion | `equal_weight` | The honest baseline |
+| Volatility-balanced | `risk_parity` / `inverse_vol` | Inverse APY volatility |
+| A core plus bets | `core_satellite` | Core and satellite, each with its own selector |
+
+`sleeves` tiers key on the **composite score** — a blend of nine measured factors (TVL, APY stability, reward dependence, liquidity, oracle, fee, curator, market concentration, collateral mix) — so a sleeve is a quality band computed from data, not a hand-applied label. Each tier declares its target share of the book, which is how you express "half in the top band, a fifth in the bottom".
+
+`simulate` then reports what the choice actually bought: `effective_positions` (independent-bet count, inverse-HHI over the correlation matrix), `median_tail_lift` (how much more often held pairs have a bad day on the *same* day), `unmeasured_weight_bps` (how much of the book those metrics couldn't see), and `hidden_tail_pairs` (pairs correlation calls diversified that co-crash anyway). Compare two strategies by building both and diffing that output — the trade-off depends on the live shelf, so measure it, don't look it up.
+
+Full knob surface, plus the known limits of each metric: **[docs/capabilities.md](docs/capabilities.md)**.
 
 **Execution** (confirmation-gated)
 

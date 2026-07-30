@@ -13,6 +13,7 @@ Review the artifacts already produced by CLI/code:
 ## Required Checks
 
 - Concentration: instrument, protocol, curator, chain, and single-failure exposure.
+- Measured diversification: `effective_positions` against the `min_effective_positions` floor, `median_tail_lift`, `hidden_tail_pairs`, and `unmeasured_weight_bps`. Label caps passing is not evidence the book holds more than one bet. Treat low metric coverage as a finding in its own right, and never present effective-N as a property of the library rather than of the shelf on the day it was measured.
 - Reward dependence: emissions-driven APY and policy caps.
 - Liquidity: low liquidity flags, TVL depth, withdrawal messages, and exit size.
 - Policy conformance: cite `check-policy` or rebalance policy result; do not reinterpret violations.

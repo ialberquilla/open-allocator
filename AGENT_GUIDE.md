@@ -49,12 +49,44 @@ Use this loop for deposits and new books.
 3. Run `list-vaults` to discover the full live 1Tx universe.
 4. Run `score-vault` over candidate instruments and keep unknown fields visible.
 5. Run `build-allocation` to create a weighted, policy-conformant proposal.
-6. Run `simulate` to inspect blended APY, concentration, and failure-cost flags.
-7. Run `check-policy`; stop on any violation.
+   Pick the construction rule deliberately — `--strategy` is a real choice, not a
+   default to accept (see [Choosing a Construction Rule](#choosing-a-construction-rule)).
+6. Run `simulate` to inspect blended APY, concentration, measured
+   diversification, and failure-cost flags. Read `diversification.effective_positions`
+   (independent-bet count), `median_tail_lift`, and `unmeasured_weight_bps`
+   alongside label concentration — a book can satisfy every label cap and still
+   be one bet.
+7. Run `check-policy`; stop on any violation. `min_effective_positions` is a
+   **floor** and it fails closed: an allocation whose independence cannot be
+   measured is rejected, not passed. Do not route around it by loosening the
+   policy — rebuild with a construction rule that earns the floor.
 8. Announce vaults, chains, amounts, risks, expected transactions, and gas requirements.
 9. Wait for human approval.
 10. Run `build-tx`, then `execute --confirm` only after approval.
 11. Run `positions` and retain the checkpoint/allocation-log artifacts.
+
+## Choosing a Construction Rule
+
+`--strategy` decides what the book optimizes for, and the trade-off between yield
+and independence is the user's to set — never silently yours. If the task does
+not say, ask, or build more than one and present the measured difference.
+
+| Ask | Strategy | Params |
+| --- | --- | --- |
+| Highest scored yield | `score_weighted` (default) | — |
+| Most independent book | `decorrelated` | `top_n`, `unknown_correlation` |
+| A declared risk budget | `sleeves` / `ladder` | `tiers` |
+| No opinion | `equal_weight` | — |
+| Volatility-balanced | `risk_parity` / `inverse_vol` | — |
+| Core plus bets | `core_satellite` | `core_weight`, `core_count`, `core_selector`, `satellite_selector` |
+
+Pass params as repeatable `--strategy-param key=value` (JSON scalar values).
+Sleeve tiers are `{name, min_score, max_score, weight, strategy?}` keyed on the
+composite score, so a sleeve is a computed quality band, not a label.
+
+Never present an independence number as a property of the library. It is a
+property of the shelf on the day it was measured — regenerate it per run.
+Full surface and the known limits of every metric: [docs/capabilities.md](docs/capabilities.md).
 
 ## Rebalance Loop
 
@@ -83,6 +115,7 @@ Announce before execute. A valid execution announcement includes the wallet, sou
 
 Use these stage skills and workflow graphs for agent-operated runs. They describe how to call the CLI and review artifacts; deterministic allocation, scoring, policy, and execution logic remains in Python code.
 
+- [docs/capabilities.md](docs/capabilities.md) — the knob surface: every strategy and its params, ceilings vs. the floor, what `simulate` reports, and the known limits of each metric. Read this before deriving capabilities from source.
 - [skills/discover.md](skills/discover.md)
 - [skills/score.md](skills/score.md)
 - [skills/build-allocation.md](skills/build-allocation.md)
