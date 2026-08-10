@@ -296,6 +296,14 @@ class _Bucket:
     indices: tuple[int, ...]
     target: float
     strategy: str
+    # Minimum instruments required before the bucket may hold its target. A
+    # bucket that cannot meet it is dropped whole rather than held small: a
+    # sleeve too thin to survive one failed instrument is not made safe by
+    # shrinking it, so partial exposure at partial size is not on offer.
+    min_positions: int = 0
+    # Ordering key for redistribution. Higher is safer; a dropped bucket's
+    # target may only move to buckets strictly above it.
+    safety: float = 0.0
 
 
 def _core_satellite(
@@ -321,8 +329,14 @@ def _core_satellite(
     core_indices = tuple(sorted(order[:core_count]))
     satellite_indices = tuple(sorted(order[core_count:]))
     buckets = (
-        _Bucket("core", core_indices, core_weight, core_selector),
-        _Bucket("satellite", satellite_indices, 1.0 - core_weight, satellite_selector),
+        _Bucket("core", core_indices, core_weight, core_selector, safety=1.0),
+        _Bucket(
+            "satellite",
+            satellite_indices,
+            1.0 - core_weight,
+            satellite_selector,
+            safety=0.0,
+        ),
     )
     return _allocate_buckets(records, ctx, buckets)
 
@@ -343,6 +357,11 @@ def _sleeves(
             indices=tuple(assigned[tier_index]),
             target=float(spec["weight"]),
             strategy=str(spec.get("strategy", "score_weighted")),
+            min_positions=int(spec.get("min_positions", 0)),
+            # A tier's floor score is its safety rank: redistribution may only
+            # move weight to a band that demands a *higher* score than the one
+            # being dropped.
+            safety=float(spec["min_score"]),
         )
         for tier_index, spec in enumerate(tier_specs)
     )
@@ -354,30 +373,72 @@ def _allocate_buckets(
     ctx: StrategyContext,
     buckets: Sequence[_Bucket],
 ) -> StrategyResult:
+    """Allocate across buckets, redistributing what an unfillable one gives up.
+
+    A bucket must hold at least ``min_positions`` instruments (and always at
+    least one) to be funded. One that cannot is dropped whole and its target is
+    reassigned **upward only** — to funded buckets with a strictly higher
+    ``safety``. Redistributing proportionally across all survivors would push
+    weight *down* the ladder whenever the safest band is the one that came up
+    short, so a shortage of safe instruments would silently buy more risk.
+    """
     weights = [0.0 for _ in records]
     warnings: list[str] = []
 
-    active = [
-        bucket for bucket in buckets if bucket.indices and bucket.target > _EPSILON
-    ]
+    active: list[_Bucket] = []
+    dropped: list[_Bucket] = []
     for bucket in buckets:
-        if bucket.target > _EPSILON and not bucket.indices:
+        if bucket.target <= _EPSILON:
+            continue
+        if len(bucket.indices) >= max(bucket.min_positions, 1):
+            active.append(bucket)
+        else:
+            dropped.append(bucket)
+
+    for bucket in dropped:
+        if bucket.indices:
+            warnings.append(
+                f"sleeve_underfilled:{bucket.name}:"
+                f"{len(bucket.indices)}/{bucket.min_positions}:weight_redistributed"
+            )
+        else:
             warnings.append(f"sleeve_empty:{bucket.name}:weight_redistributed")
 
-    active_target = sum(bucket.target for bucket in active)
-    if active_target <= _EPSILON:
+    if not active:
         equal = 1 / len(records)
         warnings.append("sleeves:no_populated_tiers:using_equal_weights")
         return [equal for _ in records], warnings
 
-    for bucket in active:
+    # Absorbed shares are computed against the absorbers' *original* targets, so
+    # the outcome does not depend on the order the dropped buckets are visited.
+    adjusted = [bucket.target for bucket in active]
+    for bucket in dropped:
+        absorbers = [
+            position
+            for position, candidate in enumerate(active)
+            if candidate.safety > bucket.safety
+        ]
+        if not absorbers:
+            # The safest funded band is the one that came up short. There is
+            # nowhere up to go, so this falls back to spreading across what is
+            # left — which does raise the book's risk, and says so.
+            absorbers = list(range(len(active)))
+            warnings.append(
+                f"sleeve_no_safer_tier:{bucket.name}:weight_redistributed_down"
+            )
+        basis = sum(active[position].target for position in absorbers)
+        for position in absorbers:
+            adjusted[position] += bucket.target * active[position].target / basis
+
+    active_target = sum(adjusted)
+    for position, bucket in enumerate(active):
         subset = [records[index] for index in bucket.indices]
         sub_fn = _flat_strategy(bucket.strategy)
         sub_raw, sub_warnings = sub_fn(subset, ctx)
         sub_weights = _normalize(sub_raw)
-        share = bucket.target / active_target
-        for position, index in enumerate(bucket.indices):
-            weights[index] = share * sub_weights[position]
+        share = adjusted[position] / active_target
+        for offset, index in enumerate(bucket.indices):
+            weights[index] = share * sub_weights[offset]
         warnings.extend(f"{bucket.name}:{warning}" for warning in sub_warnings)
 
     return weights, warnings
@@ -401,6 +462,8 @@ def _tier_specs(params: Mapping[str, object]) -> tuple[Mapping[str, object], ...
                 raise StrategyError(f"sleeves tier missing required key: {key}")
         if "strategy" in tier:
             _flat_strategy(str(tier["strategy"]))
+        if "min_positions" in tier:
+            _int_param(tier, "min_positions", None, minimum=0)
         specs.append(tier)
     if not specs:
         raise StrategyError("sleeves 'tiers' must not be empty")

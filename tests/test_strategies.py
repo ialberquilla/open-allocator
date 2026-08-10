@@ -169,6 +169,171 @@ def test_sleeves_rejects_malformed_tier() -> None:
         )
 
 
+# --- sleeves: min_positions ------------------------------------------------
+
+
+def tiered(**mins: int) -> list[dict[str, object]]:
+    """The default ladder, with a `min_positions` floor on the named tiers."""
+    ladder = [
+        {"name": "safe", "min_score": 0.6, "max_score": 1.01, "weight": 0.5},
+        {"name": "med", "min_score": 0.3, "max_score": 0.6, "weight": 0.3},
+        {"name": "risky", "min_score": 0.0, "max_score": 0.3, "weight": 0.2},
+    ]
+    for tier in ladder:
+        if str(tier["name"]) in mins:
+            tier["min_positions"] = mins[str(tier["name"])]
+    return ladder
+
+
+def by_tier(result: dict[str, float]) -> dict[str, float]:
+    """Sum weights by the tier prefix in each instrument id."""
+    totals = {"safe": 0.0, "med": 0.0, "risky": 0.0}
+    for instrument_id, weight in result.items():
+        totals[instrument_id.split("-")[0]] += weight
+    return totals
+
+
+def full_ladder() -> list[ScoredVault]:
+    return [
+        scored("safe-1", 0.9),
+        scored("safe-2", 0.7),
+        scored("med-1", 0.5),
+        scored("med-2", 0.35),
+        scored("risky-1", 0.2),
+        scored("risky-2", 0.05),
+    ]
+
+
+def warnings_for(
+    records: list[ScoredVault], strategy: str, **params: object
+) -> list[str]:
+    _, found = strategies.desired_weights(strategy, records, params=params)
+    return found
+
+
+def test_sleeves_min_positions_met_leaves_targets_untouched() -> None:
+    records = full_ladder()
+    result = weights(records, "sleeves", tiers=tiered(safe=2, med=2, risky=2))
+    assert by_tier(result) == pytest.approx({"safe": 0.5, "med": 0.3, "risky": 0.2})
+    assert warnings_for(records, "sleeves", tiers=tiered(safe=2, med=2, risky=2)) == []
+
+
+def test_sleeves_underfilled_tier_is_dropped_whole_not_clamped() -> None:
+    # One risky instrument against a floor of 12: the sleeve is not held at a
+    # twelfth of its target, it is not held at all.
+    records = full_ladder()[:5]
+    params = {"tiers": tiered(risky=12)}
+    result = by_tier(weights(records, "sleeves", **params))
+
+    assert result["risky"] == pytest.approx(0.0)
+    # 0.2 splits over safe and med in proportion to their own targets (5:3).
+    assert result["safe"] == pytest.approx(0.625)
+    assert result["med"] == pytest.approx(0.375)
+    assert sum(result.values()) == pytest.approx(1.0)
+    assert "sleeve_underfilled:risky:1/12:weight_redistributed" in warnings_for(
+        records, "sleeves", **params
+    )
+
+
+def test_sleeves_underfilled_middle_tier_moves_weight_up_only() -> None:
+    # The discriminating case: med is dropped, and risky must not grow. Spread
+    # proportionally across every survivor, risky would go 0.2 -> 0.286.
+    records = [
+        scored("safe-1", 0.9),
+        scored("safe-2", 0.7),
+        scored("med-1", 0.5),
+        scored("risky-1", 0.2),
+        scored("risky-2", 0.05),
+    ]
+    params = {"tiers": tiered(med=2)}
+    result = by_tier(weights(records, "sleeves", **params))
+
+    assert result["risky"] == pytest.approx(0.2)
+    assert result["safe"] == pytest.approx(0.8)
+    assert result["med"] == pytest.approx(0.0)
+
+
+def test_sleeves_empty_middle_tier_also_moves_weight_up_only() -> None:
+    # An empty tier is the extreme of an underfilled one and takes the same
+    # path, so a vacant middle band cannot buy the book more risk either.
+    records = [scored("safe-1", 0.9), scored("safe-2", 0.7), scored("risky-1", 0.2)]
+    result = by_tier(weights(records, "sleeves"))
+
+    assert result["risky"] == pytest.approx(0.2)
+    assert result["safe"] == pytest.approx(0.8)
+    assert "sleeve_empty:med:weight_redistributed" in warnings_for(records, "sleeves")
+
+
+def test_sleeves_underfilled_safest_tier_warns_that_it_redistributed_down() -> None:
+    # Nothing sits above `safe`, so its target has to go down the ladder. That
+    # raises the book's risk and must be said out loud.
+    records = [
+        scored("safe-1", 0.9),
+        scored("med-1", 0.5),
+        scored("med-2", 0.35),
+        scored("risky-1", 0.2),
+        scored("risky-2", 0.05),
+    ]
+    params = {"tiers": tiered(safe=3)}
+    result = by_tier(weights(records, "sleeves", **params))
+    found = warnings_for(records, "sleeves", **params)
+
+    assert result["med"] == pytest.approx(0.6)
+    assert result["risky"] == pytest.approx(0.4)
+    assert "sleeve_underfilled:safe:1/3:weight_redistributed" in found
+    assert "sleeve_no_safer_tier:safe:weight_redistributed_down" in found
+
+
+def test_sleeves_redistribution_is_independent_of_drop_order() -> None:
+    # safe and med both fall short; each absorbs against original targets, so
+    # the survivor's share cannot depend on which was processed first.
+    records = [scored("safe-1", 0.9), scored("med-1", 0.5), scored("risky-1", 0.2)]
+    result = by_tier(weights(records, "sleeves", tiers=tiered(safe=2, med=2)))
+    assert result["risky"] == pytest.approx(1.0)
+
+
+def test_sleeves_all_tiers_underfilled_falls_back_to_equal_weights() -> None:
+    records = full_ladder()
+    params = {"tiers": tiered(safe=9, med=9, risky=9)}
+    result = weights(records, "sleeves", **params)
+    found = warnings_for(records, "sleeves", **params)
+
+    assert list(result.values()) == pytest.approx([1 / 6] * 6)
+    assert "sleeves:no_populated_tiers:using_equal_weights" in found
+    assert "sleeve_underfilled:safe:2/9:weight_redistributed" in found
+
+
+def test_sleeves_min_positions_does_not_change_the_within_tier_split() -> None:
+    # Dropping a tier reweights the bands; it must not disturb how the
+    # surviving band ranks its own instruments.
+    records = full_ladder()[:5]
+    base = weights(records, "sleeves")
+    dropped = weights(records, "sleeves", tiers=tiered(risky=12))
+    assert dropped["safe-1"] / dropped["safe-2"] == pytest.approx(
+        base["safe-1"] / base["safe-2"]
+    )
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, "3", True])
+def test_sleeves_rejects_invalid_min_positions(bad: object) -> None:
+    with pytest.raises(StrategyError):
+        strategies.desired_weights(
+            "sleeves",
+            [scored("a", 0.5)],
+            params={
+                "tiers": [
+                    {
+                        "name": "only",
+                        "min_score": 0.0,
+                        "max_score": 1.01,
+                        "weight": 1.0,
+                        "min_positions": bad,
+                    }
+                ]
+            },
+        )
+
+
 # --- integration through build_allocation ----------------------------------
 
 
