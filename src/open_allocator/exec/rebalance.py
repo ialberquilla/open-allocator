@@ -68,6 +68,10 @@ class _StepRef(FrozenModel):
     idempotency_key: str
     usd: float | None = None
     shares: str | None = None
+    # Only set where the venue quoted a price. A buy cannot know it: 1Tx's
+    # build endpoint neither takes nor returns a share amount, and the receipt
+    # carries no logs, so the price is unknown until the position is next read.
+    share_price: str | None = None
     action_type: str
 
 

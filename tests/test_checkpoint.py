@@ -300,6 +300,179 @@ def test_allocation_log_appends_and_reconciles_against_positions(
     assert reconciliation.missing_in_positions == ()
 
 
+# --- cost basis -------------------------------------------------------------
+#
+# The log is the only record of what a share cost: 1Tx has no wallet-history
+# endpoint, so an amount not written at execution time is gone, not deferred.
+
+
+def test_a_quoted_price_is_kept_and_completes_the_dollar_amount(
+    tmp_path: Path,
+) -> None:
+    """A withdraw knows its price -- the plan quotes it -- so nothing is lost."""
+    entry = write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="withdraw",
+        tx_hash="0x1",
+        shares="1000",
+        share_price="1.05",
+        log_path=tmp_path / "log.jsonl",
+    )
+
+    assert entry.basis == "quoted"
+    assert entry.share_price == "1.05"
+    assert entry.usd == pytest.approx(1050.0)
+
+
+def test_a_price_is_derived_when_both_amounts_are_known(tmp_path: Path) -> None:
+    entry = write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="sell",
+        tx_hash="0x1",
+        usd=1050.0,
+        shares="1000",
+        log_path=tmp_path / "log.jsonl",
+    )
+
+    assert entry.basis == "derived"
+    assert entry.share_price == "1.05"
+
+
+def test_a_quoted_price_wins_over_the_derivable_one(tmp_path: Path) -> None:
+    """The venue's own number beats arithmetic over two rounded amounts."""
+    entry = write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="withdraw",
+        tx_hash="0x1",
+        usd=999.0,
+        shares="1000",
+        share_price="1.05",
+        log_path=tmp_path / "log.jsonl",
+    )
+
+    assert entry.basis == "quoted"
+    assert entry.share_price == "1.05"
+    assert entry.usd == pytest.approx(999.0)
+
+
+def test_a_buy_records_dollars_and_admits_it_has_no_price(tmp_path: Path) -> None:
+    """The honest case, and the reason `basis` exists.
+
+    1Tx's build endpoint neither takes nor returns a share amount and the
+    receipt carries no logs, so a buy's price is genuinely unknown at write
+    time. It must read as unknown rather than as an estimate.
+    """
+    entry = write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="buy",
+        tx_hash="0x1",
+        usd=1000.0,
+        log_path=tmp_path / "log.jsonl",
+    )
+
+    assert entry.basis == "unresolved"
+    assert entry.share_price is None
+    assert entry.usd == 1000.0
+
+
+def test_a_zero_share_count_does_not_lose_the_entry(tmp_path: Path) -> None:
+    """The write happens after the money moved; a bad amount must not raise."""
+    entry = write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="sell",
+        tx_hash="0x1",
+        usd=500.0,
+        shares="0",
+        log_path=tmp_path / "log.jsonl",
+    )
+
+    assert entry.basis == "unresolved"
+    assert entry.share_price is None
+    assert entry.usd == 500.0
+
+
+def test_a_tiny_price_is_not_rounded_away(tmp_path: Path) -> None:
+    """Bounded by significant digits: a fixed decimal place reads dust as free."""
+    entry = write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="sell",
+        tx_hash="0x1",
+        usd=1.0,
+        shares="1000000000000000000000000000",
+        log_path=tmp_path / "log.jsonl",
+    )
+
+    assert entry.share_price is not None
+    assert float(entry.share_price) > 0
+    assert "e" not in entry.share_price.casefold()
+
+
+def test_a_large_share_count_survives_the_round_trip(tmp_path: Path) -> None:
+    """Shares are decimal strings because this number breaks a float."""
+    shares = "123456789012345678901234567890"
+    log_path = tmp_path / "log.jsonl"
+    write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="withdraw",
+        tx_hash="0x1",
+        shares=shares,
+        share_price="1.0",
+        log_path=log_path,
+    )
+
+    assert read_allocation_log(log_path=log_path)[0].shares == shares
+
+
+def test_a_withdrawal_now_subtracts_from_the_logged_total(tmp_path: Path) -> None:
+    """Before the price was recorded, an exit carried no dollars at all and
+    reconciliation skipped it -- so the log drifted after every withdrawal."""
+    log_path = tmp_path / "log.jsonl"
+    write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="buy",
+        tx_hash="0x1",
+        usd=1000.0,
+        log_path=log_path,
+    )
+    write_allocation_log_entry(
+        instrument_id="vault-a",
+        chain_id=8453,
+        action_type="withdraw",
+        tx_hash="0x2",
+        shares="400",
+        share_price="1.0",
+        log_path=log_path,
+    )
+
+    totals = allocation_log_totals(read_allocation_log(log_path=log_path))
+
+    assert totals == {"vault-a": 600}
+
+
+def test_old_entries_still_load(tmp_path: Path) -> None:
+    """Existing logs predate these fields and must not become unreadable."""
+    log_path = tmp_path / "log.jsonl"
+    log_path.write_text(
+        '{"instrument_id":"vault-a","chain_id":8453,"action_type":"buy",'
+        '"tx_hash":"0x1","timestamp":"2026-08-01T00:00:00Z","usd":100.0,'
+        '"shares":null}\n',
+        encoding="utf-8",
+    )
+
+    entry = read_allocation_log(log_path=log_path)[0]
+
+    assert entry.usd == 100.0
+    assert entry.basis == "unresolved"
+
+
 def test_confirmed_execution_writes_checkpoint_and_allocation_log(
     tmp_path: Path,
 ) -> None:

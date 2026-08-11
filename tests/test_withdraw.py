@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from open_allocator.core.checkpoint import read_allocation_log
 from open_allocator.core.positions import IdleBalance, PositionHolding, Positions
 from open_allocator.core.types import (
     Policy,
@@ -62,6 +64,11 @@ class Config:
         message=f"native gas available on chain {chain_id}",
     )
     _rpc_overrides: dict[int, str] = field(default_factory=lambda: {8453: "rpc://base"})
+    _allocation_log_path: Path | None = None
+
+    @property
+    def allocation_log_path(self) -> Path | None:
+        return self._allocation_log_path
 
 
 def holding(
@@ -146,6 +153,38 @@ def sell_response(**extra: object) -> dict[str, Any]:
     }
     payload.update(extra)
     return payload
+
+
+def test_a_confirmed_exit_logs_the_price_it_sold_at(tmp_path: Path) -> None:
+    """The cost-basis wiring, end to end.
+
+    A withdraw is the one action whose share price is known exactly at write
+    time -- `WithdrawPlan.share_price_usd` is quoted from the position itself
+    -- so the log must carry it rather than recording bare share counts and
+    leaving the dollars to be guessed later. There is no backfill for this.
+    """
+    position = holding(usd_value="100", share_balance="80")
+    log_path = tmp_path / "allocation-log.jsonl"
+
+    report = withdraw(
+        MockWithdrawClient([sell_response(expectedUsdc="99.50")]),
+        MockSigner(),
+        position,
+        permissive_policy(),
+        confirm=True,
+        config=Config(_allocation_log_path=log_path),
+    )
+
+    entry = read_allocation_log(log_path=log_path)[0]
+
+    assert report.status == "success"
+    assert entry.action_type == "withdraw"
+    assert entry.shares == "80"
+    assert entry.share_price == "1.25"
+    assert entry.basis == "quoted"
+    # And the dollars follow from the two, so an exit no longer lands in the
+    # log without a value and get skipped by reconciliation.
+    assert entry.usd == pytest.approx(100.0)
 
 
 def test_full_exit_sends_exact_share_balance_as_yield_token_amount() -> None:
