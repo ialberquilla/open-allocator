@@ -41,7 +41,7 @@ is a JSON scalar). Source of truth: `src/open_allocator/core/strategies/library.
 | `risk_parity` / `inverse_vol` | — | Aliases. Inverse APY volatility, with a vol floor. |
 | `decorrelated` | `top_n`, `unknown_correlation` | `top_n` switches on greedy selection; omit it to keep every candidate and only re-weight. `unknown_correlation` defaults to `1.0` — an unmeasurable pair is charged as fully correlated. |
 | `core_satellite` | `core_weight`, `core_count`, `core_selector`, `satellite_selector` | Selectors must be flat strategies; composites are rejected so dispatch stays finite. |
-| `sleeves` / `ladder` | `tiers` | Aliases. `tiers` is a list of `{name, min_score, max_score, weight, strategy?}`. Omit to use the default 3-tier ladder. |
+| `sleeves` / `ladder` | `tiers` | Aliases. `tiers` is a list of `{name, min_score, max_score, weight, strategy?, min_positions?}`. Omit to use the default 3-tier ladder. |
 
 ### How `sleeves` buckets
 
@@ -52,13 +52,51 @@ fee, curator, market concentration, collateral mix. So a sleeve is a
 quality band computed from data, not a hand-applied label.
 
 Each tier declares a `weight` — a *target share* of the book. That is how you
-say "half in the top band, a fifth in the bottom one". A tier that matches no
-instrument raises `sleeve_empty:<name>:weight_redistributed` and its target is
-spread across the populated tiers, so the allocation still sums to 1 and tells
-you what it did.
+say "half in the top band, a fifth in the bottom one".
 
 Each tier may also name its own `strategy`, so a risk budget can be composed
 with a different construction rule inside each band.
+
+### The floor under a sleeve: `min_positions`
+
+A target share says how much goes in a band; it says nothing about how many
+names carry it. `min_positions` is the second half — the count a tier must
+reach before it may hold its target at all.
+
+A tier that cannot reach it is **dropped whole, not held small**. Shrinking a
+sleeve does not fix a sleeve that is too thin: the failure being guarded is one
+instrument going to zero, and a three-name band loses a third of itself to that
+whatever share of the book it was given. So the knob is a floor on breadth, not
+a discount on size, and the tier either clears it or gets nothing.
+
+Where the released weight goes is the part worth reading twice. It moves
+**upward only** — to funded tiers with a strictly higher `min_score`, in
+proportion to their own targets. Spread evenly across every survivor instead, a
+shortage of *safe* instruments would push weight down into the riskier bands
+and quietly buy more risk than was asked for. The one case where that cannot be
+avoided is the safest tier itself falling short, since nothing sits above it;
+that path still runs, and says so.
+
+What a run tells you:
+
+| Warning | Meaning |
+| --- | --- |
+| `sleeve_empty:<name>:weight_redistributed` | Tier matched no instrument. |
+| `sleeve_underfilled:<name>:<n>/<min>:weight_redistributed` | Tier matched `n` instruments against a floor of `min`. |
+| `sleeve_no_safer_tier:<name>:weight_redistributed_down` | Nothing above the dropped tier could absorb it, so its weight went down the ladder. **This raises the book's risk.** |
+| `sleeves:no_populated_tiers:using_equal_weights` | No tier cleared its floor; the run falls back to equal weights. |
+
+The allocation still sums to 1 in every case, and the redistribution is
+computed against the tiers' original targets, so the result does not depend on
+the order unfillable tiers are visited.
+
+`min_positions` defaults to `0` — unset, a tier needs one instrument, which is
+the behaviour that shipped before the knob existed. Sizing it is a judgement
+about how many independent failures a band should absorb, and `simulate` is
+where you check what a given floor costs on the shelf you actually have. Note
+this is a floor on *names*, not on independence: `min_effective_positions`
+below is the measured counterpart, and a tier can clear a count floor with
+instruments that are one position in disguise.
 
 ## Ceilings, and the one floor
 
