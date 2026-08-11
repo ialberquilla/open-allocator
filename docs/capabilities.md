@@ -163,9 +163,21 @@ blocks.
   cheap validated stand-in for composition overlap, not a substitute for it.
 - **Sleeve tiers key only on the composite score.** You cannot currently bucket
   directly on correlation load, drawdown, or any single factor.
-- **Sleeves have no `min_positions`.** A tier can be given a target weight but
-  not a minimum name count, so a small high-risk sleeve can concentrate inside
-  its own budget.
+- **A sleeve floor can move weight the wrong way.** `min_positions` drops a tier
+  that cannot fill it and hands the weight *up* the ladder — but when the tier
+  that comes up short is the safest one, there is nothing above it to absorb the
+  weight and it goes down instead. The run says so (`sleeve_no_safer_tier`), and
+  the allocation is still valid, but a blanket floor applied to every tier can
+  produce a riskier book than setting no floor at all. Size floors against the
+  shelf you have, not uniformly.
+- **The allocation log cannot price a buy.** A buy records the dollars it spent
+  and nothing else: the build endpoint neither takes nor returns a share amount
+  and the receipt carries no logs, so the shares bought are unknown until the
+  position is next read. Those entries carry `basis: "unresolved"` and cannot
+  contribute a per-share cost basis. Sells and withdrawals do carry a price —
+  quoted where the plan knew it, derived from dollars ÷ shares otherwise — and
+  say which in the same field. **There is no backfill**: an amount missing from
+  the log stays missing.
 - **`--max-positions` truncates after tier allocation.** Combined with
   `sleeves`, the cut can collapse the book toward the top tier rather than
   thinning each tier against its budget. The `min_effective_positions` floor

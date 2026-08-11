@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
@@ -23,6 +24,10 @@ CheckpointStatus: TypeAlias = Literal[
 DEFAULT_CHECKPOINT_DIR = Path(".open_allocator/checkpoints")
 DEFAULT_ALLOCATION_LOG_PATH = Path(".open_allocator/allocation-log.jsonl")
 _VALIDATED_STATUSES = {"completed", "awaiting_human"}
+# Significant digits kept in a derived share price. Wide enough for an
+# 18-decimal token priced in dollars; narrow enough that the tail of a
+# rounded share count does not read as precision the log does not have.
+_PRICE_PRECISION = 18
 _SCHEMA_BY_ARTIFACT_TYPE = {
     "allocation": "allocation",
     "tx-plan": "tx-plan",
@@ -63,13 +68,58 @@ class CheckpointIdempotencyStore:
 
 
 class AllocationLogEntry(FrozenModel):
+    """One executed action, recorded so cost basis survives the transaction.
+
+    An action has three amounts -- dollars in, shares out, and the price
+    between them -- and any two determine the third. Recording only one made
+    per-share cost basis underivable from the log, and there is no backfill:
+    1Tx exposes no wallet-history endpoint, so an amount not written here is
+    lost rather than merely inconvenient.
+
+    So the entry takes whatever the caller knows, completes the third amount
+    itself, and records in `basis` where the share price came from. It never
+    invents one: a buy knows its dollars and cannot know its shares until the
+    trade settles, and that entry stays `unresolved` instead of carrying an
+    estimate dressed as a fill.
+    """
+
     instrument_id: str
     chain_id: int
     action_type: str
     tx_hash: str
     timestamp: str
     usd: float | None = Field(default=None, ge=0)
+    # Decimal strings, not floats: share counts routinely exceed a float's
+    # exact-integer range, and a cost basis that rounds is not a cost basis.
     shares: str | None = None
+    share_price: str | None = None
+    basis: Literal["quoted", "derived", "unresolved"] = "unresolved"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _complete_amounts(cls, data: object) -> object:
+        if not isinstance(data, Mapping):
+            return data
+
+        values = dict(data)
+        usd = values.get("usd")
+        shares = values.get("shares")
+        share_price = values.get("share_price")
+
+        if share_price is not None:
+            # The caller was quoted a price by the venue. Trust it over
+            # anything computed here, and fill the missing dollar amount from
+            # it so the entry's own three numbers agree with each other.
+            values["basis"] = "quoted"
+            if usd is None and shares is not None:
+                values["usd"] = _multiplied_usd(shares, share_price)
+        elif usd is not None and shares is not None:
+            values["share_price"] = _quotient(usd, shares)
+            values["basis"] = "derived" if values["share_price"] else "unresolved"
+        else:
+            values["basis"] = "unresolved"
+
+        return values
 
     @model_validator(mode="after")
     def _has_amount(self) -> "AllocationLogEntry":
@@ -204,18 +254,22 @@ def write_allocation_log_entry(
     tx_hash: str,
     usd: float | None = None,
     shares: str | None = None,
+    share_price: str | None = None,
     timestamp: str | None = None,
     log_path: str | Path = DEFAULT_ALLOCATION_LOG_PATH,
 ) -> AllocationLogEntry:
     return append_allocation_log_entry(
-        AllocationLogEntry(
-            instrument_id=instrument_id,
-            chain_id=chain_id,
-            action_type=action_type,
-            tx_hash=tx_hash,
-            timestamp=timestamp or _timestamp(),
-            usd=usd,
-            shares=shares,
+        AllocationLogEntry.model_validate(
+            {
+                "instrument_id": instrument_id,
+                "chain_id": chain_id,
+                "action_type": action_type,
+                "tx_hash": tx_hash,
+                "timestamp": timestamp or _timestamp(),
+                "usd": usd,
+                "shares": shares,
+                "share_price": share_price,
+            }
         ),
         log_path=log_path,
     )
@@ -396,6 +450,44 @@ def _timestamp(*, compact: bool = False) -> str:
     if compact:
         return now.strftime("%Y%m%dT%H%M%S%fZ")
     return now.isoformat().replace("+00:00", "Z")
+
+
+def _quotient(usd: object, shares: object) -> str | None:
+    """USD per share, or None when the division cannot be trusted.
+
+    Returns None rather than raising: a log write happens *after* the money
+    has moved, so a malformed amount must not be the reason the record of a
+    settled transaction is lost. The entry degrades to `unresolved` instead.
+    """
+    try:
+        share_count = Decimal(str(shares))
+        if share_count <= 0:
+            return None
+        # Bounded by significant digits, not decimal places: share prices span
+        # dollars-per-share down to dust, and quantizing to a fixed number of
+        # places rounds the small end to zero -- which reads as free rather
+        # than as small.
+        with localcontext() as context:
+            context.prec = _PRICE_PRECISION
+            return _format_amount(Decimal(str(usd)) / share_count)
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+
+
+def _multiplied_usd(shares: object, share_price: object) -> float | None:
+    try:
+        return float(Decimal(str(shares)) * Decimal(str(share_price)))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+
+
+def _format_amount(value: Decimal) -> str:
+    """Plain decimal string -- never exponent notation, which reads as garbage
+    in a ledger and does not round-trip through every JSON consumer."""
+    normalized = value.normalize()
+    if normalized == normalized.to_integral_value():
+        normalized = normalized.quantize(Decimal(1))
+    return format(normalized, "f")
 
 
 def _signed_usd(entry: AllocationLogEntry) -> float:
