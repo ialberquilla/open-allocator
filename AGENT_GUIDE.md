@@ -26,6 +26,7 @@ The registered CLI commands are exactly:
 - `simulate`
 - `backtest`
 - `check-policy`
+- `validate-mandate`
 - `build-tx`
 - `execute`
 - `positions`

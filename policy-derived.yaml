@@ -1,0 +1,74 @@
+# Derived policy — produced from mandate.yaml, not hand-written.
+#
+# This is the baseline policy.yaml with two caps tightened to answer the
+# mandate text. Every other value is copied unchanged: `validate-mandate`
+# rejects a derived policy that loosens anything, so the only edits a
+# derivation may make are in one direction.
+#
+# Regenerate rather than edit. The mandate carries this file's sha256, so an
+# edit here breaks the binding and validation fails — which is the point: the
+# rationale that argued for these numbers must travel with the numbers.
+# policy.yaml - the allocator's constitution
+version: 1
+wallet:
+  mode: self-custody           # self-custody EOA now; Safe multisig later
+  signer: local-eoa            # local-eoa | remote | safe
+allowed:
+  protocols: null              # null/omitted = all protocols 1Tx exposes
+  chains: null                 # null/omitted = all chains 1Tx exposes
+  asset_categories: null       # null = all; e.g. [USD] for dollar-denominated only (1Tx assetCategory)
+  stablecoin_only: true        # only isStablecoin instruments — the stablecoin-first knob (null/false = any)
+  assets: null                 # optional fine-grained tokenSymbol allowlist; null = all (e.g. [USDC] to exclude EUR stables)
+  curators: null               # null/omitted = any curator
+caps:
+  max_weight_per_instrument: 0.30  # no single pool > 30%
+  # Chain is the diversifying axis, protocol largely is not: measured on live
+  # instruments, only protocol+chain+asset *together* co-moves, while the same
+  # protocol on a different chain is uncorrelated. So the chain cap is the
+  # tighter of the two.
+  max_weight_per_protocol: 0.60
+  # NOTE: not a control we currently have. `curator` arrives Unknown from
+  # discovery, and curator_bucket gives each unknown its own bucket (an
+  # undisclosed curator is not evidence two vaults share one), so this cap does
+  # not bind until discovery surfaces curators.
+  max_weight_per_curator: 0.40
+  max_weight_per_chain: 0.60
+  # Sector = yield source (variable-rate lending / savings rate / fixed rate /
+  # private credit / basis / LP fee), sourced from 1Tx discovery.
+  #
+  # Left unbinding at 1.00 on purpose. Every live instrument on today's shelf is
+  # VARIABLE_RATE_LENDING, so any real cap here would leave capital unplaceable
+  # and report `caps_binding:unallocatable_weight` rather than diversify
+  # anything — the shelf, not the policy, is the binding constraint. The
+  # effective-sector count is reported by `simulate` regardless, so the
+  # monoculture is visible before signing either way. Tighten to ~0.60 in the
+  # same commit that puts a second sector on the shelf.
+  max_weight_per_sector: 1.00
+  # The measured counterpart to the caps above: a floor on the effective number
+  # of independent positions, computed from the instruments' own APY history
+  # rather than from their labels. A ceiling on a label can be satisfied by
+  # holding many names for one position; this cannot.
+  #
+  # 3.0 rejects taking the highest APYs on offer and accepts a spread of the
+  # same width across distinct protocol/chain/asset cells.
+  #
+  # Unmeasurable allocations FAIL this rather than passing it — see
+  # policy._check_diversification. Instruments too new to score are charged as
+  # fully correlated, so a basket of fresh high-APY pools will not clear it.
+  # Tightened 3.0 -> 3.5 by the mandate's "enough diversification".
+  # Measured on the derived allocation against the 2026-08-11 shelf:
+  # 3.99 effective positions across 41 names. 4.0 was tested first and
+  # REJECTED that allocation (actual 3.9828), so the floor sits below the
+  # measurement with margin rather than at a round number above it.
+  min_effective_positions: 3.5
+  min_instrument_tvl_usd: 50_000
+  # Tightened 0.50 -> 0.40 by the mandate's "good yield", read as yield
+  # that is not an emissions schedule. Measured cost on the 2026-08-11
+  # shelf: one instrument removed, blended APY unchanged (4.509% -> 4.523%).
+  # It barely binds today; it is cheap insurance against a shelf that
+  # turns reward-heavy, not a live constraint.
+  max_reward_dependence: 0.40
+gates:
+  new_instrument_needs_approval: false  # first touch of a pool needs approval
+  autonomous_rebalance: true          # opt in explicitly before autonomy
+  max_deploy_per_cycle_usd: 25_000

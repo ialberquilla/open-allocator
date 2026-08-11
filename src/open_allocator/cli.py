@@ -14,6 +14,7 @@ from open_allocator.core import allocator as allocation_core
 from open_allocator.core import backtest as backtest_core
 from open_allocator.core import costs as costs_core
 from open_allocator.core import eligibility, metrics, universe
+from open_allocator.core import mandate as mandate_core
 from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
 from open_allocator.core import riskmetrics as riskmetrics_core
@@ -1408,6 +1409,28 @@ def check_policy(
         policy,
         known_instruments,
     ).model_dump(mode="json")
+
+
+@app.command("validate-mandate")
+@json_command
+def validate_mandate(
+    mandate_path: Annotated[
+        Path,
+        typer.Option("--mandate", exists=True, dir_okay=False, readable=True),
+    ],
+    baseline_path: Annotated[
+        Path,
+        typer.Option("--baseline", dir_okay=False, readable=True),
+    ] = DEFAULT_POLICY_PATH,
+) -> JsonObject:
+    """Gate an LLM-authored mandate before its policy is used.
+
+    Reads files only -- no discovery, no network, no model. The derived policy
+    is located relative to the mandate, not to the working directory.
+    """
+    return mandate_core.validate_mandate(mandate_path, baseline_path).model_dump(
+        mode="json"
+    )
 
 
 @app.command("build-tx")

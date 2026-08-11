@@ -1,0 +1,136 @@
+# A mandate is a sentence of intent plus the knobs derived from it, with a
+# reason attached to every knob that moved. It is the readable half of the
+# allocator: policy.yaml says what execution may do, this says what was asked
+# for and how that request was read.
+#
+# Hand-derived against the live shelf on 2026-08-11 so that it can serve as the
+# worked example of what skills/mandate.md must make an agent produce. Every
+# number below was measured, not chosen for roundness — three of them contradict
+# the values the design spec proposed, and each of those is called out in the
+# rationale entry that owns it.
+#
+# Validate with:
+#   open-allocator validate-mandate --mandate mandate.yaml --baseline policy.yaml
+version: 1
+
+text: |
+  I need a professional asset allocation with different buckets, good yield,
+  but enough diversification.
+
+derived_at: "2026-08-11T11:40:00Z"
+derived_by: "hand-derived (ialberquilla)"
+
+policy_path: policy-derived.yaml
+policy_hash: "sha256:7205b9777512dfe7d6735f4a9c586a3d32037f6405b6437312886bff05f867be"
+
+strategy: sleeves
+strategy_params:
+  tiers:
+    - {name: core,     min_score: 0.85, max_score: 1.01, weight: 0.50, min_positions: 5}
+    - {name: yield,    min_score: 0.58, max_score: 0.85, weight: 0.35, min_positions: 6}
+    - {name: frontier, min_score: 0.00, max_score: 0.58, weight: 0.15, min_positions: 12}
+
+bands:
+  weight_drift_bps: 100
+  sleeve_drift_bps: 500
+
+rationale:
+  - knob: strategy
+    value: sleeves
+    because: >
+      "different buckets" is a request for a declared risk budget, not for a
+      particular set of names. The sleeve ladder is the only strategy here that
+      takes target shares per band as input, so the mandate's own sentence
+      survives into the config instead of being translated into a weighting
+      curve that no longer reads as what was asked.
+
+  - knob: strategy_params.tiers[].min_score
+    value: [0.85, 0.58, 0.00]
+    because: >
+      Cut where the scores actually sit, not at the library defaults. The
+      default ladder puts its bottom band under 0.30 and on the 2026-08-11
+      shelf that band is EMPTY (41 policy candidates: 25 / 16 / 0), so a
+      three-bucket mandate would have rendered as two buckets and the
+      allocation would have carried a sleeve_empty warning by construction.
+      The observed distribution is bimodal: 16 names in 0.31-0.52, then a
+      0.123-wide gap, then 25 names in 0.64-0.98. The 0.58 cut sits in the
+      middle of that gap, which is the most stable place to put it -- any
+      value from 0.53 to 0.64 produces the same split, so ordinary score
+      movement cannot reclassify a name across it.
+
+  - knob: strategy_params.tiers[0].min_score
+    value: 0.85
+    because: >
+      Stated separately because it is weaker evidence than the 0.58 cut and
+      should not borrow its confidence. There is no comparable gap inside the
+      upper cluster -- the widest is 0.031 -- so the core/yield boundary is a
+      judgement about how selective "core" should be, not a feature of the
+      data. 0.85 sits in the largest available gap up there (0.844 to 0.868)
+      and yields core=13 / yield=12 / frontier=16. The spec proposed 0.90,
+      which falls in a 0.018-wide gap and leaves core at 10; both work today,
+      0.85 is simply harder to dislodge.
+
+  - knob: strategy_params.tiers[].min_positions
+    value: [5, 6, 12]
+    because: >
+      Floors rise as score falls, which is the opposite of how they read at
+      first glance and is the whole lesson of this derivation. The floor exists
+      so one instrument going to zero cannot gut a band, and that risk is
+      concentrated in frontier -- so frontier carries 12 (studies 038/042: a
+      12-name sleeve survives the hacked-pool grid, a 3-name sleeve does not at
+      any size) against its 16 names. Core cannot carry the same number, and
+      not because it would be expensive: when the band that fails its floor is
+      the SAFEST one there is nothing above it to absorb the released weight,
+      so the weight travels DOWN the ladder and the book gets riskier than it
+      would have been with no floor at all. Measured on this shelf: a core
+      floor of 14 against its 13 names raises blended APY from 4.478% to
+      4.716% -- yield up because risk went up, from a knob whose entire purpose
+      is to reduce risk. Core therefore gets 5 against 13 names, a margin wide
+      enough that ordinary shelf churn cannot trip the inversion.
+
+  - knob: caps.min_effective_positions
+    value: 3.5
+    because: >
+      "enough diversification" is a floor on measured independence, not a name
+      count -- and the gap between those two is this shelf's defining feature:
+      the derived allocation holds 40 names that behave as 3.81 independent
+      bets. The spec proposed 4.0. That value was tested first and it REJECTS
+      this allocation (check-policy: actual 3.9828 against a limit of 4.0,
+      before the reward cap trimmed it further to 3.81), so it would have
+      shipped a mandate whose own output its own policy refuses. 3.5 tightens
+      the 3.0 baseline while leaving margin above it for the measurement to
+      move, which it does daily.
+
+  - knob: caps.max_reward_dependence
+    value: 0.40
+    because: >
+      "good yield" read as yield that is not an emissions schedule. Tightening
+      0.50 to 0.40 costs one instrument and no yield on the 2026-08-11 shelf
+      (blended 4.509% to 4.523%, i.e. the name removed was not carrying its
+      weight). Worth stating plainly: this knob barely binds today. It is cheap
+      insurance against a shelf that turns reward-heavy, not a live constraint,
+      and it should not be described as though it were doing work.
+
+  - knob: bands.weight_drift_bps
+    value: 100
+    because: >
+      Sized against the book this mandate actually produces rather than picked
+      as a round share of it. Across 40 legs the median position is 282 bps and
+      the smallest is 29 bps, so the spec's proposed 300 bps band is wider than
+      a typical whole position: a leg would have to more than double to trip
+      it, and the smallest leg could go to zero without ever doing so. 100 bps
+      is roughly a third of a median position -- large enough that ordinary
+      yield drift does not trigger a rebalance, small enough that the band can
+      be reached by something short of a total loss.
+
+  - knob: bands.sleeve_drift_bps
+    value: 500
+    because: >
+      Deliberately looser than the per-instrument band, because names inside a
+      band are substitutes for each other and the band total is the number the
+      mandate asked for. Note the asymmetry this leaves, since it is a real
+      limit rather than a tuned choice: 500 bps is 10% of core's 5000 bps
+      target but a third of frontier's 1500 bps, so the same absolute band is a
+      much tighter constraint on the small sleeve than on the large one. An
+      allocation whose sleeves are far apart in size wants relative bands, and
+      this knob cannot express them.
