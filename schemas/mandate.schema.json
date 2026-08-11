@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-allocator.local/schemas/mandate.schema.json",
+  "title": "Mandate",
+  "description": "A sentence of intent, the knobs derived from it, and why each knob has the value it has. Kept in its own file because the policy schema is closed: a mandate cannot be a block inside policy.yaml. The mandate says what was asked for and how it was read; policy.yaml stays the sole authority on what execution is allowed to do.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "text": {
+      "description": "The mandate in the words it was given in. Kept verbatim so the derivation can be re-read against the request rather than against a paraphrase of it.",
+      "type": "string",
+      "minLength": 1
+    },
+    "derived_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "derived_by": {
+      "description": "Who or what turned the text into knobs. A model id when an agent derived it, a human identifier when a person did. Not a signature and not an authorization: it records provenance, and validate-mandate trusts none of it.",
+      "type": "string",
+      "minLength": 1
+    },
+    "policy_path": {
+      "description": "Path to the derived policy, relative to the mandate file.",
+      "type": "string",
+      "minLength": 1
+    },
+    "policy_hash": {
+      "description": "sha256 of the policy file's bytes, as 'sha256:<64 hex>'. Binds the mandate to one exact policy: an edited policy no longer matches the rationale that argued for it, and validate-mandate fails rather than letting the two drift apart silently.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "strategy": {
+      "description": "Construction rule the mandate resolves to. Composites are allowed here, unlike inside a sleeve tier.",
+      "enum": [
+        "score_weighted",
+        "equal_weight",
+        "risk_parity",
+        "inverse_vol",
+        "decorrelated",
+        "core_satellite",
+        "sleeves",
+        "ladder"
+      ]
+    },
+    "strategy_params": {
+      "$ref": "#/$defs/StrategyParams"
+    },
+    "bands": {
+      "$ref": "#/$defs/Bands"
+    },
+    "rationale": {
+      "description": "One entry per knob the derivation moved off its default. This is the readable half of the artifact: without it a mandate is a config file that claims to have been reasoned about.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/RationaleEntry"
+      }
+    }
+  },
+  "required": [
+    "version",
+    "text",
+    "derived_at",
+    "derived_by",
+    "policy_path",
+    "policy_hash",
+    "strategy",
+    "bands",
+    "rationale"
+  ],
+  "$defs": {
+    "StrategyParams": {
+      "title": "StrategyParams",
+      "description": "Parameters for the chosen strategy. Only the sleeve ladder is described structurally, because it is the only one whose shape a mandate is expected to derive; other strategies pass their scalar params through.",
+      "type": "object",
+      "properties": {
+        "tiers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Tier"
+          }
+        }
+      }
+    },
+    "Tier": {
+      "title": "Tier",
+      "description": "One band of the sleeve ladder. Mirrors what core.strategies.library._tier_specs accepts, closed here so a typo in a derived mandate is caught by validation rather than silently ignored by the strategy.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "min_score": {
+          "description": "Inclusive lower bound of the band, and also its safety rank: weight released by a dropped tier may only move to a tier with a strictly higher min_score.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_score": {
+          "description": "Exclusive upper bound. The top band uses a value above 1 to include a perfect score.",
+          "type": "number",
+          "minimum": 0
+        },
+        "weight": {
+          "description": "Target share of the book for this band.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "strategy": {
+          "description": "Construction rule inside the band. Flat strategies only; composites are rejected so dispatch stays finite.",
+          "enum": [
+            "score_weighted",
+            "equal_weight",
+            "risk_parity",
+            "inverse_vol",
+            "decorrelated"
+          ]
+        },
+        "min_positions": {
+          "description": "Names the band must hold before it may carry its target at all. A band that cannot reach it is dropped whole, not held small. Do not set one that has not been checked against the live shelf: when the band that comes up short is the safest one, its weight redistributes downward and the book gets riskier than it would have been with no floor.",
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": ["name", "min_score", "max_score", "weight"]
+    },
+    "Bands": {
+      "title": "Bands",
+      "description": "How far the book may drift from its targets before a rebalance is worth its costs. These are the cost lever: on a stable book the drift check answers 'no' and no agent runs.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "weight_drift_bps": {
+          "description": "Per-instrument tolerance, in basis points of the book.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "sleeve_drift_bps": {
+          "description": "Per-sleeve tolerance, in basis points of the book. Wider than the per-instrument band in a sensible mandate: names inside a band are substitutes for each other, so the band's total is the number the mandate actually asked for.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        }
+      },
+      "required": ["weight_drift_bps", "sleeve_drift_bps"]
+    },
+    "RationaleEntry": {
+      "title": "RationaleEntry",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "knob": {
+          "description": "Dotted path to the setting being justified, e.g. 'caps.min_effective_positions' or 'strategy_params.tiers'.",
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "description": "The value chosen. Any JSON type, since knobs range from numbers to tier lists."
+        },
+        "because": {
+          "description": "Which part of the mandate text this value answers, and why this value rather than the default. A restatement of the value is not a reason.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["knob", "value", "because"]
+    }
+  }
+}
