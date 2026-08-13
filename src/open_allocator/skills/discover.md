@@ -4,7 +4,7 @@ Use this stage to establish wallet readiness and the live 1Tx universe before an
 
 ## Runnable Workflow
 
-1. Load repo rules from [../AGENT_GUIDE.md](../AGENT_GUIDE.md) and the active policy file.
+1. Load repo rules from [../AGENT_GUIDE.md](../../../AGENT_GUIDE.md) and the active policy file.
 2. Run wallet discovery: `open-allocator wallet-status`.
 3. Run full universe discovery: `open-allocator list-vaults`.
 4. Only after the full run, optionally narrow for inspection with CLI filters such as `open-allocator list-vaults --asset USDC --sort score`.

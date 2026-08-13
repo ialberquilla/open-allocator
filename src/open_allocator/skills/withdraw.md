@@ -7,7 +7,7 @@ Use this stage to exit one position to the destination asset through 1Tx. ERC-46
 1. Snapshot positions: `open-allocator positions --address <wallet>`.
 2. Identify the exact `instrument_id`, chain, share balance, share decimals, and current USD value.
 3. Dry-run withdrawal: `open-allocator withdraw --position <instrument_id> --amount <usd> --positions <positions.json> --policy <policy.yaml>` or omit `--amount` for full exit.
-4. Review the planned `yield_token_amount`, expected USDC, chain, transaction steps, gas needs, and liquidity/withdrawal messages. Under `erc4337-paymaster` the exit pays its own gas out of the redeem, so the position's chain needs no prior funding — but a position worth less than its gas cannot be exited this way ([docs/gasless-execution.md](../docs/gasless-execution.md)).
+4. Review the planned `yield_token_amount`, expected USDC, chain, transaction steps, gas needs, and liquidity/withdrawal messages. Under `erc4337-paymaster` the exit pays its own gas out of the redeem, so the position's chain needs no prior funding — but a position worth less than its gas cannot be exited this way ([docs/gasless-execution.md](../../../docs/gasless-execution.md)).
 5. Announce the exact withdrawal and wait for human approval.
 6. Execute only after approval with the same command plus `--confirm`.
 7. Run `positions` again and reconcile the allocation log.

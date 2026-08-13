@@ -8,19 +8,20 @@ from pathlib import Path
 import yaml
 
 from open_allocator import cli
+from open_allocator.resources import PACKAGE_ROOT, WORKFLOWS_DIR
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_POINTERS = ["CLAUDE.md", "CODEX.md", "AGENTS.md", "OPENCODE.md"]
 SKIPPED_DOC_DIRS = {".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
 EXPECTED_SKILLS = {
-    "skills/discover.md",
-    "skills/score.md",
-    "skills/build-allocation.md",
-    "skills/execute-with-1tx.md",
-    "skills/rebalance.md",
-    "skills/withdraw.md",
-    "skills/meta/risk-review.md",
-    "skills/meta/checkpoint-protocol.md",
+    "src/open_allocator/skills/discover.md",
+    "src/open_allocator/skills/score.md",
+    "src/open_allocator/skills/build-allocation.md",
+    "src/open_allocator/skills/execute-with-1tx.md",
+    "src/open_allocator/skills/rebalance.md",
+    "src/open_allocator/skills/withdraw.md",
+    "src/open_allocator/skills/meta/risk-review.md",
+    "src/open_allocator/skills/meta/checkpoint-protocol.md",
 }
 WORKFLOW_STAGE_KEYS = {
     "stage",
@@ -172,7 +173,7 @@ def test_agent_guide_links_every_skill() -> None:
 
 def test_workflows_reference_existing_skills_and_documented_commands() -> None:
     documented_commands = set(documented_cli_commands())
-    workflow_paths = sorted((REPO_ROOT / "workflows").glob("*.yaml"))
+    workflow_paths = sorted(WORKFLOWS_DIR.glob("*.yaml"))
 
     assert {path.name for path in workflow_paths} == {
         "allocate.yaml",
@@ -189,7 +190,7 @@ def test_workflows_reference_existing_skills_and_documented_commands() -> None:
 
         for stage in stages:
             assert WORKFLOW_STAGE_KEYS <= set(stage)
-            skill_path = REPO_ROOT / stage["skill"]
+            skill_path = PACKAGE_ROOT / stage["skill"]
             assert skill_path.exists(), f"{workflow_path.name}:{stage['stage']}"
             assert stage["command"] in documented_commands
             assert isinstance(stage["produces"], list)
@@ -202,7 +203,7 @@ def test_workflows_reference_existing_skills_and_documented_commands() -> None:
 def test_workflow_review_focus_items_are_known_checks() -> None:
     missing_focus: list[str] = []
 
-    for workflow_path in sorted((REPO_ROOT / "workflows").glob("*.yaml")):
+    for workflow_path in sorted(WORKFLOWS_DIR.glob("*.yaml")):
         workflow = yaml.safe_load(workflow_path.read_text())
         for stage in workflow["stages"]:
             for focus in stage["review_focus"]:

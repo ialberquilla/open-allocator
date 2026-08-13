@@ -9,7 +9,9 @@ from typing import TypeVar
 
 from jsonschema import Draft202012Validator
 
-SCHEMA_DIR = Path(__file__).resolve().parents[3] / "schemas"
+from open_allocator.resources import SCHEMAS_DIR
+
+SCHEMA_DIR = SCHEMAS_DIR
 T = TypeVar("T")
 
 

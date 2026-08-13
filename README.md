@@ -137,7 +137,7 @@ uv run open-allocator backtest  --allocation allocation.json       # daily-compo
 uv run open-allocator check-policy --allocation allocation.json    # block-only policy gate
 ```
 
-`build-allocation` supports risk presets, allocation strategies (`--strategy`, parameterized with repeatable `--strategy-param key=value`), advisory screening flags, `--exclude`, pinned weights (`--pin id=weight`), and a full [allocation-spec](schemas/allocation-spec.schema.json) via `--spec`.
+`build-allocation` supports risk presets, allocation strategies (`--strategy`, parameterized with repeatable `--strategy-param key=value`), advisory screening flags, `--exclude`, pinned weights (`--pin id=weight`), and a full [allocation-spec](src/open_allocator/schemas/allocation-spec.schema.json) via `--spec`.
 
 ### Choosing a construction rule
 
@@ -199,9 +199,9 @@ Agents start with [AGENT_GUIDE.md](AGENT_GUIDE.md), the operating contract for t
 
 Stage skills and workflow graphs describe how to drive the CLI and review artifacts:
 
-- Skills: [discover](skills/discover.md), [score](skills/score.md), [build-allocation](skills/build-allocation.md), [agentic-allocation](skills/agentic-allocation.md), [execute-with-1tx](skills/execute-with-1tx.md), [rebalance](skills/rebalance.md), [withdraw](skills/withdraw.md), plus [risk-review](skills/meta/risk-review.md) and [checkpoint-protocol](skills/meta/checkpoint-protocol.md).
-- Workflows: [allocate](workflows/allocate.yaml), [rebalance](workflows/rebalance.yaml), [withdraw](workflows/withdraw.yaml).
-- Artifact schemas: [schemas/](schemas/).
+- Skills: [discover](src/open_allocator/skills/discover.md), [score](src/open_allocator/skills/score.md), [build-allocation](src/open_allocator/skills/build-allocation.md), [agentic-allocation](src/open_allocator/skills/agentic-allocation.md), [execute-with-1tx](src/open_allocator/skills/execute-with-1tx.md), [rebalance](src/open_allocator/skills/rebalance.md), [withdraw](src/open_allocator/skills/withdraw.md), plus [risk-review](src/open_allocator/skills/meta/risk-review.md) and [checkpoint-protocol](src/open_allocator/skills/meta/checkpoint-protocol.md).
+- Workflows: [allocate](src/open_allocator/workflows/allocate.yaml), [rebalance](src/open_allocator/workflows/rebalance.yaml), [withdraw](src/open_allocator/workflows/withdraw.yaml).
+- Artifact schemas: [schemas/](src/open_allocator/schemas/).
 
 ## Safety
 
@@ -219,7 +219,7 @@ uv run pytest            # 542 passed, 3 integration tests skipped without live 
 
 Unit tests mock 1Tx over `httpx.MockTransport` and the chain over `eth-tester`; no live network is touched. Live API/RPC tests are opt-in behind `@pytest.mark.integration` and explicit credential gates.
 
-Layout: `src/open_allocator/core` (allocation, scoring, policy, risk metrics, strategies, screening, backtest, positions, checkpoints), `src/open_allocator/exec` (1Tx client, signers, executor, RPC registry), `schemas/` (JSON artifact contracts), `skills/` + `workflows/` (agent instruction layer), `docs/` (reference notes).
+Layout: `src/open_allocator/core` (allocation, scoring, policy, risk metrics, strategies, screening, backtest, positions, checkpoints), `src/open_allocator/exec` (1Tx client, signers, executor, RPC registry), `src/open_allocator/schemas` (JSON artifact contracts), `src/open_allocator/skills` + `src/open_allocator/workflows` (agent instruction layer), `docs/` (reference notes).
 
 The live 1Tx risk-factor field refresh remains credential-gated; see [docs/onetx-analysis-fields.md](docs/onetx-analysis-fields.md).
 
