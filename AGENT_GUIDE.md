@@ -6,7 +6,7 @@ This is the operating contract for agents and humans working in this repository.
 
 - Treat the CLI as the source of truth for repo operations.
 - Keep allocation and risk logic in Python code, not hidden prompt instructions.
-- Prefer JSON artifacts validated by [schemas/](schemas/) over prose handoffs.
+- Prefer JSON artifacts validated by [schemas/](src/open_allocator/schemas/) over prose handoffs.
 - Never hardcode protocol, chain, or instrument universes; discover from 1Tx and narrow by policy.
 - Do not sign, broadcast, rebalance, or withdraw without first announcing the exact action and obtaining the required confirmation.
 - Frame APY as descriptive, not predictive.
@@ -117,17 +117,17 @@ Announce before execute. A valid execution announcement includes the wallet, sou
 Use these stage skills and workflow graphs for agent-operated runs. They describe how to call the CLI and review artifacts; deterministic allocation, scoring, policy, and execution logic remains in Python code.
 
 - [docs/capabilities.md](docs/capabilities.md) — the knob surface: every strategy and its params, ceilings vs. the floor, what `simulate` reports, and the known limits of each metric. Read this before deriving capabilities from source.
-- [skills/discover.md](skills/discover.md)
-- [skills/score.md](skills/score.md)
-- [skills/build-allocation.md](skills/build-allocation.md)
-- [skills/agentic-allocation.md](skills/agentic-allocation.md)
-- [skills/execute-with-1tx.md](skills/execute-with-1tx.md)
-- [skills/rebalance.md](skills/rebalance.md)
-- [skills/withdraw.md](skills/withdraw.md)
-- [skills/meta/risk-review.md](skills/meta/risk-review.md)
-- [skills/meta/checkpoint-protocol.md](skills/meta/checkpoint-protocol.md)
-- [workflows/allocate.yaml](workflows/allocate.yaml)
-- [workflows/rebalance.yaml](workflows/rebalance.yaml)
-- [workflows/withdraw.yaml](workflows/withdraw.yaml)
+- [src/open_allocator/skills/discover.md](src/open_allocator/skills/discover.md)
+- [src/open_allocator/skills/score.md](src/open_allocator/skills/score.md)
+- [src/open_allocator/skills/build-allocation.md](src/open_allocator/skills/build-allocation.md)
+- [src/open_allocator/skills/agentic-allocation.md](src/open_allocator/skills/agentic-allocation.md)
+- [src/open_allocator/skills/execute-with-1tx.md](src/open_allocator/skills/execute-with-1tx.md)
+- [src/open_allocator/skills/rebalance.md](src/open_allocator/skills/rebalance.md)
+- [src/open_allocator/skills/withdraw.md](src/open_allocator/skills/withdraw.md)
+- [src/open_allocator/skills/meta/risk-review.md](src/open_allocator/skills/meta/risk-review.md)
+- [src/open_allocator/skills/meta/checkpoint-protocol.md](src/open_allocator/skills/meta/checkpoint-protocol.md)
+- [src/open_allocator/workflows/allocate.yaml](src/open_allocator/workflows/allocate.yaml)
+- [src/open_allocator/workflows/rebalance.yaml](src/open_allocator/workflows/rebalance.yaml)
+- [src/open_allocator/workflows/withdraw.yaml](src/open_allocator/workflows/withdraw.yaml)
 
 Risk review is advisory-only. It can flag critical/suggestion/nitpick findings, but only policy failures and missing/denied human confirmation block execution.

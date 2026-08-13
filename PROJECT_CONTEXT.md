@@ -27,7 +27,7 @@ The investable universe is whatever 1Tx returns from live discovery. Do not hard
 
 Policy is block-only governance. It can reject or tighten a proposed allocation, but it cannot loosen risk limits or bypass confirmation.
 
-The intended policy surface includes allowed protocols, chains, assets, and curators plus caps for instrument, protocol, curator, chain, TVL, LLTV, reward dependence, and deploy size. JSON schemas live in [schemas/](schemas/).
+The intended policy surface includes allowed protocols, chains, assets, and curators plus caps for instrument, protocol, curator, chain, TVL, LLTV, reward dependence, and deploy size. JSON schemas live in [schemas/](src/open_allocator/schemas/).
 
 ## Self-Custody Execution Model
 
