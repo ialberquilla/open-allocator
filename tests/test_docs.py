@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_POINTERS = ["CLAUDE.md", "CODEX.md", "AGENTS.md", "OPENCODE.md"]
 SKIPPED_DOC_DIRS = {".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
 EXPECTED_SKILLS = {
+    "src/open_allocator/skills/mandate.md",
     "src/open_allocator/skills/discover.md",
     "src/open_allocator/skills/score.md",
     "src/open_allocator/skills/build-allocation.md",
