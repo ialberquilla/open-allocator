@@ -199,7 +199,7 @@ def validate_mandate(
     mandate = _checked_mandate(mandate_file, checks)
     # Relative to the mandate, not to the process's working directory: the
     # pair travels together and must validate the same way from anywhere.
-    derived_file = _resolve_policy_path(mandate_file, mandate.policy_path)
+    derived_file = resolve_policy_path(mandate_file, mandate.policy_path)
 
     derived = _checked_policy(derived_file, checks)
     if derived is None:
@@ -479,7 +479,7 @@ def _absent_is_permissive(value: float | None, when_absent: float) -> float:
     return when_absent if value is None else float(value)
 
 
-def _resolve_policy_path(mandate_file: Path, policy_path: str) -> Path:
+def resolve_policy_path(mandate_file: Path, policy_path: str) -> Path:
     candidate = Path(policy_path)
     if candidate.is_absolute():
         return candidate

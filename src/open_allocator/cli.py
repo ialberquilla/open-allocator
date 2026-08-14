@@ -13,6 +13,7 @@ import typer
 from open_allocator.core import allocator as allocation_core
 from open_allocator.core import backtest as backtest_core
 from open_allocator.core import costs as costs_core
+from open_allocator.core import drift as drift_core
 from open_allocator.core import eligibility, metrics, universe
 from open_allocator.core import mandate as mandate_core
 from open_allocator.core import policy as policy_core
@@ -212,6 +213,11 @@ def _read_allocation(path: Path) -> Allocation:
 
     validate(payload, "allocation")
     return Allocation.model_validate(payload)
+
+
+def _read_json(path: Path) -> object:
+    with path.open(encoding="utf-8") as file:
+        return json.load(file)
 
 
 def _load_allocation_spec(path: Path) -> JsonObject:
@@ -1382,6 +1388,59 @@ def validate_mandate(
     return mandate_core.validate_mandate(mandate_path, baseline_path).model_dump(
         mode="json"
     )
+
+
+@app.command("drift")
+@json_command
+def drift(
+    mandate_path: Annotated[
+        Path,
+        typer.Option("--mandate", exists=True, dir_okay=False, readable=True),
+    ],
+    positions_path: Annotated[
+        Path | None,
+        typer.Option("--positions", exists=True, dir_okay=False, readable=True),
+    ] = None,
+    allocation_path: Annotated[
+        Path | None,
+        typer.Option("--allocation", exists=True, dir_okay=False, readable=True),
+    ] = None,
+    previous_shelf_path: Annotated[
+        Path | None,
+        typer.Option("--previous-shelf", exists=True, dir_okay=False, readable=True),
+    ] = None,
+) -> JsonObject:
+    """The daily gate. Run it first; if `drifted` is false, stop.
+
+    Reports rather than decides, and never answers `false` because it could not
+    tell -- a check it cannot run appears in `reasons` as `unevaluated`.
+
+    `--allocation` is the target the book was built to, and is the only source
+    of a per-instrument `target_bps`: a mandate carries tier weights, not
+    per-instrument ones. `--previous-shelf` takes yesterday's `list-vaults`
+    output or the `shelf` block this command returns.
+    """
+    mandate = mandate_core.load_mandate(mandate_path)
+    policy = load_policy(
+        mandate_core.resolve_policy_path(mandate_path, mandate.policy_path),
+    )
+    positions_snapshot = (
+        _read_positions(positions_path)
+        if positions_path is not None
+        else positions_core.Positions.model_validate(_positions_payload(None))
+    )
+    return drift_core.evaluate(
+        mandate,
+        positions_snapshot,
+        policy,
+        target=(
+            _read_allocation(allocation_path) if allocation_path is not None else None
+        ),
+        known_instruments=_discover_vaults(enrich=True),
+        previous_shelf=(
+            _read_json(previous_shelf_path) if previous_shelf_path is not None else None
+        ),
+    ).model_dump(mode="json")
 
 
 @app.command("build-tx")
