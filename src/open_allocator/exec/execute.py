@@ -10,6 +10,7 @@ from web3 import HTTPProvider, Web3
 
 from open_allocator.core import checkpoint as checkpoint_core
 from open_allocator.core import policy as policy_core
+from open_allocator.core.state import backend_from_config
 from open_allocator.core.types import (
     Allocation,
     FrozenModel,
@@ -859,8 +860,8 @@ def _write_checkpoint(
     *,
     completed_keys: Iterable[str] = (),
 ) -> None:
-    checkpoint_dir = _path_config_value(config, "checkpoint_dir")
-    if checkpoint_dir is None:
+    backend = backend_from_config(config, needs="checkpoint_dir")
+    if backend is None:
         return
     status = getattr(report, "status", None)
     checkpoint_status: checkpoint_core.CheckpointStatus
@@ -874,9 +875,9 @@ def _write_checkpoint(
         stage,
         checkpoint_status,
         report,
-        checkpoint_dir=checkpoint_dir,
         artifact_type=f"{stage}-report",
         completed_keys=completed_keys,
+        backend=backend,
     )
 
 
@@ -887,8 +888,8 @@ def _append_allocation_log(
 ) -> None:
     if ref.step.kind == "approve":
         return
-    log_path = _path_config_value(config, "allocation_log_path")
-    if log_path is None:
+    backend = backend_from_config(config, needs="allocation_log_path")
+    if backend is None:
         return
     checkpoint_core.write_allocation_log_entry(
         instrument_id=ref.instrument_id,
@@ -898,7 +899,7 @@ def _append_allocation_log(
         usd=ref.usd,
         shares=ref.shares,
         share_price=ref.share_price,
-        log_path=log_path,
+        backend=backend,
     )
 
 
