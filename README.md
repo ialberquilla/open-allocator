@@ -6,10 +6,10 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-542%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-723%20passing-brightgreen.svg)](#development)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
 
-[Install](#install) · [Talking to Your Agent](#talking-to-your-agent) · [Commands](#commands) · [Safety](#safety) · [Disclaimer](#disclaimer)
+[The Mandate](#the-mandate) · [Install](#install) · [Talking to Your Agent](#talking-to-your-agent) · [Commands](#commands) · [Safety](#safety) · [Disclaimer](#disclaimer)
 
 ![OpenAllocator demo — a plain-language allocation request returns a policy-clean, confirmation-gated $10k book](docs/media/demo.gif)
 
@@ -19,7 +19,9 @@
 
 OpenAllocator is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://app.1tx.fi/) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.
 
-**This is portfolio construction, not yield-chasing.** Most "auto-yield" tools sweep funds into whatever APY is highest this hour. OpenAllocator does what a professional asset allocator does — it builds an allocation across explicit risk/reward metrics (Sharpe, volatility, drawdown), quality tiers, and real portfolio structures (`decorrelated`, `core_satellite`, `risk_parity`/`inverse_vol`, `sleeves`, `ladder`), bounded by an explicit policy — and runs it through an agent instead of a desk. High APY is a risk input, never the objective.
+**One sentence in, a governed allocation out, with a reason attached to every knob.** You write what you want — *"different buckets, good yield, but enough diversification"* — and the agent derives a **mandate**: score-tiered sleeves with a declared share each, and a policy narrowed from your baseline to match. Every number it moved carries the measurement that justified it. Deterministic code then checks that the derived policy only ever *narrows* what you already allowed, before a single transaction is built.
+
+**That is portfolio construction, not yield-chasing.** Most "auto-yield" tools sweep funds into whatever APY is highest this hour. OpenAllocator does what a professional asset allocator does — a declared risk budget, a measured floor under diversification, and an explicit policy that execution cannot widen — run through an agent instead of a desk. High APY is a risk input, never the objective.
 
 **It does not pick your trade-off for you.** Independence and yield pull against each other, so the allocator exposes both controls and *measures* what your choice cost — per run, on the shelf as it stands that day. Want the top rates? That is a knob. Want the most independent book the shelf allows? Also a knob. See [docs/capabilities.md](docs/capabilities.md) for the full surface.
 
@@ -31,13 +33,55 @@ This is an end-user allocator, not Morpho's curator-side Allocator role.
 
 ## Why It Exists
 
-- **Professional allocation, not APY-chasing** — risk/reward metrics, quality tiers, and portfolio strategies (`decorrelated`, `core_satellite`, `risk_parity`, `sleeves`, `ladder`) — the way an allocator builds a book, not a sweep to the top rate.
+- **A mandate you can read in thirty seconds** — a sentence of intent becomes score-tiered sleeves and a narrowed policy, with a `because` on every knob that moved. It is the artifact that makes the rest of this legible; see [The Mandate](#the-mandate).
+- **Professional allocation, not APY-chasing** — risk/reward metrics and quality tiers, the way an allocator builds a book rather than a sweep to the top rate.
 - **Diversification measured, not labelled** — a ceiling on a protocol or chain label can be satisfied by holding many names that are really one bet. So the policy also carries a *floor* on the effective number of independent positions, computed from the instruments' own history, and it fails closed when independence can't be measured.
 - **Dynamic discovery** — no hardcoded protocol or chain universe; new networks and instruments are picked up automatically from 1Tx.
 - **Transparent scoring** — every allocation and risk score maps to visible inputs. Unknown fields stay `Unknown` instead of being guessed.
 - **Policy-bounded execution** — allowlists and caps block unsafe proposals before signing. Policy can only tighten, never loosen.
 - **CLI-first** — agents and humans use the same JSON-out commands. Every command prints one JSON object to stdout.
 - **Self-custody, and gasless** — the wallet signs and broadcasts its own transactions. With a Safe smart account it pays gas in **USDC** instead of native tokens, so you fund one chain and never top up ETH anywhere.
+
+## The Mandate
+
+A mandate is what you asked for, plus the knobs derived from it, plus the reason for each. It is the readable half of the allocator: [policy.yaml](policy.yaml) says what execution *may* do; the mandate says what was *asked for* and how that request was read.
+
+```yaml
+text: |
+  I need a professional asset allocation with different buckets, good yield,
+  but enough diversification.
+
+strategy: sleeves
+strategy_params:
+  tiers:
+    - {name: core,     min_score: 0.85, max_score: 1.01, weight: 0.50, min_positions: 5}
+    - {name: yield,    min_score: 0.58, max_score: 0.85, weight: 0.35, min_positions: 6}
+    - {name: frontier, min_score: 0.00, max_score: 0.58, weight: 0.15, min_positions: 12}
+
+rationale:
+  - knob: strategy_params.tiers[].min_score
+    because: >
+      Cut where the scores actually sit, not at the library defaults. The
+      default ladder puts its bottom band under 0.30 and on this shelf that
+      band is EMPTY, so a three-bucket mandate would have rendered as two...
+```
+
+**The rationale is the product, not documentation.** Each entry names the measurement that moved the knob — band populations, gap widths, the value that was tried and rejected — so a reader can audit the derivation instead of taking the numbers on trust. The worked example in [mandate.yaml](mandate.yaml) contradicts three values that looked reasonable until they were run against the live shelf, and says so.
+
+Three things make it safe to let a model write this:
+
+1. **A derived policy may only narrow.** `validate-mandate` rejects one that loosens *anything* against your baseline — ceilings down, floors up, allowlists to subsets, flags to their restricting value — and treats a dropped knob as a loosening, because `null` is permissive rather than neutral.
+2. **The mandate is bound to its policy by hash.** Edit the derived policy and validation fails, so the rationale that argued for a number cannot drift away from the number.
+3. **The agent writes files and never signs.** Derivation is a proposal; deterministic Python validates and executes.
+
+```bash
+uv run open-allocator validate-mandate --mandate mandate.yaml --baseline policy.yaml
+uv run open-allocator drift --mandate mandate.yaml --positions positions.json
+```
+
+`drift` is the daily counterpart: it asks whether the book still matches the mandate, and if it does, nothing expensive runs. It never answers "no drift" because it could not tell — a check it cannot run says so and drift is true.
+
+How an agent derives one is in [skills/mandate.md](src/open_allocator/skills/mandate.md).
 
 ## How It Works
 
@@ -93,6 +137,12 @@ Governance lives in [policy.yaml](policy.yaml) — the allocator's constitution.
 
 OpenAllocator is a harness: you don't type CLI commands, your **agent** does. Point a coding agent (Claude Code, Cursor, or any agent that can run a shell) at this repo — it reads [AGENT_GUIDE.md](AGENT_GUIDE.md) and the [skills](#agent-operation) — and then you drive everything in plain language. The agent translates your intent into the JSON-out commands below, and every spend stays confirmation-gated.
 
+**Set a mandate** (read-only)
+
+> "I need a professional asset allocation with different buckets, good yield, but enough diversification. Derive me a mandate and show me why you picked each number."
+>
+> "Has my book drifted from that mandate since yesterday?"
+
 **Discover & analyze** (read-only)
 
 > "Show me the highest-scoring stablecoin venues 1Tx can see right now, and explain why the top three rank where they do."
@@ -137,17 +187,32 @@ uv run open-allocator backtest  --allocation allocation.json       # daily-compo
 uv run open-allocator check-policy --allocation allocation.json    # block-only policy gate
 ```
 
+**Mandate** (read-only, and no model anywhere near either one)
+
+```bash
+uv run open-allocator validate-mandate --mandate mandate.yaml --baseline policy.yaml
+uv run open-allocator drift --mandate mandate.yaml --positions positions.json \
+    --allocation target.json --previous-shelf yesterday.json
+```
+
+`validate-mandate` reads files only — no discovery, no network — and runs four checks. It **reports through its `ok` field while still exiting 0**, same convention as `check-policy`, so read the field and not the exit code. `drift` reads the live shelf to score held instruments into sleeves and to spot listings that appeared or vanished; run it first each day, and if `drifted` is false, stop before anything expensive.
+
 `build-allocation` supports risk presets, allocation strategies (`--strategy`, parameterized with repeatable `--strategy-param key=value`), advisory screening flags, `--exclude`, pinned weights (`--pin id=weight`), and a full [allocation-spec](src/open_allocator/schemas/allocation-spec.schema.json) via `--spec`.
 
 ### Choosing a construction rule
 
-Each strategy answers a different question. None of them is the right default for everyone:
+Two rules carry the story above, and they answer the two questions a mandate is usually made of:
 
 | Ask | Strategy | Mechanism |
 | --- | --- | --- |
-| Highest scored yield | `score_weighted` (default) | Composite score, tilted by `--apy-weight` / `--score-power` |
-| Most independent book | `decorrelated` | Weight divided by measured correlation load; `top_n` adds greedy selection |
-| A risk budget you declare | `sleeves` / `ladder` | Score-tiered buckets, each with a target weight and its own sub-strategy |
+| **A risk budget you declare** | **`sleeves` / `ladder`** | Score-tiered buckets, each with a target weight, a per-tier floor on names, and its own sub-strategy. **This is what a mandate derives into.** |
+| **The most independent book** | **`decorrelated`** | Weight divided by measured correlation load; `top_n` adds greedy selection |
+
+Also supported, for asks that are not a risk budget:
+
+| Ask | Strategy | Mechanism |
+| --- | --- | --- |
+| Highest scored yield | `score_weighted` (the CLI default) | Composite score, tilted by `--apy-weight` / `--score-power` |
 | No opinion | `equal_weight` | The honest baseline |
 | Volatility-balanced | `risk_parity` / `inverse_vol` | Inverse APY volatility |
 | A core plus bets | `core_satellite` | Core and satellite, each with its own selector |
@@ -199,7 +264,7 @@ Agents start with [AGENT_GUIDE.md](AGENT_GUIDE.md), the operating contract for t
 
 Stage skills and workflow graphs describe how to drive the CLI and review artifacts:
 
-- Skills: [discover](src/open_allocator/skills/discover.md), [score](src/open_allocator/skills/score.md), [build-allocation](src/open_allocator/skills/build-allocation.md), [agentic-allocation](src/open_allocator/skills/agentic-allocation.md), [execute-with-1tx](src/open_allocator/skills/execute-with-1tx.md), [rebalance](src/open_allocator/skills/rebalance.md), [withdraw](src/open_allocator/skills/withdraw.md), plus [risk-review](src/open_allocator/skills/meta/risk-review.md) and [checkpoint-protocol](src/open_allocator/skills/meta/checkpoint-protocol.md).
+- Skills: [mandate](src/open_allocator/skills/mandate.md), [discover](src/open_allocator/skills/discover.md), [score](src/open_allocator/skills/score.md), [build-allocation](src/open_allocator/skills/build-allocation.md), [agentic-allocation](src/open_allocator/skills/agentic-allocation.md), [execute-with-1tx](src/open_allocator/skills/execute-with-1tx.md), [rebalance](src/open_allocator/skills/rebalance.md), [withdraw](src/open_allocator/skills/withdraw.md), plus [risk-review](src/open_allocator/skills/meta/risk-review.md) and [checkpoint-protocol](src/open_allocator/skills/meta/checkpoint-protocol.md).
 - Workflows: [allocate](src/open_allocator/workflows/allocate.yaml), [rebalance](src/open_allocator/workflows/rebalance.yaml), [withdraw](src/open_allocator/workflows/withdraw.yaml).
 - Artifact schemas: [schemas/](src/open_allocator/schemas/).
 
@@ -214,7 +279,7 @@ Stage skills and workflow graphs describe how to drive the CLI and review artifa
 
 ```bash
 uv run ruff check
-uv run pytest            # 542 passed, 3 integration tests skipped without live creds
+uv run pytest            # 723 passed, 3 integration tests skipped without live creds
 ```
 
 Unit tests mock 1Tx over `httpx.MockTransport` and the chain over `eth-tester`; no live network is touched. Live API/RPC tests are opt-in behind `@pytest.mark.integration` and explicit credential gates.
