@@ -11,6 +11,12 @@ from typing import Any, Literal, TypeAlias
 from pydantic import Field, model_validator
 
 from open_allocator.core.schema import validate
+from open_allocator.core.state import (
+    DEFAULT_ALLOCATION_LOG_PATH,
+    DEFAULT_CHECKPOINT_DIR,
+    LocalFsBackend,
+    StateBackend,
+)
 from open_allocator.core.types import FrozenModel
 
 JsonValue: TypeAlias = Any
@@ -21,8 +27,6 @@ CheckpointStatus: TypeAlias = Literal[
     "in_progress",
 ]
 
-DEFAULT_CHECKPOINT_DIR = Path(".open_allocator/checkpoints")
-DEFAULT_ALLOCATION_LOG_PATH = Path(".open_allocator/allocation-log.jsonl")
 _VALIDATED_STATUSES = {"completed", "awaiting_human"}
 # Significant digits kept in a derived share price. Wide enough for an
 # 18-decimal token priced in dollars; narrow enough that the tail of a
@@ -148,7 +152,15 @@ def write_checkpoint(
     schema_name: str | None = None,
     metadata: Mapping[str, object] | None = None,
     completed_keys: Iterable[str] | None = None,
+    backend: StateBackend | None = None,
 ) -> Checkpoint:
+    """Validate an artifact, name it, and hand the finished checkpoint to a backend.
+
+    Everything above the `backend.write_checkpoint` call is the part that must
+    not vary by where state lives -- see `core.state`. `checkpoint_dir` is the
+    filesystem shorthand for `backend=LocalFsBackend(checkpoint_dir=...)` and is
+    ignored once a backend is supplied.
+    """
     payload = _json_compatible(artifact)
     inferred_schema = schema_name or _infer_schema_name(payload, artifact_type)
     if status in _VALIDATED_STATUSES:
@@ -168,7 +180,7 @@ def write_checkpoint(
         completed_keys=completed,
         metadata=_metadata(metadata),
     )
-    _write_checkpoint_file(Path(checkpoint_dir), checkpoint)
+    _backend(backend, checkpoint_dir=checkpoint_dir).write_checkpoint(checkpoint)
     return checkpoint
 
 
@@ -176,21 +188,24 @@ def read_checkpoint(
     checkpoint_id: str | Path,
     *,
     checkpoint_dir: str | Path = DEFAULT_CHECKPOINT_DIR,
+    backend: StateBackend | None = None,
 ) -> Checkpoint:
-    path = _checkpoint_path(checkpoint_id, Path(checkpoint_dir))
-    with path.open(encoding="utf-8") as file:
-        payload = json.load(file)
-    if not isinstance(payload, Mapping):
-        raise TypeError("checkpoint file must contain a JSON object")
-    return Checkpoint.model_validate(payload)
+    return _backend(backend, checkpoint_dir=checkpoint_dir).read_checkpoint(
+        str(checkpoint_id),
+    )
 
 
 def resume_state(
     checkpoint_id: str | Path | Checkpoint | Mapping[str, object],
     *,
     checkpoint_dir: str | Path = DEFAULT_CHECKPOINT_DIR,
+    backend: StateBackend | None = None,
 ) -> ResumeState:
-    checkpoint = _checkpoint(checkpoint_id, checkpoint_dir=checkpoint_dir)
+    checkpoint = _checkpoint(
+        checkpoint_id,
+        checkpoint_dir=checkpoint_dir,
+        backend=backend,
+    )
     completed = tuple(sorted(completed_keys_from_checkpoint(checkpoint)))
     return ResumeState(checkpoint=checkpoint, completed_keys=completed)
 
@@ -199,8 +214,13 @@ def idempotency_store_from_checkpoint(
     checkpoint_id: str | Path | Checkpoint | Mapping[str, object],
     *,
     checkpoint_dir: str | Path = DEFAULT_CHECKPOINT_DIR,
+    backend: StateBackend | None = None,
 ) -> CheckpointIdempotencyStore:
-    state = resume_state(checkpoint_id, checkpoint_dir=checkpoint_dir)
+    state = resume_state(
+        checkpoint_id,
+        checkpoint_dir=checkpoint_dir,
+        backend=backend,
+    )
     return state.idempotency_store()
 
 
@@ -232,17 +252,14 @@ def append_allocation_log_entry(
     entry: AllocationLogEntry | Mapping[str, object],
     *,
     log_path: str | Path = DEFAULT_ALLOCATION_LOG_PATH,
+    backend: StateBackend | None = None,
 ) -> AllocationLogEntry:
     model = (
         entry
         if isinstance(entry, AllocationLogEntry)
         else AllocationLogEntry.model_validate(entry)
     )
-    path = Path(log_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(model.model_dump(mode="json"), separators=(",", ":")))
-        file.write("\n")
+    _backend(backend, log_path=log_path).append_allocation_log_entry(model)
     return model
 
 
@@ -257,6 +274,7 @@ def write_allocation_log_entry(
     share_price: str | None = None,
     timestamp: str | None = None,
     log_path: str | Path = DEFAULT_ALLOCATION_LOG_PATH,
+    backend: StateBackend | None = None,
 ) -> AllocationLogEntry:
     return append_allocation_log_entry(
         AllocationLogEntry.model_validate(
@@ -272,28 +290,16 @@ def write_allocation_log_entry(
             }
         ),
         log_path=log_path,
+        backend=backend,
     )
 
 
 def read_allocation_log(
     *,
     log_path: str | Path = DEFAULT_ALLOCATION_LOG_PATH,
+    backend: StateBackend | None = None,
 ) -> tuple[AllocationLogEntry, ...]:
-    path = Path(log_path)
-    if not path.exists():
-        return ()
-
-    entries: list[AllocationLogEntry] = []
-    with path.open(encoding="utf-8") as file:
-        for line_number, line in enumerate(file, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            payload = json.loads(stripped)
-            if not isinstance(payload, Mapping):
-                raise TypeError(f"allocation log line {line_number} is not an object")
-            entries.append(AllocationLogEntry.model_validate(payload))
-    return tuple(entries)
+    return _backend(backend, log_path=log_path).read_allocation_log()
 
 
 def allocation_log_totals(
@@ -344,16 +350,42 @@ def reconcile_allocation_log(
     )
 
 
+def _backend(
+    backend: StateBackend | None,
+    *,
+    checkpoint_dir: str | Path | None = None,
+    log_path: str | Path | None = None,
+) -> StateBackend:
+    """The supplied backend, or the filesystem one the path arguments describe.
+
+    Only the paths a call actually needs are passed, so a `LocalFsBackend` built
+    for a log write carries no checkpoint directory and would raise rather than
+    quietly write to the default one if it were asked for a checkpoint.
+    """
+    if backend is not None:
+        return backend
+    return LocalFsBackend(
+        checkpoint_dir=checkpoint_dir,
+        log_path=log_path,
+        idempotency_store_path=None,
+    )
+
+
 def _checkpoint(
     checkpoint_id: str | Path | Checkpoint | Mapping[str, object],
     *,
     checkpoint_dir: str | Path,
+    backend: StateBackend | None = None,
 ) -> Checkpoint:
     if isinstance(checkpoint_id, Checkpoint):
         return checkpoint_id
     if isinstance(checkpoint_id, Mapping):
         return Checkpoint.model_validate(checkpoint_id)
-    return read_checkpoint(checkpoint_id, checkpoint_dir=checkpoint_dir)
+    return read_checkpoint(
+        checkpoint_id,
+        checkpoint_dir=checkpoint_dir,
+        backend=backend,
+    )
 
 
 def _validate_known_artifact(payload: JsonValue, schema_name: str | None) -> None:
@@ -424,25 +456,6 @@ def _checkpoint_id(stage: str, status: str, artifact: JsonValue) -> str:
         char if char.isalnum() or char in {"-", "_"} else "-" for char in stage
     ).strip("-")
     return f"{_timestamp(compact=True)}-{safe_stage or 'checkpoint'}-{status}-{digest}"
-
-
-def _write_checkpoint_file(checkpoint_dir: Path, checkpoint: Checkpoint) -> None:
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    path = checkpoint_dir / f"{checkpoint.id}.json"
-    if path.exists():
-        raise FileExistsError(f"checkpoint already exists: {checkpoint.id}")
-    temp_path = checkpoint_dir / f".{checkpoint.id}.tmp"
-    with temp_path.open("w", encoding="utf-8") as file:
-        json.dump(checkpoint.model_dump(mode="json"), file, sort_keys=True, indent=2)
-        file.write("\n")
-    temp_path.replace(path)
-
-
-def _checkpoint_path(checkpoint_id: str | Path, checkpoint_dir: Path) -> Path:
-    path = Path(checkpoint_id)
-    if path.exists() or path.suffix == ".json" or path.is_absolute():
-        return path
-    return checkpoint_dir / f"{checkpoint_id}.json"
 
 
 def _timestamp(*, compact: bool = False) -> str:

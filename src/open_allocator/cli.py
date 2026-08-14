@@ -25,6 +25,11 @@ from open_allocator.core.metrics import enrich as enrich_vaults
 from open_allocator.core.policy_loader import load_policy
 from open_allocator.core.schema import validate
 from open_allocator.core.scoring import score_vault as score_vault_model
+from open_allocator.core.state import (
+    ScopedIdempotencyStore,
+    backend_from_config,
+    json_safe,
+)
 from open_allocator.core.types import (
     Allocation,
     Policy,
@@ -292,61 +297,25 @@ def _model_payload(value: object) -> JsonObject:
     return payload
 
 
-class _JsonIdempotencyStore:
-    def __init__(self, path: Path, scope: str) -> None:
-        self._path = path
-        self._scope = scope
+def _idempotency_store(config: object, scope: str) -> ScopedIdempotencyStore | None:
+    """The store that decides whether a step is re-sent, bound to its scope.
 
-    def is_completed(self, key: str) -> bool:
-        return key in self._scope_data(self._read())
-
-    def mark_completed(self, key: str, value: object | None = None) -> None:
-        payload = self._read()
-        scope_data = self._scope_data(payload)
-        entry: JsonObject = {"completed": True}
-        if value is not None:
-            entry["value"] = _json_safe(value)
-        scope_data[key] = entry
-        self._write(payload)
-
-    def _read(self) -> JsonObject:
-        if not self._path.exists():
-            return {"version": 1, "scopes": {}}
-
-        with self._path.open(encoding="utf-8") as file:
-            payload = json.load(file)
-        if not isinstance(payload, dict):
-            raise TypeError("idempotency store must contain a JSON object")
-        payload.setdefault("version", 1)
-        payload.setdefault("scopes", {})
-        return payload
-
-    def _write(self, payload: JsonObject) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self._path.with_name(f".{self._path.name}.tmp")
-        with temp_path.open("w", encoding="utf-8") as file:
-            json.dump(payload, file, sort_keys=True, separators=(",", ":"))
-        temp_path.replace(self._path)
-
-    def _scope_data(self, payload: JsonObject) -> JsonObject:
-        scopes = payload.setdefault("scopes", {})
-        if not isinstance(scopes, dict):
-            raise TypeError("idempotency store scopes must be a JSON object")
-        scope = scopes.setdefault(self._scope, {})
-        if not isinstance(scope, dict):
-            raise TypeError("idempotency store scope must be a JSON object")
-        return scope
+    Where it *lives* is `core.state`'s problem, not the CLI's: on a laptop that
+    is a JSON file, and in a container whose filesystem does not survive a retry
+    it is whatever backend the caller injected. This is the seam that stops a
+    retried run from broadcasting trades that already landed.
+    """
+    backend = backend_from_config(config, needs="idempotency_store_path")
+    if backend is None:
+        return None
+    return ScopedIdempotencyStore(backend, scope)
 
 
 def _execution_idempotency_store(
     config: object,
     allocation: Allocation,
-) -> _JsonIdempotencyStore | None:
-    path = getattr(config, "idempotency_store_path", None)
-    if path is None:
-        return None
-    scope = _allocation_scope(allocation)
-    return _JsonIdempotencyStore(Path(path), scope)
+) -> ScopedIdempotencyStore | None:
+    return _idempotency_store(config, _allocation_scope(allocation))
 
 
 def _rebalance_idempotency_store(
@@ -355,12 +324,11 @@ def _rebalance_idempotency_store(
     target: Allocation,
     *,
     min_trade_usd: float,
-) -> _JsonIdempotencyStore | None:
-    path = getattr(config, "idempotency_store_path", None)
-    if path is None:
-        return None
-    scope = _rebalance_scope(positions, target, min_trade_usd=min_trade_usd)
-    return _JsonIdempotencyStore(Path(path), scope)
+) -> ScopedIdempotencyStore | None:
+    return _idempotency_store(
+        config,
+        _rebalance_scope(positions, target, min_trade_usd=min_trade_usd),
+    )
 
 
 def _withdraw_idempotency_store(
@@ -368,12 +336,8 @@ def _withdraw_idempotency_store(
     position: positions_core.PositionHolding,
     *,
     amount: float | None,
-) -> _JsonIdempotencyStore | None:
-    path = getattr(config, "idempotency_store_path", None)
-    if path is None:
-        return None
-    scope = _withdraw_scope(position, amount=amount)
-    return _JsonIdempotencyStore(Path(path), scope)
+) -> ScopedIdempotencyStore | None:
+    return _idempotency_store(config, _withdraw_scope(position, amount=amount))
 
 
 def _allocation_scope(allocation: Allocation) -> str:
@@ -408,19 +372,6 @@ def _withdraw_scope(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _json_safe(value: object) -> JsonValue:
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        return model_dump(mode="json")
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, str | int | float | bool) or value is None:
-        return value
-    return str(value)
 
 
 def _build_execution_plan(
@@ -979,7 +930,7 @@ def _risk_metrics(vault: Vault) -> JsonObject:
     # Yield-path risk only; never principal/depeg/contract loss. Unknown stays
     # Unknown when history is insufficient.
     return {
-        name: _json_safe(value)
+        name: json_safe(value)
         for name, value in riskmetrics_core.summary(vault).items()
     }
 
