@@ -117,6 +117,7 @@ Announce before execute. A valid execution announcement includes the wallet, sou
 Use these stage skills and workflow graphs for agent-operated runs. They describe how to call the CLI and review artifacts; deterministic allocation, scoring, policy, and execution logic remains in Python code.
 
 - [docs/capabilities.md](docs/capabilities.md) — the knob surface: every strategy and its params, ceilings vs. the floor, what `simulate` reports, and the known limits of each metric. Read this before deriving capabilities from source.
+- [src/open_allocator/skills/mandate.md](src/open_allocator/skills/mandate.md) — a sentence of intent into a governed policy, with a reason per knob. Read this before deriving any allocation config by hand.
 - [src/open_allocator/skills/discover.md](src/open_allocator/skills/discover.md)
 - [src/open_allocator/skills/score.md](src/open_allocator/skills/score.md)
 - [src/open_allocator/skills/build-allocation.md](src/open_allocator/skills/build-allocation.md)
