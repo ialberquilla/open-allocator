@@ -220,7 +220,31 @@ def _solve_formula(
         if not sub_min:
             break
 
-        smallest = min(sub_min, key=lambda leg: (leg.usd, leg.instrument_id))
+        # Drop the smallest leg, breaking ties on the LOWEST SCORE.
+        #
+        # `instrument_id` is the last resort and must stay last, because under
+        # any equal-weighting rule every leg carries the same `usd` and the
+        # tiebreak stops being a tiebreak — it becomes the selection rule. An
+        # `equal_weight` sleeve trimmed to fit `min_position_usd` was choosing
+        # its holdings by hex string: on a live shelf it kept 2.17%/2.40%/2.63%
+        # APY names and dropped an 8.50% one, silently, because the survivors
+        # were whichever ids happened to sort highest.
+        #
+        # Score is the right ranking to fall back on: it is what every other
+        # selection step in the library already orders by, so a leg dropped for
+        # being too small is now dropped on the same grounds it would have been
+        # excluded for anywhere else.
+        score_by_id = {
+            record.vault.instrument_id: record.score.score for record in active
+        }
+        smallest = min(
+            sub_min,
+            key=lambda leg: (
+                leg.usd,
+                score_by_id.get(leg.instrument_id, 0.0),
+                leg.instrument_id,
+            ),
+        )
         active = tuple(
             record
             for record in active
