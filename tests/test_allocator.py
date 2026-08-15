@@ -387,6 +387,71 @@ def test_min_position_usd_drops_dust_legs() -> None:
     assert allocation.metadata["dropped_below_min_position"] == ["vault-c"]
 
 
+def test_equal_weight_dust_drop_breaks_ties_on_score_not_instrument_id() -> None:
+    """Under equal weighting the id tiebreak IS the selection rule, so it must not decide.
+
+    `equal_weight` gives every leg an identical `usd`, so `min(sub_min, key=usd)`
+    is always a tie and whatever comes next in the key chooses which instrument
+    the book holds. When that was `instrument_id`, an `equal_weight` sleeve
+    trimmed to fit `min_position_usd` selected its holdings alphabetically — on
+    a live shelf it kept 2.17%/2.40%/2.63% APY names over an 8.50% one, and
+    nothing in the output said the choice was arbitrary.
+
+    The ids here are ordered ADVERSARIALLY against score: the best vault sorts
+    first, so the old behaviour drops exactly the one that should be kept.
+    """
+    vaults = [
+        vault(instrument_id="vault-a", protocol="morpho", curator="curator-a"),
+        vault(instrument_id="vault-b", protocol="aave", curator="curator-b"),
+        vault(instrument_id="vault-c", protocol="compound", curator="curator-c"),
+    ]
+    allocation = build_allocation(
+        [
+            scored(vaults[0], 0.95),  # best, and sorts FIRST
+            scored(vaults[1], 0.50),
+            scored(vaults[2], 0.10),  # worst, and sorts LAST
+        ],
+        300,
+        strategy="equal_weight",
+        min_position_usd=150,
+    )
+
+    held = {leg.instrument_id for leg in allocation.legs}
+    assert held == {"vault-a", "vault-b"}, (
+        "the worst-scoring vault must be dropped; holding vault-c means the "
+        "tiebreak selected on instrument_id"
+    )
+    assert allocation.metadata["dropped_below_min_position"] == ["vault-c"]
+    assert all(leg.usd >= 150 for leg in allocation.legs)
+
+
+def test_dust_drop_still_prefers_the_genuinely_smallest_leg() -> None:
+    """Score is a TIEBREAK, not the ordering. A smaller leg goes first regardless.
+
+    Guards the obvious over-correction: dropping by score alone would evict a
+    well-sized weak leg while leaving true dust in place.
+    """
+    vaults = [
+        vault(instrument_id="vault-a", protocol="morpho", curator="curator-a"),
+        vault(instrument_id="vault-b", protocol="aave", curator="curator-b"),
+        vault(instrument_id="vault-c", protocol="compound", curator="curator-c"),
+    ]
+    allocation = build_allocation(
+        [
+            scored(vaults[0], 0.90),
+            scored(vaults[1], 0.88),
+            # Lowest score of the three, but score_weighted still gives it a
+            # substantial leg — the dust is elsewhere.
+            scored(vaults[2], 0.80),
+        ],
+        1_000,
+        min_position_usd=100,
+    )
+
+    assert all(leg.usd >= 100 for leg in allocation.legs)
+    assert sum(leg.usd for leg in allocation.legs) == pytest.approx(1_000)
+
+
 def test_score_power_and_apy_weight_override_preset() -> None:
     vaults = [
         vault(instrument_id="vault-a", apy=0.02, curator="curator-a"),
