@@ -29,7 +29,7 @@ shelf churns daily. Re-derive, every time.
    touching the CLI. "different buckets" is a strategy choice; "enough
    diversification" is a floor on measured independence; "good yield" is usually
    a constraint on *what kind* of yield, not a target number.
-2. **Look at the actual shelf.** `open-allocator list-vaults --enrich`, then
+2. **Look at the actual shelf.** `open-allocator list-vaults --sort score`, then
    `open-allocator score-vault --instrument-id <id>` across the candidates — see
    [discover.md](discover.md) and [score.md](score.md). **The distribution that
    matters is the one the policy admits, not the raw discovery set**: run
@@ -184,7 +184,7 @@ not a restatement of the value.
 
 ## Relevant CLI Commands
 
-- `open-allocator list-vaults --enrich`
+- `open-allocator list-vaults --sort score`
 - `open-allocator score-vault --instrument-id <instrument_id>`
 - `open-allocator build-allocation --amount <usd> --strategy sleeves --strategy-param tiers=<json> --policy policy-derived.yaml`
 - `open-allocator simulate --allocation <allocation.json>`
