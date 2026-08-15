@@ -48,7 +48,7 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import Field
 
-from open_allocator.core import diversify, simulate
+from open_allocator.core import costs, diversify, simulate
 from open_allocator.core import policy as policy_core
 from open_allocator.core.mandate import Mandate
 from open_allocator.core.positions import Positions
@@ -63,6 +63,14 @@ from open_allocator.core.types import (
 
 HASH_PREFIX = "sha256:"
 _BPS = 10_000
+# A switch is one exit and one entry. ``CostParams.txs_per_leg`` already
+# prices an entry as approve + deposit; the exit is a single withdraw, which
+# needs no approval. Deliberately the heavier reading, matching the
+# over-rather-than-under-state convention in :mod:`open_allocator.core.costs`.
+_EXIT_TXS_PER_SWITCH = 1
+# Horizon the switch must repay within. Not a new knob: it is the same year-1
+# window ``costs.CostEstimate.net_apy_pct_year1`` already reports against.
+_PAYBACK_HORIZON_DAYS = 365.0
 
 
 class WeightBandReason(FrozenModel):
@@ -94,6 +102,32 @@ class ShelfChangeReason(FrozenModel):
     delisted: int
 
 
+class OpportunityReason(FrozenModel):
+    """A better-paying instrument is available in the same sleeve.
+
+    The other four reason types ask whether the book moved away from the
+    mandate. This one asks whether the *shelf* moved underneath a book that did
+    not: a satellite sitting in a 5% pool while a 9% pool is listed has not
+    drifted by any of the other measures, and every one of them answers "no".
+
+    Constrained to the holding's own sleeve on purpose. Swapping a core name for
+    a frontier one is not an opportunity, it is a mandate violation wearing an
+    APY number.
+    """
+
+    type: Literal["opportunity"] = "opportunity"
+    sleeve: str
+    held_instrument_id: str
+    candidate_instrument_id: str
+    held_apy_pct: float
+    candidate_apy_pct: float
+    uplift_bps: int
+    band_bps: int
+    position_usd: float
+    round_trip_cost_usd: float
+    payback_days: float
+
+
 class UnevaluatedReason(FrozenModel):
     """A check the mandate asks for that could not be run.
 
@@ -109,6 +143,7 @@ class UnevaluatedReason(FrozenModel):
 
 DriftReason: TypeAlias = (
     WeightBandReason
+    | OpportunityReason
     | SleeveBandReason
     | PolicyViolationReason
     | ShelfChangeReason
@@ -172,6 +207,7 @@ def evaluate(
     target: Allocation | Mapping[str, object] | None = None,
     known_instruments: Iterable[Vault | Mapping[str, object]] = (),
     previous_shelf: object | None = None,
+    cost_params: costs.CostParams | None = None,
 ) -> DriftReport:
     """Compare a book against the mandate that governs it.
 
@@ -193,6 +229,9 @@ def evaluate(
     reasons.extend(_weight_band_reasons(mandate, held, target))
     reasons.extend(_sleeve_band_reasons(mandate, held, vault_by_id))
     reasons.extend(_policy_reasons(current, policy_model, vaults))
+    reasons.extend(
+        _opportunity_reasons(mandate, positions_model, held, vault_by_id, cost_params)
+    )
 
     shelf = ShelfSnapshot.of(vault_by_id) if vaults else None
     reasons.extend(_shelf_reasons(shelf, previous_shelf))
@@ -306,6 +345,161 @@ def _sleeve_band_reasons(
                 )
             )
     return reasons
+
+
+def _gas_confidence_ok(chain_id: int, params: costs.CostParams) -> bool:
+    """Whether this chain's gas number is trustworthy enough to reject a switch.
+
+    Live pricing is always fine. The interesting case is the static fallback,
+    and its error is not symmetric — ``costs`` measured it 8.4x too *high* on
+    Base and notes it would be ~50x too *low* on L1 at an ordinary 15 gwei base
+    fee.
+
+    On an L2 that overstatement is harmless here: the fallback is fractions of a
+    cent against an annual yield difference, so an 8x error cannot flip the
+    verdict. On L1 the understatement can, and in the direction that matters —
+    it makes a switch that never repays look like one that repays in a month.
+    So an unpriced L1 leg is unevaluated, and an unpriced L2 leg proceeds.
+    """
+    if params.gas_priced_live(chain_id):
+        return True
+    return chain_id not in params.l1_chain_ids
+
+
+def _opportunity_reasons(
+    mandate: Mandate,
+    positions: Positions,
+    held: Mapping[str, int],
+    vault_by_id: Mapping[str, Vault],
+    cost_params: costs.CostParams | None,
+) -> list[DriftReason]:
+    """Is a better-paying instrument available in a holding's own sleeve?
+
+    Two gates, and both have to pass. ``min_uplift_bps`` is the mandate's churn
+    tolerance -- a judgement about how much yield is worth a round trip. The
+    payback test is arithmetic: an uplift that does not repay its own execution
+    cost inside the year is not an opportunity, it is a fee.
+
+    The mandate knob alone would not be enough. A flat bps threshold is a claim
+    about *rate* and execution cost is a claim about *dollars*, so the same 50
+    bps is worth taking on a $5,000 position and worth nothing on a $50 one.
+    """
+    tiers = _tiers(mandate)
+    if not tiers or not held:
+        return []
+
+    band = mandate.bands.min_uplift_bps
+    if band is None:
+        return [
+            UnevaluatedReason(
+                check="opportunity",
+                because=(
+                    "the mandate declares no bands.min_uplift_bps, so there is no "
+                    "churn tolerance to measure a better-paying candidate against"
+                ),
+            )
+        ]
+
+    unscorable = sorted(key for key in held if key not in vault_by_id)
+    if unscorable:
+        return [
+            UnevaluatedReason(
+                check="opportunity",
+                because=(
+                    "held instruments are absent from the shelf and cannot be "
+                    f"compared against it: {', '.join(unscorable)}"
+                ),
+            )
+        ]
+
+    params = cost_params or costs.CostParams()
+    usd_by_id = _usd_by_instrument(positions)
+
+    # Bucket the shelf once. Candidates are whatever the caller supplied as
+    # `known_instruments` -- this check does not re-screen, the same way none of
+    # the others do.
+    by_tier: dict[str, list[Vault]] = {}
+    for vault in vault_by_id.values():
+        tier = _tier_for(score_vault(vault).score, tiers)
+        if tier is not None:
+            by_tier.setdefault(str(tier["name"]), []).append(vault)
+
+    reasons: list[DriftReason] = []
+    unpriced: list[str] = []
+    for instrument_id in sorted(held):
+        current = vault_by_id[instrument_id]
+        tier = _tier_for(score_vault(current).score, tiers)
+        if tier is None:
+            continue
+        sleeve = str(tier["name"])
+
+        candidates = [
+            vault
+            for vault in by_tier.get(sleeve, ())
+            if vault.instrument_id not in held and vault.apy > current.apy
+        ]
+        if not candidates:
+            continue
+        # Deterministic: best APY wins, ties broken by instrument id.
+        best = min(candidates, key=lambda v: (-v.apy, v.instrument_id))
+
+        uplift_bps = int(round((best.apy - current.apy) * 100))
+        if uplift_bps < band:
+            continue
+
+        if not _gas_confidence_ok(best.chain_id, params) or not _gas_confidence_ok(
+            current.chain_id, params
+        ):
+            unpriced.append(instrument_id)
+            continue
+
+        position_usd = usd_by_id.get(instrument_id, 0.0)
+        round_trip_usd = params.txs_per_leg * params.gas_usd_per_tx(
+            best.chain_id
+        ) + _EXIT_TXS_PER_SWITCH * params.gas_usd_per_tx(current.chain_id)
+        annual_gain_usd = position_usd * (best.apy - current.apy) / 100
+        if annual_gain_usd <= 0:
+            continue
+        payback_days = round_trip_usd / (annual_gain_usd / 365.0)
+        if payback_days > _PAYBACK_HORIZON_DAYS:
+            continue
+
+        reasons.append(
+            OpportunityReason(
+                sleeve=sleeve,
+                held_instrument_id=instrument_id,
+                candidate_instrument_id=best.instrument_id,
+                held_apy_pct=current.apy,
+                candidate_apy_pct=best.apy,
+                uplift_bps=uplift_bps,
+                band_bps=band,
+                position_usd=round(position_usd, 2),
+                round_trip_cost_usd=round(round_trip_usd, 4),
+                payback_days=round(payback_days, 2),
+            )
+        )
+
+    if unpriced:
+        reasons.append(
+            UnevaluatedReason(
+                check="opportunity",
+                because=(
+                    "an uplift cleared the mandate band but its round-trip cost "
+                    "could not be priced from a live gas read on an L1 leg: "
+                    f"{', '.join(sorted(unpriced))}"
+                ),
+            )
+        )
+    return reasons
+
+
+def _usd_by_instrument(positions: Positions) -> dict[str, float]:
+    usd: dict[str, float] = {}
+    for holding in positions.holdings:
+        usd[holding.instrument_id] = (
+            usd.get(holding.instrument_id, 0.0) + holding.usd_value
+        )
+    return usd
 
 
 def _policy_reasons(

@@ -33,6 +33,7 @@ strategy_params:
 bands:
   weight_drift_bps: 100
   sleeve_drift_bps: 500
+  min_uplift_bps: 50
 
 rationale:
   - knob: strategy
@@ -122,6 +123,23 @@ rationale:
       is roughly a third of a median position -- large enough that ordinary
       yield drift does not trigger a rebalance, small enough that the band can
       be reached by something short of a total loss.
+
+  - knob: bands.min_uplift_bps
+    value: 50
+    because: >
+      A judgement, not a measurement, and the weakest-evidence entry in this
+      file. The other two bands were sized against the book's own leg
+      distribution; there is no equivalent observation for how much extra yield
+      justifies a round trip, because the book has not yet held a position long
+      enough to have churned. 50 bps is roughly an 11% relative improvement on
+      the 4.5% blended APY this mandate produces -- large enough that ordinary
+      APY noise between two same-sleeve names does not trip it, small enough
+      that a genuinely better instrument is not ignored for a year. Re-derive it
+      the first time a real switch is either taken or declined; that is the
+      observation this number is currently missing. Note it is a floor on
+      *rate* only: `drift` separately requires the switch to repay its own
+      execution cost within the year, so this band never has to encode position
+      size or gas, and should not be re-tuned to compensate for them.
 
   - knob: bands.sleeve_drift_bps
     value: 500

@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from open_allocator.core import costs
 from open_allocator.core import drift as drift_core
 from open_allocator.core.mandate import Mandate
 from open_allocator.core.positions import IdleBalance, PositionHolding, Positions
@@ -38,6 +39,10 @@ def mandate(
     *,
     weight_drift_bps: int = 100,
     sleeve_drift_bps: int = 500,
+    # Defaulted rather than left absent: an absent band makes the opportunity
+    # check unevaluated, which makes every other test in this file drift for a
+    # reason it is not about.
+    min_uplift_bps: int | None = 50,
     tiers: list[dict[str, object]] | None = None,
 ) -> Mandate:
     return Mandate.model_validate(
@@ -67,6 +72,9 @@ def mandate(
             "bands": {
                 "weight_drift_bps": weight_drift_bps,
                 "sleeve_drift_bps": sleeve_drift_bps,
+                **(
+                    {} if min_uplift_bps is None else {"min_uplift_bps": min_uplift_bps}
+                ),
             },
             "rationale": [
                 {
@@ -125,11 +133,12 @@ def vault(
     apy: float = 0.04,
     history: bool = False,
     seed: int = 1,
+    chain_id: int = 8453,
 ) -> Vault:
     payload: dict[str, object] = {
         "instrument_id": instrument_id,
         "protocol": "aave",
-        "chain_id": 8453,
+        "chain_id": chain_id,
         "asset": "USDC",
         "apy": apy,
         "tvl_usd": 1_000_000,
@@ -227,9 +236,13 @@ def test_a_held_instrument_missing_from_the_shelf_does_not_shrink_a_sleeve() -> 
         known_instruments=[vault("vault-a")],
     )
 
-    sleeve_reasons = reasons_of(report, "unevaluated")
-    assert [item.check for item in sleeve_reasons] == ["sleeve_band"]
-    assert "delisted" in sleeve_reasons[0].because
+    unevaluated = reasons_of(report, "unevaluated")
+    # Two checks, independently unevaluable for the same root cause. Reported
+    # separately rather than deduplicated: a caller filtering on `check` should
+    # not have to know that sleeve_band failing implies opportunity failing,
+    # and collapsing them would make the report depend on evaluation order.
+    assert sorted(item.check for item in unevaluated) == ["opportunity", "sleeve_band"]
+    assert all("delisted" in item.because for item in unevaluated)
     assert report.drifted is True
 
 
@@ -519,3 +532,264 @@ def _run_drift(
     )
     assert result.exit_code == 0, result.stdout + result.stderr
     return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+# --- opportunity: the shelf moving under a book that did not ---------------
+#
+# The other four reason types all ask whether the book left the mandate. These
+# ask the question none of them can: the book is exactly where it should be, and
+# a better-paying instrument appeared next to it. Every check above answers "no"
+# to that, which is how a satellite sits in a 5% pool while a 9% pool is listed.
+
+
+def test_opportunity_fires_when_a_better_same_sleeve_candidate_appears() -> None:
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=5.0),
+            vault("vault-b", apy=9.0),
+        ],
+    )
+
+    found = reasons_of(report, "opportunity")
+    assert len(found) == 1
+    assert found[0].held_instrument_id == "vault-a"
+    assert found[0].candidate_instrument_id == "vault-b"
+    assert found[0].uplift_bps == 400
+    assert report.drifted is True
+
+
+def test_opportunity_stays_quiet_below_the_mandate_band() -> None:
+    """The band is the mandate's churn tolerance and it is the first gate."""
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=500),
+        book(holding("vault-a", 1_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=5.0),
+            # 400 bps better, but the mandate asked for 500.
+            vault("vault-b", apy=9.0),
+        ],
+    )
+
+    assert reasons_of(report, "opportunity") == []
+
+
+def test_opportunity_stays_quiet_when_the_switch_never_repays() -> None:
+    """The band is a claim about rate; execution cost is a claim about dollars.
+
+    A 60 bps uplift clears a 50 bps band on any book. Whether it is worth taking
+    depends entirely on position size against gas, and the mandate band cannot
+    see that -- so the payback test is arithmetic the mandate does not get a
+    vote on.
+
+    Priced on L1 deliberately. On Base a round trip is fractions of a cent and
+    this gate almost never binds; the case where it decides anything is the one
+    where gas is real, and testing it on the chain where it is free would prove
+    nothing.
+    """
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 200)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=5.00, chain_id=1),
+            vault("vault-b", apy=5.60, chain_id=1),
+        ],
+        cost_params=costs.CostParams(
+            gas=costs.GasPricing(gas_price_wei={1: 15_000_000_000}, eth_usd=3_000.0)
+        ),
+    )
+
+    # $200 at 60 bps earns $1.20/year against a ~$25.65 round trip: ~21 years.
+    assert reasons_of(report, "opportunity") == []
+
+
+def test_opportunity_does_not_cross_sleeves() -> None:
+    """A better-paying frontier name is not an opportunity for a core holding.
+
+    Yield is not the mandate. Crossing the ladder to chase it is the thing the
+    sleeve structure exists to prevent, so a cross-sleeve uplift must not read
+    as a reason to rebalance.
+    """
+    ladder = [
+        {"name": "core", "min_score": 0.50, "max_score": 1.01, "weight": 1.0},
+        {"name": "frontier", "min_score": 0.00, "max_score": 0.50, "weight": 0.0},
+    ]
+    # vault-b pays far more but scores into the other sleeve: no reward
+    # dependence cap headroom and a thin book drop its score below the cut.
+    risky = Vault.model_validate(
+        {
+            "instrument_id": "vault-b",
+            "protocol": "aave",
+            "chain_id": 8453,
+            "asset": "USDC",
+            "apy": 20.0,
+            "tvl_usd": 1_000,
+            "curator": "curator-b",
+            "reward_dependence": 0.95,
+        }
+    )
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50, tiers=ladder),
+        book(holding("vault-a", 1_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[vault("vault-a", apy=5.0), risky],
+    )
+
+    crossed = [
+        reason
+        for reason in reasons_of(report, "opportunity")
+        if reason.candidate_instrument_id == "vault-b"
+        and reason.sleeve
+        != drift_core._tier_for(drift_core.score_vault(risky).score, ladder)["name"]
+    ]
+    assert crossed == []
+
+
+def test_opportunity_ignores_candidates_already_held() -> None:
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000), holding("vault-b", 1_000)),
+        policy(),
+        target=target(("vault-a", 0.5), ("vault-b", 0.5)),
+        known_instruments=[
+            vault("vault-a", apy=5.0),
+            vault("vault-b", apy=9.0),
+        ],
+    )
+
+    assert reasons_of(report, "opportunity") == []
+
+
+def test_opportunity_is_unevaluated_when_the_mandate_declares_no_band() -> None:
+    """Absent is not zero, and it is not "no opportunity" either.
+
+    A mandate with no churn tolerance has not said switching is never worth it;
+    it has said nothing. Inventing a default here would be this module deciding
+    policy, and reporting quiet would be the exact bug this check exists to fix.
+    """
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=None),
+        book(holding("vault-a", 1_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[vault("vault-a", apy=5.0), vault("vault-b", apy=9.0)],
+    )
+
+    unevaluated = reasons_of(report, "unevaluated")
+    assert any(reason.check == "opportunity" for reason in unevaluated)
+    assert report.drifted is True
+
+
+def test_opportunity_is_unevaluated_when_a_holding_is_off_shelf() -> None:
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000), holding("ghost", 1_000)),
+        policy(),
+        target=target(("vault-a", 0.5), ("ghost", 0.5)),
+        known_instruments=[vault("vault-a", apy=5.0), vault("vault-b", apy=9.0)],
+    )
+
+    assert any(
+        reason.check == "opportunity" and "ghost" in reason.because
+        for reason in reasons_of(report, "unevaluated")
+    )
+    assert report.drifted is True
+
+
+def test_opportunity_proceeds_on_l2_with_fallback_gas() -> None:
+    """An 8x overstatement of fractions of a cent cannot flip this verdict.
+
+    Refusing to evaluate here would make the CLI useless as a gate on the chains
+    the shelf actually lives on -- 41 of 58 instruments were Morpho on Base as
+    of 2026-08-14.
+    """
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=5.0, chain_id=8453),
+            vault("vault-b", apy=9.0, chain_id=8453),
+        ],
+        cost_params=costs.CostParams(gas=None),
+    )
+
+    assert len(reasons_of(report, "opportunity")) == 1
+    assert not [
+        reason
+        for reason in reasons_of(report, "unevaluated")
+        if reason.check == "opportunity"
+    ]
+
+
+def test_opportunity_is_unevaluated_on_l1_with_fallback_gas() -> None:
+    """The fallback runs ~50x too low on L1 at an ordinary base fee.
+
+    That error points the wrong way: it makes a switch that never repays look
+    like one that repays in a month, so the check must decline to answer rather
+    than answer cheaply.
+    """
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=5.0, chain_id=1),
+            vault("vault-b", apy=9.0, chain_id=1),
+        ],
+        cost_params=costs.CostParams(gas=None),
+    )
+
+    assert any(
+        reason.check == "opportunity" for reason in reasons_of(report, "unevaluated")
+    )
+    assert report.drifted is True
+
+
+def test_opportunity_evaluates_l1_when_gas_is_priced_live() -> None:
+    """Live pricing removes the objection: the number is measured, not assumed."""
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 100_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=5.0, chain_id=1),
+            vault("vault-b", apy=9.0, chain_id=1),
+        ],
+        cost_params=costs.CostParams(
+            gas=costs.GasPricing(gas_price_wei={1: 15_000_000_000}, eth_usd=3_000.0)
+        ),
+    )
+
+    found = reasons_of(report, "opportunity")
+    assert len(found) == 1
+    # 190k gas * 15 gwei * $3000/ETH = ~$8.55/tx, three txs for a round trip.
+    assert found[0].round_trip_cost_usd == pytest.approx(25.65, rel=1e-3)
+
+
+def test_a_book_with_no_better_candidate_stays_quiet() -> None:
+    """The gate's whole economic argument: most days this answers no."""
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=9.0),
+            vault("vault-b", apy=5.0),
+        ],
+    )
+
+    assert reasons_of(report, "opportunity") == []
+    assert report.drifted is False

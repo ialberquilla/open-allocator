@@ -131,7 +131,12 @@
           "minimum": 0
         }
       },
-      "required": ["name", "min_score", "max_score", "weight"]
+      "required": [
+        "name",
+        "min_score",
+        "max_score",
+        "weight"
+      ]
     },
     "Bands": {
       "title": "Bands",
@@ -150,9 +155,18 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 10000
+        },
+        "min_uplift_bps": {
+          "description": "How much better a same-sleeve instrument must pay before switching to it is worth the round trip, in basis points of APY. The other bands ask whether the book moved away from its targets; this one asks whether the shelf moved underneath a book that did not. Optional: omit it and the opportunity check reports itself unevaluated rather than assuming a tolerance. It is a floor on rate only -- `drift` additionally requires the switch to repay its own execution cost within the year, which is arithmetic and not a matter of mandate policy.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
         }
       },
-      "required": ["weight_drift_bps", "sleeve_drift_bps"]
+      "required": [
+        "weight_drift_bps",
+        "sleeve_drift_bps"
+      ]
     },
     "RationaleEntry": {
       "title": "RationaleEntry",
@@ -173,7 +187,11 @@
           "minLength": 1
         }
       },
-      "required": ["knob", "value", "because"]
+      "required": [
+        "knob",
+        "value",
+        "because"
+      ]
     }
   }
 }
