@@ -6,7 +6,12 @@ from datetime import date, timedelta
 
 import pytest
 
-from open_allocator.core.policy import PolicyResult, check
+from open_allocator.core.policy import (
+    PolicyResult,
+    check,
+    check_incremental,
+    resulting_book,
+)
 from open_allocator.core.types import (
     Allocation,
     AllocationLeg,
@@ -665,3 +670,74 @@ def test_unmeasurable_legs_cannot_buy_diversification() -> None:
 
     found = violation(result, "min_effective_positions")
     assert found.actual < 2.5
+
+
+def test_incremental_buy_is_scored_against_the_book_it_joins() -> None:
+    """A top-up that is 100% of itself is a small part of the book it joins.
+
+    Scored alone the leg breaches every per-bucket cap; scored against the book
+    it produces, it breaches none. This is the whole reason the mode exists.
+    """
+    top_up = allocation((("vault-f", 1.0, 13.0),), total_usd=13.0)
+    held = {
+        name: 17.4 for name in ("vault-a", "vault-b", "vault-c", "vault-d", "vault-e")
+    }
+    strict = policy(policy_caps=caps(max_weight_per_instrument=0.2))
+    known = [
+        vault(instrument_id=name)
+        for name in ("vault-a", "vault-b", "vault-c", "vault-d", "vault-e", "vault-f")
+    ]
+
+    assert check(top_up, strict, known).ok is False
+    assert check_incremental(top_up, strict, known, held).ok is True
+
+
+def test_incremental_buy_still_fails_when_the_resulting_book_breaches_a_cap() -> None:
+    top_up = allocation((("vault-b", 1.0, 60.0),), total_usd=60.0)
+    held = {"vault-a": 40.0}
+    strict = policy(policy_caps=caps(max_weight_per_instrument=0.5))
+    known = [vault(), vault(instrument_id="vault-b")]
+
+    result = check_incremental(top_up, strict, known, held)
+    assert result.ok is False
+    assert violation(result, "max_weight_per_instrument").actual == pytest.approx(0.6)
+
+
+def test_deploy_cycle_cap_is_charged_to_the_buy_not_the_book() -> None:
+    """The gate is a property of a cycle, the caps are properties of a book.
+
+    Charging the book's total against a per-cycle deploy limit would reject
+    every top-up of a book bigger than one cycle's budget.
+    """
+    top_up = allocation((("vault-b", 1.0, 10.0),), total_usd=10.0)
+    held = {"vault-a": 990.0}
+    capped = policy(policy_gates=gates(max_deploy_per_cycle_usd=100))
+    known = [vault(), vault(instrument_id="vault-b")]
+
+    assert check_incremental(top_up, capped, known, held).ok is True
+
+    oversized = allocation((("vault-b", 1.0, 500.0),), total_usd=500.0)
+    result = check_incremental(oversized, capped, known, held)
+    assert violation(result, "max_deploy_per_cycle_usd").actual == pytest.approx(500.0)
+
+
+def test_resulting_book_merges_a_top_up_into_a_held_leg() -> None:
+    book = resulting_book(
+        allocation((("vault-a", 1.0, 25.0),), total_usd=25.0),
+        {"vault-a": 75.0},
+    )
+    assert [leg.instrument_id for leg in book.legs] == ["vault-a"]
+    assert book.total_usd == pytest.approx(100.0)
+    assert book.legs[0].weight == pytest.approx(1.0)
+
+
+def test_resulting_book_carries_the_buys_metadata_not_the_holdings() -> None:
+    """`autonomous` describes the action being gated, not the book it joins."""
+    top_up = allocation(
+        (("vault-b", 1.0, 10.0),), total_usd=10.0, metadata={"autonomous": True}
+    )
+    attended = policy(policy_gates=gates(autonomous_rebalance=False))
+    known = [vault(), vault(instrument_id="vault-b")]
+
+    result = check_incremental(top_up, attended, known, {"vault-a": 90.0})
+    assert violation(result, "autonomous_rebalance") is not None

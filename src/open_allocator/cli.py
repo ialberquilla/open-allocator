@@ -1351,14 +1351,35 @@ def check_policy(
         Path,
         typer.Option("--policy", dir_okay=False, readable=True),
     ] = DEFAULT_POLICY_PATH,
+    against_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--against",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help=(
+                "Positions JSON to add the allocation to. Scores the resulting "
+                "book instead of the buy in isolation."
+            ),
+        ),
+    ] = None,
 ) -> JsonObject:
     allocation = _read_allocation(allocation_path)
     policy = load_policy(policy_path)
     known_instruments = _discover_vaults(enrich=True)
-    return policy_core.check(
+    if against_path is None:
+        return policy_core.check(
+            allocation,
+            policy,
+            known_instruments,
+        ).model_dump(mode="json")
+    held_usd = positions_core.held_usd_by_instrument(_read_positions(against_path))
+    return policy_core.check_incremental(
         allocation,
         policy,
         known_instruments,
+        held_usd,
     ).model_dump(mode="json")
 
 
