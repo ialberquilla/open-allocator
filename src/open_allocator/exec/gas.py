@@ -12,9 +12,18 @@ Two reads, both over the RPC endpoints already configured in
   negligible in practice (measured 2026-07-30 on a real Base ERC-4626 call: L1
   fee 5.5e-10 ETH against an L2 execution cost of 1.87e-6 ETH, i.e. ~0.03% of
   the total), so the L2 execution price is what the estimate needs.
-- **ETH/USD** — a Chainlink aggregator's ``latestRoundData()``. Every chain here
-  pays gas in ETH, so one quote serves all of them, and reading it on-chain means
-  no price API and no new dependency.
+- **ETH/USD** — a Chainlink aggregator's ``latestRoundData()``. Reading it
+  on-chain means no price API and no new dependency.
+
+🔑 **One quote does not serve every chain.** A gas price is denominated in the
+chain's own native token, so an ETH/USD quote prices only the chains that pay in
+ETH; used on a chain that pays in something else it is wrong by the price ratio
+between the two tokens, which can be several orders of magnitude and looks
+entirely ordinary in the output. So this module prices **only** the chains whose
+gas token it holds a quote for (``chains.pays_gas_in_eth``); every other chain is
+left out of the result and falls back to ``core.costs``' static constants with
+``gas_priced_live: false``. Adding a price source for another token later is a
+new entry in the price map, not a change to anything downstream.
 
 Everything degrades to ``None`` rather than raising. A failed gas read must not
 break ``build-allocation`` — the caller falls back to ``core.costs``' static
@@ -105,26 +114,33 @@ def _read_feed(chain_id: int, feed: str) -> float | None:
 
 
 def live_pricing(chain_ids: Iterable[int]) -> GasPricing | None:
-    """Read gas prices for ``chain_ids`` plus one ETH/USD quote.
+    """Read gas prices for the ETH-gas chains in ``chain_ids``, plus one quote.
 
-    Returns ``None`` when no ETH/USD quote is available or no chain priced —
-    a partial result is still useful (``GasPricing`` falls back per chain), but
-    with no price quote at all nothing can be converted to USD.
+    Chains that pay gas in their own token are skipped rather than priced with
+    the ETH quote — see the module docstring. Returns ``None`` when no ETH/USD
+    quote is available or no chain priced: a partial result is still useful
+    (``GasPricing`` falls back per chain), but with no price quote at all
+    nothing can be converted to USD.
     """
     wanted = list(dict.fromkeys(chain_ids))
-    if not wanted:
+    # Reading the feed is only worth doing if some chain here can use it.
+    priceable = [chain_id for chain_id in wanted if chains.pays_gas_in_eth(chain_id)]
+    if not priceable:
         return None
-    price_usd = eth_usd(wanted)
+    price_usd = eth_usd(priceable)
     if price_usd is None:
         return None
     prices: dict[int, int] = {}
-    for chain_id in wanted:
+    for chain_id in priceable:
         wei = gas_price_wei(chain_id)
         if wei is not None:
             prices[chain_id] = wei
     if not prices:
         return None
-    return GasPricing(gas_price_wei=prices, eth_usd=price_usd)
+    return GasPricing(
+        gas_price_wei=prices,
+        native_usd={chain_id: price_usd for chain_id in prices},
+    )
 
 
 __all__ = ["ETH_USD_FEEDS", "eth_usd", "gas_price_wei", "live_pricing"]

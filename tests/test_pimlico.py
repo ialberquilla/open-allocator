@@ -155,14 +155,20 @@ def test_token_quote_asks_the_entry_point_the_safe_can_actually_use() -> None:
     assert params[2] == hex(BASE)
 
 
-def test_the_quoted_cost_includes_the_paymasters_own_postop_gas() -> None:
+def test_the_quote_carries_the_paymasters_own_postop_gas() -> None:
+    """The quote's fields are parsed and kept; nothing here computes a cost.
+
+    There used to be a `token_cost()` helper, and this test pinned its
+    arithmetic — but no caller ever used it, so the test was checking the
+    formula against itself rather than against a charge. It is gone; see
+    TokenQuote's docstring for what to do if a cost function is needed.
+    """
     quote = TokenQuote(
         paymaster=PAYMASTER_V07, token=USDC, post_op_gas=1_000, exchange_rate=10**18
     )
 
-    # At a 1:1 rate the token cost is (gas + postOpGas) * fee — the paymaster
-    # charges for collecting payment too, so ignoring postOpGas under-quotes.
-    assert quote.token_cost(gas_limit=100_000, max_fee_per_gas=2) == 202_000
+    assert quote.post_op_gas == 1_000
+    assert quote.exchange_rate == 10**18
 
 
 def test_a_missing_quote_is_an_error_not_a_silent_zero() -> None:

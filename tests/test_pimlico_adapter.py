@@ -20,11 +20,13 @@ from open_allocator.exec.erc4337_paymaster import (
     UserOperationCall,
     _adapter_from_config,
 )
+from open_allocator.exec.pimlico import PimlicoError
 from open_allocator.exec.pimlico_adapter import (
     PimlicoUserOperationAdapter,
     pimlico_adapter_from_config,
 )
 from open_allocator.exec.safe_deployment import SafeSeed
+from open_allocator.exec.user_operation import MULTISEND_CALL_ONLY
 
 BASE = 8453
 FANTOM = 250  # deliberately not in PAYMASTER_CHAINS
@@ -55,11 +57,22 @@ class FakeEndpoint:
                     }
                 ]
             },
+            # All three tiers, as the real endpoint quotes them: the tier is a
+            # multiplier on what the paymaster charges in USDC, so which one is
+            # picked has to be visible to a test.
             "pimlico_getUserOperationGasPrice": {
+                "slow": {
+                    "maxFeePerGas": "0x1dcd6500",
+                    "maxPriorityFeePerGas": "0xf4240",
+                },
+                "standard": {
+                    "maxFeePerGas": "0x3b9aca00",
+                    "maxPriorityFeePerGas": "0xf4240",
+                },
                 "fast": {
                     "maxFeePerGas": "0x59682f00",
                     "maxPriorityFeePerGas": "0xf4240",
-                }
+                },
             },
             "pm_getPaymasterStubData": {
                 "paymaster": PAYMASTER,
@@ -128,6 +141,7 @@ class FakeEndpoint:
 
 _PROXY_CREATION_CODE = keccak(text="proxyCreationCode()")[:4]
 _GET_NONCE = keccak(text="getNonce(address,uint192)")[:4]
+_ALLOWANCE = keccak(text="allowance(address,address)")[:4]
 
 # Any bytes work: prediction only has to be self-consistent here, and a real
 # factory's creation code is already exercised against live chains in
@@ -143,10 +157,19 @@ class FakeWeb3:
     whatever the fake happened to return.
     """
 
-    def __init__(self, *, nonce: int = 0, deployed: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        nonce: int = 0,
+        deployed: bool = True,
+        allowance: int = 0,
+    ) -> None:
         self.eth = self
         self._nonce = nonce
         self._deployed = deployed
+        # A fresh Safe has approved nothing, so the default here is the state
+        # the first operation actually finds.
+        self._allowance = allowance
         self.infrastructure = {
             Web3.to_checksum_address(safe_deployment.SAFE_PROXY_FACTORY),
             Web3.to_checksum_address(safe_deployment.SAFE_SINGLETON_L2),
@@ -159,6 +182,8 @@ class FakeWeb3:
             return abi_encode(["bytes"], [_FAKE_CREATION_CODE])
         if selector == _GET_NONCE:
             return self._nonce.to_bytes(32, "big")
+        if selector == _ALLOWANCE:
+            return self._allowance.to_bytes(32, "big")
         raise AssertionError(f"unexpected eth_call selector {selector.hex()}")
 
     def get_code(self, address: str) -> bytes:
@@ -177,14 +202,17 @@ def _adapter(
     seed: SafeSeed | None = None,
     account_address: str | None = SAFE,
     inclusion_timeout_s: float = 120.0,
+    allowance: int = 0,
+    fee_tier: str = "standard",
 ) -> PimlicoUserOperationAdapter:
-    w3 = FakeWeb3(nonce=nonce, deployed=deployed)
+    w3 = FakeWeb3(nonce=nonce, deployed=deployed, allowance=allowance)
     return PimlicoUserOperationAdapter(
         api_key=API_KEY,
         owner_keys=[OWNER_KEY],
         seed=seed,
         account_address=account_address,
         rpc_urls={BASE: "https://base.invalid"},
+        fee_tier=fee_tier,
         http_client=endpoint.client(),
         web3_factory=lambda url: w3,
         poll_interval_s=0,
@@ -589,3 +617,159 @@ def test_a_request_needs_at_least_one_call() -> None:
             calls=(),
             gas_token_address=USDC,
         )
+
+
+# --- what the operation costs in USDC ---------------------------------------
+#
+# Two things drive the gas bill on this path: the fee tier the bundler is asked
+# for, and how much work rides in the op. Both were fixed at their most
+# expensive setting — `fast`, and an approval on every single operation.
+
+
+def test_the_fee_tier_defaults_to_standard_not_fast() -> None:
+    """`fast` was hardcoded, which is the wrong default for a job that is not
+    racing anyone — worth ~5% of the gas bill at the measured tier spread."""
+    endpoint = FakeEndpoint()
+    _adapter(endpoint).submit_user_operation(_request())
+    assert int(endpoint.sent_user_op()["maxFeePerGas"], 16) == 0x3B9ACA00
+
+
+def test_the_fee_tier_is_configurable_for_when_ops_sit_unincluded() -> None:
+    endpoint = FakeEndpoint()
+    _adapter(endpoint, fee_tier="fast").submit_user_operation(_request())
+    assert int(endpoint.sent_user_op()["maxFeePerGas"], 16) == 0x59682F00
+
+
+def test_a_tier_the_bundler_did_not_quote_is_an_error_not_another_tier() -> None:
+    """Falling through would charge a price nobody asked for."""
+    endpoint = FakeEndpoint(
+        pimlico_getUserOperationGasPrice={
+            "fast": {"maxFeePerGas": "0x59682f00", "maxPriorityFeePerGas": "0xf4240"}
+        }
+    )
+    with pytest.raises(PimlicoError, match="tier 'standard' was not quoted"):
+        _adapter(endpoint).submit_user_operation(_request())
+
+
+def test_an_unknown_fee_tier_is_refused_at_construction() -> None:
+    with pytest.raises(PaymasterConfigurationError, match="PAYMASTER_FEE_TIER"):
+        PimlicoUserOperationAdapter(
+            api_key=API_KEY,
+            owner_keys=[OWNER_KEY],
+            account_address=SAFE,
+            fee_tier="instant",
+        )
+
+
+def test_from_config_carries_the_fee_tier() -> None:
+    config = FakeConfig()
+    config.paymaster_fee_tier = "slow"
+    assert pimlico_adapter_from_config(config)._fee_tier == "slow"  # noqa: SLF001
+
+
+def test_from_config_without_a_fee_tier_still_gets_the_default() -> None:
+    """A config predating the setting must not construct an adapter with None."""
+    assert pimlico_adapter_from_config(FakeConfig())._fee_tier == "standard"  # noqa: SLF001
+
+
+# --- the approval that rode on every operation ------------------------------
+
+
+def test_the_first_operation_approves_the_paymaster() -> None:
+    endpoint = FakeEndpoint()
+    _adapter(endpoint, allowance=0).submit_user_operation(_request())
+    assert endpoint.sent_user_op()["callData"].count("095ea7b3") == 1
+
+
+def test_a_standing_unlimited_approval_is_not_sent_again() -> None:
+    """Once approved, the approval is dead weight in every later operation."""
+    endpoint = FakeEndpoint()
+    _adapter(endpoint, allowance=2**256 - 1).submit_user_operation(_request())
+    assert "095ea7b3" not in endpoint.sent_user_op()["callData"]
+
+
+def test_an_allowance_drawn_down_by_gas_charges_still_counts() -> None:
+    """USDC decrements on transferFrom, so the standing allowance is never
+    exactly what was approved — hence a floor rather than an equality check."""
+    endpoint = FakeEndpoint()
+    spent_on_gas = 5_000_000  # $5 of USDC, far more than this Safe has paid
+    _adapter(endpoint, allowance=2**256 - 1 - spent_on_gas).submit_user_operation(
+        _request()
+    )
+    assert "095ea7b3" not in endpoint.sent_user_op()["callData"]
+
+
+def test_a_small_scoped_allowance_does_not_count_as_unlimited() -> None:
+    endpoint = FakeEndpoint()
+    _adapter(endpoint, allowance=10**12).submit_user_operation(_request())
+    assert endpoint.sent_user_op()["callData"].count("095ea7b3") == 1
+
+
+def test_dropping_the_approval_takes_a_single_call_out_of_multisend() -> None:
+    """The real saving: one action plus one approval is a batch, and a batch is
+    a MultiSendCallOnly delegatecall. Alone, the action is a direct call."""
+    endpoint = FakeEndpoint()
+    _adapter(endpoint, allowance=2**256 - 1).submit_user_operation(_request())
+
+    call_data = endpoint.sent_user_op()["callData"].lower()
+    assert MULTISEND_CALL_ONLY[2:].lower() not in call_data
+    assert "deadbeef" in call_data
+
+
+def test_an_undeployed_safe_approves_without_reading_an_allowance() -> None:
+    """There is no contract to ask, and asking one that is not there returns 0
+    anyway — but the read is skipped rather than relied on."""
+    endpoint = FakeEndpoint()
+    submission = _adapter(
+        endpoint,
+        deployed=False,
+        seed=SafeSeed(owners=(OWNER,), threshold=1),
+        account_address=None,
+    ).submit_user_operation(_request())
+
+    assert "factory" in endpoint.sent_user_op()
+    assert endpoint.sent_user_op()["callData"].count("095ea7b3") == 1
+    assert submission.status == "included"
+
+
+def test_an_unreadable_allowance_sends_the_approval() -> None:
+    """A redundant approval costs gas; a missing one reverts the operation. The
+    unknown case has to fall on the cheap side of that."""
+
+    class _Unreadable(FakeWeb3):
+        def call(self, transaction: dict[str, Any]) -> bytes:
+            data = bytes.fromhex(transaction["data"][2:])
+            if data[:4] == _ALLOWANCE:
+                raise RuntimeError("rpc down")
+            return super().call(transaction)
+
+    endpoint = FakeEndpoint()
+    w3 = _Unreadable(allowance=2**256 - 1)
+    adapter = PimlicoUserOperationAdapter(
+        api_key=API_KEY,
+        owner_keys=[OWNER_KEY],
+        account_address=SAFE,
+        rpc_urls={BASE: "https://base.invalid"},
+        http_client=endpoint.client(),
+        web3_factory=lambda url: w3,
+        poll_interval_s=0,
+        sleep=lambda _seconds: None,
+    )
+    adapter.submit_user_operation(_request())
+
+    assert endpoint.sent_user_op()["callData"].count("095ea7b3") == 1
+
+
+def test_allowances_observed_on_mainnet_count_as_unlimited() -> None:
+    """Real standing allowances: MAX_UINT256 less a few cents of gas charges.
+
+    Pinned because this is the shape the check has to keep recognising as
+    charges accumulate over the life of an account.
+    """
+    endpoint = FakeEndpoint()
+    for standing in (
+        2**256 - 1 - 31_925,
+        2**256 - 1 - 6_319,
+    ):
+        _adapter(endpoint, allowance=standing).submit_user_operation(_request())
+        assert "095ea7b3" not in endpoint.sent_user_op()["callData"]

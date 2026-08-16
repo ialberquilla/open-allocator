@@ -12,6 +12,11 @@ USDC_ENV_PREFIX = "PAYMASTER_USDC_ADDRESS_"
 class ChainInfo:
     name: str
     rpc_url: str | None
+    # The token gas is denominated in. Most rows here are ETH, which is exactly
+    # why it has to be written down: a gas price read from a chain that pays in
+    # something else is a number in *that* token, and converting it with an
+    # ETH/USD quote is wrong by the price ratio between the two. See exec.gas.
+    native_symbol: str = "ETH"
     # Whether the Safe Singleton Factory reaches this chain, so a Safe derived
     # from one seed lands on the same address here as everywhere else. False for
     # non-standard-CREATE chains (zkSync-Era-type), where the guarantee breaks.
@@ -23,13 +28,13 @@ class ChainInfo:
 DEFAULT_CHAINS: Mapping[int, ChainInfo] = {
     1: ChainInfo("Ethereum", "https://ethereum-rpc.publicnode.com"),
     10: ChainInfo("OP Mainnet", "https://optimism-rpc.publicnode.com"),
-    56: ChainInfo("BNB Smart Chain", "https://bsc-rpc.publicnode.com"),
-    100: ChainInfo("Gnosis", "https://gnosis-rpc.publicnode.com"),
+    56: ChainInfo("BNB Smart Chain", "https://bsc-rpc.publicnode.com", "BNB"),
+    100: ChainInfo("Gnosis", "https://gnosis-rpc.publicnode.com", "xDAI"),
     130: ChainInfo("Unichain", "https://unichain-rpc.publicnode.com"),
-    137: ChainInfo("Polygon", "https://polygon-bor-rpc.publicnode.com"),
-    143: ChainInfo("Monad", "https://rpc.monad.xyz"),
-    146: ChainInfo("Sonic", "https://sonic-rpc.publicnode.com"),
-    250: ChainInfo("Fantom", "https://fantom-rpc.publicnode.com"),
+    137: ChainInfo("Polygon", "https://polygon-bor-rpc.publicnode.com", "POL"),
+    143: ChainInfo("Monad", "https://rpc.monad.xyz", "MON"),
+    146: ChainInfo("Sonic", "https://sonic-rpc.publicnode.com", "S"),
+    250: ChainInfo("Fantom", "https://fantom-rpc.publicnode.com", "FTM"),
     # zkSync Era derives contract addresses differently, so a Safe from the same
     # seed lands elsewhere here. Scorable and depositable, just not same-address.
     324: ChainInfo(
@@ -40,15 +45,19 @@ DEFAULT_CHAINS: Mapping[int, ChainInfo] = {
     480: ChainInfo("World Chain", "https://worldchain.drpc.org"),
     1101: ChainInfo("Polygon zkEVM", "https://polygon-zkevm-rpc.publicnode.com"),
     1868: ChainInfo("Soneium", "https://soneium.drpc.org"),
-    5000: ChainInfo("Mantle", "https://mantle-rpc.publicnode.com"),
+    5000: ChainInfo("Mantle", "https://mantle-rpc.publicnode.com", "MNT"),
     8453: ChainInfo("Base", "https://mainnet.base.org"),
     34443: ChainInfo("Mode", "https://mode-rpc.publicnode.com"),
     42161: ChainInfo("Arbitrum One", "https://arbitrum-one-rpc.publicnode.com"),
-    42220: ChainInfo("Celo", "https://celo-rpc.publicnode.com"),
-    43114: ChainInfo("Avalanche C-Chain", "https://avalanche-c-chain-rpc.publicnode.com"),
+    42220: ChainInfo("Celo", "https://celo-rpc.publicnode.com", "CELO"),
+    43114: ChainInfo(
+        "Avalanche C-Chain",
+        "https://avalanche-c-chain-rpc.publicnode.com",
+        "AVAX",
+    ),
     57073: ChainInfo("Ink", "https://ink.drpc.org"),
     59144: ChainInfo("Linea", "https://linea-rpc.publicnode.com"),
-    80094: ChainInfo("Berachain", "https://berachain-rpc.publicnode.com"),
+    80094: ChainInfo("Berachain", "https://berachain-rpc.publicnode.com", "BERA"),
     81457: ChainInfo("Blast", "https://blast-rpc.publicnode.com"),
     534352: ChainInfo("Scroll", "https://scroll-rpc.publicnode.com"),
 }
@@ -119,6 +128,29 @@ def chain_name(chain_id: int) -> str:
     if info is not None:
         return info.name
     return f"chain {chain_id}"
+
+
+def native_symbol(chain_id: int) -> str | None:
+    """The gas token's symbol, or None for a chain not in the registry."""
+    info = DEFAULT_CHAINS.get(chain_id)
+    if info is None:
+        return None
+    return info.native_symbol
+
+
+def pays_gas_in_eth(chain_id: int) -> bool:
+    """Whether an ETH/USD quote prices this chain's gas.
+
+    Unknown chains answer **False**, which is the opposite of
+    ``supports_deterministic_safe``'s benefit of the doubt, and deliberately:
+    that one is a capability hint whose worst case is an extra on-chain check,
+    while a wrong answer here silently converts a gas price at the wrong rate,
+    by orders of magnitude, with nothing about the result looking unusual. An
+    unpriced chain falls back to ``core.costs``' static constants and reports
+    ``gas_priced_live: false``, which is the honest answer to "I do not know
+    what this chain's gas is worth."
+    """
+    return native_symbol(chain_id) == "ETH"
 
 
 def supports_deterministic_safe(chain_id: int) -> bool:

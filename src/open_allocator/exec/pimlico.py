@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -15,6 +15,17 @@ from open_allocator.exec import paymaster_registry
 # Method shapes checked against Pimlico's docs on 2026-07-15.
 
 JSON_RPC_ID = 4337
+
+# pimlico_getUserOperationGasPrice quotes three tiers. The EntryPoint charges
+# min(maxFeePerGas, baseFee + priority) and the ERC-20 paymaster converts that
+# into the gas token, so the tier is a multiplier on the bill — but a modest
+# one: measured 2026-08-16, fast/standard was 1.048x on both Base and Monad,
+# and slow/standard 0.95x. `standard` is the right default for a scheduled
+# rebalancer that is not competing for inclusion; `fast` is there for when
+# operations sit unincluded.
+FeeTier = Literal["slow", "standard", "fast"]
+FEE_TIERS: tuple[FeeTier, ...] = ("slow", "standard", "fast")
+DEFAULT_FEE_TIER: FeeTier = "standard"
 
 
 class PimlicoError(RuntimeError):
@@ -36,6 +47,14 @@ class TokenQuote:
 
     Pimlico bakes its fee into `exchange_rate`, so this — not a static per-chain
     table — is the only honest source for what gas will cost in USDC.
+
+    🔑 **This carries the quote's fields and deliberately does no arithmetic on
+    them.** It used to offer a ``token_cost(gas_limit, max_fee_per_gas)`` helper
+    that scaled ``exchange_rate`` by 1e18. Nothing ever called it, so the
+    scaling was never checked against a real charge — and a plausible-looking
+    cost function that no receipt has ever agreed with is worse than none at
+    all, because the first caller has no reason to doubt it. Anything added
+    back here should be derived against a real charge first.
     """
 
     paymaster: str
@@ -43,16 +62,6 @@ class TokenQuote:
     post_op_gas: int
     exchange_rate: int
     exchange_rate_native_to_usd: int | None = None
-
-    def token_cost(self, gas_limit: int, max_fee_per_gas: int) -> int:
-        """Token units this op will cost, at the quoted rate.
-
-        Mirrors the paymaster's own arithmetic: charge for the op's gas plus the
-        postOp overhead the paymaster spends collecting payment, converted at
-        exchangeRate (a 1e18-scaled token-per-wei rate).
-        """
-        native_cost = (gas_limit + self.post_op_gas) * max_fee_per_gas
-        return (native_cost * self.exchange_rate) // 10**18
 
 
 class PimlicoClient:
@@ -241,17 +250,29 @@ class PimlicoPaymasterAdapter:
         stubbed.update(result)
         return stubbed
 
-    def gas_price(self) -> dict[str, int]:
-        """pimlico_getUserOperationGasPrice — the bundler's own fee suggestion."""
+    def gas_price(self, tier: FeeTier = DEFAULT_FEE_TIER) -> dict[str, int]:
+        """pimlico_getUserOperationGasPrice — the bundler's fee suggestion.
+
+        ``tier`` picks how much to overbid; see FEE_TIERS. An endpoint that
+        answers with the fee fields directly, rather than per tier, is used
+        as-is — that shape has no tiers to choose between.
+        """
         result = self._client.call("pimlico_getUserOperationGasPrice", [])
         if not isinstance(result, Mapping):
             raise PimlicoError("malformed gas price")
-        fast = result.get("fast", result)
-        if not isinstance(fast, Mapping):
+        quoted = result.get(tier, result)
+        if not isinstance(quoted, Mapping):
             raise PimlicoError("malformed gas price")
+        if "maxFeePerGas" not in quoted:
+            # Naming what was on offer: silently falling through to another
+            # tier would quietly charge a price nobody asked for.
+            offered = ", ".join(sorted(str(key) for key in result)) or "nothing"
+            raise PimlicoError(
+                f"gas price tier {tier!r} was not quoted (offered: {offered})"
+            )
         return {
-            "maxFeePerGas": _as_int(_field(fast, "maxFeePerGas")),
-            "maxPriorityFeePerGas": _as_int(_field(fast, "maxPriorityFeePerGas")),
+            "maxFeePerGas": _as_int(_field(quoted, "maxFeePerGas")),
+            "maxPriorityFeePerGas": _as_int(_field(quoted, "maxPriorityFeePerGas")),
         }
 
     def send(self, user_operation: Mapping[str, Any]) -> str:
@@ -304,6 +325,9 @@ def _optional_int(value: Any) -> int | None:
 
 
 __all__ = [
+    "DEFAULT_FEE_TIER",
+    "FEE_TIERS",
+    "FeeTier",
     "PimlicoClient",
     "PimlicoError",
     "PimlicoPaymasterAdapter",

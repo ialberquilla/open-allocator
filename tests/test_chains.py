@@ -2,6 +2,7 @@ import os
 
 import pytest
 
+from open_allocator.exec import chains
 from open_allocator.exec.chains import (
     DEFAULT_RPC_URLS,
     USDC_ADDRESSES,
@@ -83,3 +84,29 @@ def test_rpc_mapping_does_not_answer_the_gas_token_lookup() -> None:
 
 def test_unknown_chain_has_no_gas_token() -> None:
     assert usdc_address(999999, {}) is None
+
+
+def test_every_registry_row_names_its_gas_token() -> None:
+    """The default is ETH, so the rows that are not ETH are the ones that matter."""
+    for chain_id, info in chains.DEFAULT_CHAINS.items():
+        assert info.native_symbol, f"chain {chain_id} has no native symbol"
+
+
+def test_the_known_non_eth_chains_are_marked_as_such() -> None:
+    assert chains.native_symbol(143) == "MON"
+    assert chains.pays_gas_in_eth(143) is False
+    for chain_id in (56, 100, 137, 146, 250, 5000, 42220, 43114, 80094):
+        assert chains.pays_gas_in_eth(chain_id) is False
+
+
+def test_the_eth_chains_still_answer_true() -> None:
+    for chain_id in (1, 10, 130, 8453, 42161, 59144, 534352):
+        assert chains.pays_gas_in_eth(chain_id) is True
+
+
+def test_an_unknown_chain_has_no_gas_token_and_is_not_eth() -> None:
+    """Unknown answers False here, unlike supports_deterministic_safe: a wrong
+    guess about the gas token converts a price at the wrong rate."""
+    assert chains.native_symbol(999_999) is None
+    assert chains.pays_gas_in_eth(999_999) is False
+    assert chains.supports_deterministic_safe(999_999) is True

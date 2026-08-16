@@ -141,7 +141,14 @@ price and an on-chain Chainlink ETH/USD feed — and `cost_estimate.gas_priced_l
 reports whether that succeeded. When it is `false` the estimate fell back to a
 static per-chain-class constant, which is an order of magnitude only: a constant
 is several times too high on an L2 at a low base fee and an order of magnitude
-too low on mainnet at a normal one. `core.costs.min_economic_leg_usd()` derives a
+too low on mainnet at a normal one.
+
+**Only chains whose gas token is ETH are priced live**, because that feed is the
+only price source wired. A chain that pays in its own token — Monad in MON,
+Polygon in POL, Avalanche in AVAX — is reported `gas_priced_live: false` and
+uses the constant, rather than being converted at the price of ETH. Read the
+flag before trusting a per-chain gas number, and add a price source rather than
+assuming ETH: where the two tokens differ in price, so does the estimate. `core.costs.min_economic_leg_usd()` derives a
 gas-aware minimum leg size from the same pricing, for when a flat
 `--min-position-usd` would be wrong on an expensive chain.
 
