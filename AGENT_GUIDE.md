@@ -27,6 +27,7 @@ The registered CLI commands are exactly:
 - `backtest`
 - `check-policy`
 - `validate-mandate`
+- `drift`
 - `build-tx`
 - `execute`
 - `positions`
