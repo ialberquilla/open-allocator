@@ -253,9 +253,7 @@ def _holdings(
 
         parsed.append(
             PositionHolding(
-                instrument_id=str(
-                    _required(position, "instrument_id", "instrumentId")
-                ),
+                instrument_id=str(_required(position, "instrument_id", "instrumentId")),
                 protocol=str(_required(position, "protocol")),
                 chain_id=int(chain_id),
                 symbol=str(_required(position, "symbol")),
@@ -263,9 +261,7 @@ def _holdings(
                 balance_raw=_optional_text(position, "balance_raw", "balanceRaw"),
                 decimals=_optional_int(position, "decimals"),
                 usd_value=_amount(_money_decimal(balance, "position.balance")),
-                share_balance=str(
-                    _required(position, "share_balance", "shareBalance")
-                ),
+                share_balance=str(_required(position, "share_balance", "shareBalance")),
                 share_balance_raw=str(
                     _required(position, "share_balance_raw", "shareBalanceRaw")
                 ),
@@ -287,6 +283,25 @@ def _holdings(
             )
         )
     return tuple(parsed)
+
+
+def held_usd_by_instrument(
+    positions: Positions | Mapping[str, object],
+) -> dict[str, float]:
+    """What the book holds today, per instrument, in USD.
+
+    Several holdings can share an instrument id, so they are summed rather than
+    indexed.
+    """
+    model = (
+        positions
+        if isinstance(positions, Positions)
+        else Positions.model_validate(positions)
+    )
+    return {
+        instrument_id: float(amount)
+        for instrument_id, amount in _current_usd_by_instrument(model).items()
+    }
 
 
 def _current_usd_by_instrument(positions: Positions) -> dict[str, Decimal]:
@@ -402,6 +417,7 @@ def _weight(value: Decimal, total: Decimal) -> float:
 
 __all__ = [
     "Diff",
+    "held_usd_by_instrument",
     "IdleBalance",
     "PositionDelta",
     "PositionHolding",

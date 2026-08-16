@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
+from decimal import Decimal
 from typing import TypeAlias
 
 from pydantic import Field, model_validator
@@ -9,6 +10,7 @@ from pydantic import Field, model_validator
 from open_allocator.core import diversify, eligibility
 from open_allocator.core.types import (
     Allocation,
+    AllocationLeg,
     FrozenModel,
     Policy,
     Vault,
@@ -20,6 +22,10 @@ PolicyScalar: TypeAlias = str | int | float | bool | None
 PolicyValue: TypeAlias = PolicyScalar | tuple[PolicyScalar, ...]
 
 _EPSILON = 1e-9
+
+# Rules that describe one cycle's action rather than the resulting book, and so
+# are scored against the buy even when a book is supplied.
+_CYCLE_SCOPED_RULES = ("max_deploy_per_cycle_usd",)
 
 
 class PolicyViolation(FrozenModel):
@@ -297,6 +303,73 @@ def _check_gates(
         )
 
 
+def resulting_book(
+    allocation: Allocation | Mapping[str, object],
+    held_usd: Mapping[str, float],
+) -> Allocation:
+    """The book that exists once ``allocation`` is bought on top of what is held.
+
+    Metadata travels from the incremental allocation, not from the holdings --
+    ``autonomous`` describes the action being gated, and the book being added to
+    did not have an execution mode.
+    """
+    allocation_model = _allocation(allocation)
+
+    usd: dict[str, Decimal] = defaultdict(Decimal)
+    for instrument_id, amount in held_usd.items():
+        usd[instrument_id] += Decimal(str(amount))
+    for leg in allocation_model.legs:
+        usd[leg.instrument_id] += Decimal(str(leg.usd))
+
+    total = sum(usd.values(), Decimal("0"))
+    legs = tuple(
+        AllocationLeg(
+            instrument_id=instrument_id,
+            weight=float(amount / total) if total > 0 else 0.0,
+            usd=float(amount),
+        )
+        for instrument_id, amount in sorted(usd.items())
+    )
+    return Allocation(
+        legs=legs,
+        total_usd=float(total),
+        metadata=dict(allocation_model.metadata),
+    )
+
+
+def check_incremental(
+    allocation: Allocation | Mapping[str, object],
+    policy: Policy | Mapping[str, object],
+    known_instruments: Iterable[Vault | Mapping[str, object]],
+    held_usd: Mapping[str, float],
+) -> PolicyResult:
+    """Gate a buy that is added to an existing book rather than replacing it.
+
+    A top-up is only safe or unsafe as part of the book it produces: one $13 leg
+    is 100% of itself and 13% of the book it joins, so scoring it alone rejects
+    every corrective action a partially-executed book needs.
+
+    The split is the whole point. **Caps are properties of a book** -- weights,
+    diversification, eligibility -- so they are scored against the result.
+    **Gates are properties of a cycle**, so ``max_deploy_per_cycle_usd`` is
+    scored against the buy; charging the book's total against a per-cycle deploy
+    limit would reject every top-up of a book larger than one cycle's budget.
+    """
+    book = check(resulting_book(allocation, held_usd), policy, known_instruments)
+    cycle = check(allocation, policy, known_instruments)
+
+    violations = tuple(
+        violation
+        for violation in book.violations
+        if violation.rule not in _CYCLE_SCOPED_RULES
+    ) + tuple(
+        violation
+        for violation in cycle.violations
+        if violation.rule in _CYCLE_SCOPED_RULES
+    )
+    return PolicyResult(ok=not violations, violations=violations)
+
+
 def _autonomous_mode(metadata: Mapping[str, object]) -> str | bool | None:
     for key in ("autonomous", "unattended"):
         if metadata.get(key) is True:
@@ -319,4 +392,10 @@ def _violation(
     return PolicyViolation(rule=rule, entity=entity, limit=limit, actual=actual)
 
 
-__all__ = ["PolicyResult", "PolicyViolation", "check"]
+__all__ = [
+    "PolicyResult",
+    "PolicyViolation",
+    "check",
+    "check_incremental",
+    "resulting_book",
+]
