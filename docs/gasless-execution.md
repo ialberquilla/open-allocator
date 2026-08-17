@@ -51,6 +51,43 @@ Facts below were observed on chain, not derived from a spec:
   transfer that no relayer has completed can be finished by anyone holding the
   message and Circle's attestation.
 
+## What an operation costs
+
+**The USDC the paymaster charges tracks the native fee closely** — measured
+across mainnet operations, the implied token price sits within a few percent of
+spot, so there is no hidden markup to hunt for. What the code controls is
+therefore not the exchange rate but the two inputs to it:
+
+- **The fee tier.** `pimlico_getUserOperationGasPrice` quotes `slow`,
+  `standard` and `fast`; the EntryPoint charges
+  `min(maxFeePerGas, baseFee + priority)` and the paymaster converts *that* into
+  USDC. `PAYMASTER_FEE_TIER` selects it and **defaults to `standard`** rather
+  than the `fast` that used to be hardcoded — a daily rebalancer is not racing
+  anyone. ⚠️ **Do not expect much from it:** measured 2026-08-16, `fast` is
+  **1.048x** `standard` on both Base and Monad, and `slow` is 0.95x. The tiers
+  are 5% apart, not 2x apart. Raise it to `fast` if operations sit unincluded,
+  remembering that a pending operation blocks the next one from this Safe.
+- **What rides in the operation.** The paymaster approval is sent **once per
+  (Safe, token, paymaster)**, not on every operation: the adapter reads the
+  allowance first and skips the approval when an unlimited one is already
+  standing. Beyond the approve itself, this is what lets a single-action
+  operation go out as a direct call instead of a MultiSendCallOnly
+  delegatecall it has no use for.
+
+⚠️ **The first operation on a chain still carries the approval, and must.** The
+"only works batched" rule above is about that operation, and it is unchanged —
+the allowance is read from chain state, so an undeployed Safe (nothing to ask)
+and an unreadable RPC (no answer) both fall through to sending the approval. A
+redundant approval wastes a few thousand gas; a missing one reverts the
+operation after paying for everything up to `postOp`.
+
+📍 **Modelled cost is a different number from charged cost, and the model prices
+gas in the chain's own token.** `core.costs` estimates what a leg will cost
+before it is sent; `exec.gas` reads the prices it needs. A chain whose gas token
+has no quote is left unpriced and falls back to a static constant with
+`gas_priced_live: false` — never priced at another token's rate, which on a
+chain with a cheap native token is wrong by orders of magnitude.
+
 ## Traps
 
 - **Wait for inclusion before the next operation.** Two operations from one

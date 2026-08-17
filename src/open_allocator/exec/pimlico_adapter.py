@@ -9,6 +9,7 @@ from web3 import Web3
 
 from open_allocator.exec import (
     chains,
+    erc20,
     paymaster_registry,
     safe_4337_signature,
     safe_deployment,
@@ -23,9 +24,16 @@ from open_allocator.exec.erc4337_paymaster import (
     PaymasterUserOperationRequest,
     PaymasterUserOperationSubmission,
 )
-from open_allocator.exec.pimlico import PimlicoClient, PimlicoPaymasterAdapter
+from open_allocator.exec.pimlico import (
+    DEFAULT_FEE_TIER,
+    FEE_TIERS,
+    FeeTier,
+    PimlicoClient,
+    PimlicoPaymasterAdapter,
+)
 from open_allocator.exec.safe_deployment import SafeSeed
 from open_allocator.exec.user_operation import (
+    MAX_UINT256,
     Call,
     build_user_operation,
     paymaster_calls,
@@ -43,6 +51,10 @@ _GAS_LIMIT_PLACEHOLDERS = {
     "verificationGasLimit": "0x0",
     "preVerificationGas": "0x0",
 }
+
+# An allowance above this can only be the remains of an unlimited approval that
+# gas charges have been drawn against. See _paymaster_already_approved.
+_UNLIMITED_APPROVAL_FLOOR = MAX_UINT256 // 2
 
 
 class PimlicoUserOperationAdapter:
@@ -63,6 +75,7 @@ class PimlicoUserOperationAdapter:
         config: object | None = None,
         rpc_urls: Mapping[int, str] | None = None,
         module: str = safe_deployment.SAFE_4337_MODULE,
+        fee_tier: FeeTier = DEFAULT_FEE_TIER,
         http_client: httpx.Client | None = None,
         web3_factory: Callable[[str], Web3] | None = None,
         inclusion_timeout_s: float = 120.0,
@@ -100,6 +113,12 @@ class PimlicoUserOperationAdapter:
         self._config = config
         self._rpc_urls = dict(rpc_urls or {})
         self._module = module
+        if fee_tier not in FEE_TIERS:
+            raise PaymasterConfigurationError(
+                f"PAYMASTER_FEE_TIER must be one of {', '.join(FEE_TIERS)}, "
+                f"got {fee_tier!r}"
+            )
+        self._fee_tier = fee_tier
         self._http_client = http_client
         self._web3_factory = web3_factory or _default_web3
         self._cached_address: str | None = account_address
@@ -159,13 +178,20 @@ class PimlicoUserOperationAdapter:
         # The paymaster address comes from the live quote, not the registry: it
         # is authoritative at submission time and the constant is only a fallback.
         quote = pimlico.token_quote(token)
-        calls = paymaster_calls(
-            [
-                Call(to=call.to, data=call.data, value=call.value)
-                for call in request.calls
-            ],
-            token=token,
-            paymaster=quote.paymaster,
+        actions = [
+            Call(to=call.to, data=call.data, value=call.value)
+            for call in request.calls
+        ]
+        calls = (
+            tuple(actions)
+            if self._paymaster_already_approved(
+                w3,
+                token,
+                owner=sender,
+                spender=quote.paymaster,
+                deployed=deployed,
+            )
+            else paymaster_calls(actions, token=token, paymaster=quote.paymaster)
         )
 
         user_op = build_user_operation(
@@ -176,7 +202,7 @@ class PimlicoUserOperationAdapter:
             deployed=deployed,
             signature=safe_4337_signature.dummy_signature(len(self._owner_keys)),
         )
-        user_op.update(_hex_values(pimlico.gas_price()))
+        user_op.update(_hex_values(pimlico.gas_price(self._fee_tier)))
         # pm_getPaymasterStubData rejects a userOp whose gas limits are absent,
         # but the limits come from an estimate that needs the stub first. Seed
         # zeros to break the cycle — the estimate below overwrites all three.
@@ -231,6 +257,46 @@ class PimlicoUserOperationAdapter:
             if time.monotonic() >= deadline:
                 return None
             self._sleep(self._poll_interval_s)
+
+    def _paymaster_already_approved(
+        self,
+        w3: Web3,
+        token: str,
+        *,
+        owner: str,
+        spender: str,
+        deployed: bool,
+    ) -> bool:
+        """Whether a previous op's unlimited approval is still standing.
+
+        Every op used to carry ``approve(paymaster, MAX_UINT256)`` in front of
+        it, unconditionally. That costs a warm SSTORE and an ERC-20 call every
+        time, and — because two calls can no longer go out as one direct call —
+        it forced *every* operation through a MultiSendCallOnly delegatecall,
+        including single-action ones that had no reason to be a batch. The
+        approval is only needed once per (Safe, token, paymaster).
+
+        🔑 **The threshold is ``MAX_UINT256 // 2``, not equality, because USDC
+        decrements.** FiatToken's ``transferFrom`` has no infinite-allowance
+        special case, so a standing unlimited allowance reads as ``MAX_UINT256``
+        minus every gas charge drawn against it since — never equal to what was
+        approved, and never remotely close to half of it either, since those
+        charges are token units against a ceiling of 2**256. Anything above that
+        half can only have come from an unlimited approval; a deliberate, scoped
+        one sits many orders of magnitude below.
+
+        💡 The gap between the two is worth knowing about: it is exactly what
+        the paymaster has charged, with no transfer inferred from receipt logs.
+
+        An undeployed Safe skips the read entirely: there is no contract to ask
+        and no allowance to find.
+        """
+        if not deployed:
+            return False
+        return (
+            erc20.allowance(w3, token, owner=owner, spender=spender)
+            >= _UNLIMITED_APPROVAL_FLOOR
+        )
 
     def _sender(self, w3: Web3, chain_id: int) -> tuple[str, bool]:
         """The Safe and whether it already exists.
@@ -369,6 +435,7 @@ def pimlico_adapter_from_config(config: object) -> PimlicoUserOperationAdapter:
         owner_keys=_owner_keys(config),
         seed=seed,
         account_address=getattr(config, "paymaster_account_address", None),
+        fee_tier=getattr(config, "paymaster_fee_tier", None) or DEFAULT_FEE_TIER,
         config=config,
     )
 

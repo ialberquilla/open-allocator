@@ -138,3 +138,43 @@ def test_eth_usd_is_none_when_every_feed_fails(monkeypatch) -> None:
 def test_gas_price_is_none_without_an_rpc_url(monkeypatch) -> None:
     monkeypatch.setattr(gas.chains, "rpc_url", lambda chain_id: None)
     assert gas.gas_price_wei(8453) is None
+
+
+def test_a_chain_that_pays_gas_in_its_own_token_is_not_priced_in_eth(
+    monkeypatch,
+) -> None:
+    """Monad pays in MON. An ETH quote must not reach it — see exec.gas."""
+    monkeypatch.setattr(gas, "eth_usd", lambda chain_ids=(): 2000.0)
+    monkeypatch.setattr(gas, "gas_price_wei", lambda chain_id: 10**11)
+
+    pricing = gas.live_pricing([8453, 143])
+    assert pricing is not None
+    assert dict(pricing.gas_price_wei) == {8453: 10**11}
+    assert pricing.usd_per_tx(143) is None
+    assert pricing.usd_per_tx(8453) is not None
+
+
+def test_an_all_non_eth_run_reads_no_feed_at_all(monkeypatch) -> None:
+    """Nothing here can use an ETH quote, so do not spend an RPC round trip."""
+    read = False
+
+    def _eth_usd(chain_ids=()):
+        nonlocal read
+        read = True
+        return 2000.0
+
+    monkeypatch.setattr(gas, "eth_usd", _eth_usd)
+    monkeypatch.setattr(gas, "gas_price_wei", lambda chain_id: 10**11)
+
+    assert gas.live_pricing([143]) is None
+    assert read is False
+
+
+def test_an_unknown_chain_is_not_assumed_to_pay_in_eth(monkeypatch) -> None:
+    """A new chain id must fall back, not inherit ETH by default."""
+    monkeypatch.setattr(gas, "eth_usd", lambda chain_ids=(): 2000.0)
+    monkeypatch.setattr(gas, "gas_price_wei", lambda chain_id: 10**9)
+
+    pricing = gas.live_pricing([8453, 999_999])
+    assert pricing is not None
+    assert pricing.usd_per_tx(999_999) is None

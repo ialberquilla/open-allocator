@@ -51,7 +51,9 @@ def test_small_deploy_flagged_uneconomic() -> None:
 
 def test_live_gas_pricing_overrides_the_static_fallback() -> None:
     # 190k gas at 1 gwei with ETH at $2,000 = $0.38/tx, far above the L2 default.
-    pricing = costs.GasPricing(gas_price_wei={8453: 10**9}, eth_usd=2000.0)
+    pricing = costs.GasPricing(
+        gas_price_wei={8453: 10**9}, native_usd={8453: 2000.0}
+    )
     params = costs.CostParams(gas=pricing)
     est = costs.estimate(_legs(), source_chain_id=8453, params=params)
     assert est is not None
@@ -63,15 +65,17 @@ def test_live_gas_pricing_overrides_the_static_fallback() -> None:
 def test_live_pricing_falls_back_per_chain_when_a_chain_is_missing() -> None:
     # Base priced live, Unichain absent -> Unichain must use the static constant,
     # not silently inherit Base's price.
-    pricing = costs.GasPricing(gas_price_wei={8453: 10**9}, eth_usd=2000.0)
+    pricing = costs.GasPricing(
+        gas_price_wei={8453: 10**9}, native_usd={8453: 2000.0}
+    )
     params = costs.CostParams(gas=pricing)
     assert params.gas_priced_live(8453) is True
     assert params.gas_priced_live(130) is False
     assert params.gas_usd_per_tx(130) == costs.DEFAULT_L2_GAS_USD_PER_TX
 
 
-def test_live_pricing_ignored_when_eth_quote_is_unusable() -> None:
-    pricing = costs.GasPricing(gas_price_wei={8453: 10**9}, eth_usd=0.0)
+def test_live_pricing_ignored_when_the_token_quote_is_unusable() -> None:
+    pricing = costs.GasPricing(gas_price_wei={8453: 10**9}, native_usd={8453: 0.0})
     params = costs.CostParams(gas=pricing)
     assert params.gas_priced_live(8453) is False
     assert params.gas_usd_per_tx(8453) == costs.DEFAULT_L2_GAS_USD_PER_TX
@@ -122,3 +126,37 @@ def test_from_allocation_legs_skips_unknown_chain() -> None:
     assert est is not None
     assert est.leg_count == 1
     assert est.deploy_usd == 100.0
+
+
+def test_a_chain_is_priced_in_its_own_token_not_in_eth() -> None:
+    """A cheap token at a high gas price is not an expensive chain.
+
+    The same gas price converted at ETH's price rather than the chain's own is
+    not a mis-calibration to be tuned away — it is a different token, and the
+    error is the whole ratio between the two.
+    """
+    gwei_108 = 108_733_597_232
+    ethish = costs.GasPricing(
+        gas_price_wei={143: gwei_108}, native_usd={143: 2683.0}
+    )
+    honest = costs.GasPricing(
+        gas_price_wei={143: gwei_108}, native_usd={143: 0.0255}
+    )
+
+    wrong = ethish.usd_per_tx(143)
+    right = honest.usd_per_tx(143)
+    assert wrong is not None and right is not None
+    assert wrong > 50.0
+    assert right < 0.01
+    assert wrong / right > 100_000
+
+
+def test_a_chain_with_no_token_quote_is_unpriced_rather_than_guessed() -> None:
+    """Absent from native_usd means "no quote", never "same as the others"."""
+    pricing = costs.GasPricing(
+        gas_price_wei={8453: 10**9, 143: 10**11}, native_usd={8453: 2000.0}
+    )
+    params = costs.CostParams(gas=pricing)
+    assert params.gas_priced_live(8453) is True
+    assert params.gas_priced_live(143) is False
+    assert params.gas_usd_per_tx(143) == costs.DEFAULT_L2_GAS_USD_PER_TX

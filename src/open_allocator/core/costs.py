@@ -51,30 +51,40 @@ DEFAULT_L1_CHAIN_IDS = frozenset({1})
 # of this — so a leg's gas is over- rather than under-stated.
 DEFAULT_GAS_UNITS_PER_TX = 190_000
 
-_WEI_PER_ETH = 10**18
+# Every EVM native token is 18 decimals, ETH or not, so one divisor serves all.
+_WEI_PER_NATIVE_TOKEN = 10**18
 
 
 @dataclass(frozen=True)
 class GasPricing:
-    """Live gas pricing: chain gas prices in wei plus one ETH/USD quote.
+    """Live gas pricing: per-chain gas prices in wei and per-chain token prices.
 
-    Every chain this allocator reaches pays gas in ETH, so a single ETH/USD
-    quote serves all of them. ``gas_price_wei`` is keyed by chain id; a chain
-    absent from it falls back to the static constants, which is the honest
-    behaviour when a read failed — silently substituting another chain's price
-    would be worse than admitting the gap.
+    Both maps are keyed by chain id, and **that is the load-bearing part**. Not
+    every chain pays gas in the same token, so a single price quote cannot serve
+    all of them: a gas price is a number in whatever the chain's native token
+    is, and converting it at another token's price is wrong by the ratio between
+    the two — orders of magnitude, silently. Keying the price by chain makes
+    that unrepresentable rather than merely discouraged, and a chain whose token
+    has no quote simply is not in the map.
+
+    A chain absent from either map falls back to the static constants, which is
+    the honest behaviour when a read failed or no price source exists —
+    silently substituting another chain's number would be worse than admitting
+    the gap.
     """
 
     gas_price_wei: Mapping[int, int]
-    eth_usd: float
+    # USD per whole native token, per chain — ETH for most, but never assumed.
+    native_usd: Mapping[int, float]
     gas_units_per_tx: int = DEFAULT_GAS_UNITS_PER_TX
 
     def usd_per_tx(self, chain_id: int) -> float | None:
         """USD for one signed tx on ``chain_id``, or None if unpriced."""
         price = self.gas_price_wei.get(chain_id)
-        if price is None or self.eth_usd <= 0:
+        token_usd = self.native_usd.get(chain_id)
+        if price is None or token_usd is None or token_usd <= 0:
             return None
-        return self.gas_units_per_tx * price / _WEI_PER_ETH * self.eth_usd
+        return self.gas_units_per_tx * price / _WEI_PER_NATIVE_TOKEN * token_usd
 
 
 @dataclass(frozen=True)

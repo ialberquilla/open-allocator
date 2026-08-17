@@ -213,6 +213,15 @@ class AllocatorConfig(BaseSettings):
         None,
         validation_alias="PAYMASTER_ENTRY_POINT",
     )
+    # Which of the bundler's three fee quotes to bid. `fast` was the hardcoded
+    # behaviour and is the wrong default for a daily rebalancer that is not
+    # racing anyone — though the spread is narrow (measured 1.048x fast over
+    # standard on 2026-08-16). Raise it if ops are sitting unincluded: a pending
+    # op blocks the next one from this Safe.
+    paymaster_fee_tier: Literal["slow", "standard", "fast"] = Field(
+        "standard",
+        validation_alias="PAYMASTER_FEE_TIER",
+    )
     # Legacy single-chain setting. The gas token comes from chains.USDC_ADDRESSES;
     # this is only a fallback for chains with no row there.
     paymaster_usdc_address: str | None = Field(
