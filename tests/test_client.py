@@ -200,8 +200,7 @@ def test_instrument_analysis_gets_path_and_parses() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
         assert (
-            request.url.raw_path
-            == b"/api/v1/instruments/vault%2Fwith%2Fslash/analysis"
+            request.url.raw_path == b"/api/v1/instruments/vault%2Fwith%2Fslash/analysis"
         )
         assert_common_headers(request)
         return httpx.Response(

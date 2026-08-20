@@ -181,9 +181,7 @@ def allowlist_findings(vault: Vault, allowed: PolicyAllowed) -> list[Finding]:
 
 def quality_findings(vault: Vault, caps: PolicyCaps) -> list[Finding]:
     return [
-        finding
-        for axis in _QUALITY_AXES
-        if (finding := axis(vault, caps)) is not None
+        finding for axis in _QUALITY_AXES if (finding := axis(vault, caps)) is not None
     ]
 
 

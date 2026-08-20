@@ -53,9 +53,7 @@ def test_small_deploy_flagged_uneconomic() -> None:
 
 def test_live_gas_pricing_overrides_the_static_fallback() -> None:
     # 190k gas at 1 gwei with ETH at $2,000 = $0.38/tx, far above the L2 default.
-    pricing = costs.GasPricing(
-        gas_price_wei={8453: 10**9}, native_usd={8453: 2000.0}
-    )
+    pricing = costs.GasPricing(gas_price_wei={8453: 10**9}, native_usd={8453: 2000.0})
     params = costs.CostParams(gas=pricing)
     est = costs.estimate(_legs(), source_chain_id=8453, params=params)
     assert est is not None
@@ -67,9 +65,7 @@ def test_live_gas_pricing_overrides_the_static_fallback() -> None:
 def test_live_pricing_falls_back_per_chain_when_a_chain_is_missing() -> None:
     # Base priced live, Unichain absent -> Unichain must use the static constant,
     # not silently inherit Base's price.
-    pricing = costs.GasPricing(
-        gas_price_wei={8453: 10**9}, native_usd={8453: 2000.0}
-    )
+    pricing = costs.GasPricing(gas_price_wei={8453: 10**9}, native_usd={8453: 2000.0})
     params = costs.CostParams(gas=pricing)
     assert params.gas_priced_live(8453) is True
     assert params.gas_priced_live(130) is False
@@ -138,12 +134,8 @@ def test_a_chain_is_priced_in_its_own_token_not_in_eth() -> None:
     error is the whole ratio between the two.
     """
     gwei_108 = 108_733_597_232
-    ethish = costs.GasPricing(
-        gas_price_wei={143: gwei_108}, native_usd={143: 2683.0}
-    )
-    honest = costs.GasPricing(
-        gas_price_wei={143: gwei_108}, native_usd={143: 0.0255}
-    )
+    ethish = costs.GasPricing(gas_price_wei={143: gwei_108}, native_usd={143: 2683.0})
+    honest = costs.GasPricing(gas_price_wei={143: gwei_108}, native_usd={143: 0.0255})
 
     wrong = ethish.usd_per_tx(143)
     right = honest.usd_per_tx(143)

@@ -24,6 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Lint workflow
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
         with:
@@ -40,5 +45,11 @@ jobs:
       - name: Lint
         run: uv run ruff check
 
+      - name: Check formatting
+        run: uv run ruff format --check
+
       - name: Unit tests
         run: uv run pytest -q -m "not integration"
+
+      - name: Build package
+        run: uv build

@@ -179,8 +179,7 @@ class PimlicoUserOperationAdapter:
         # is authoritative at submission time and the constant is only a fallback.
         quote = pimlico.token_quote(token)
         actions = [
-            Call(to=call.to, data=call.data, value=call.value)
-            for call in request.calls
+            Call(to=call.to, data=call.data, value=call.value) for call in request.calls
         ]
         calls = (
             tuple(actions)

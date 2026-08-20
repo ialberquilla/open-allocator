@@ -85,9 +85,7 @@ def test_the_approval_rides_in_front_of_the_action() -> None:
 
 
 def test_the_approval_targets_the_paymaster_for_an_unlimited_amount() -> None:
-    approval = paymaster_calls(
-        Call(to=VAULT), token=USDC, paymaster=PAYMASTER
-    )[0]
+    approval = paymaster_calls(Call(to=VAULT), token=USDC, paymaster=PAYMASTER)[0]
 
     raw = bytes.fromhex(approval.data[2:])
     assert raw[:4] == _APPROVE

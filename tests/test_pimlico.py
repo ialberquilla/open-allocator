@@ -283,9 +283,7 @@ def test_a_first_user_operation_deploys_the_safe_and_pays_its_gas_in_usdc() -> N
 
     sent = endpoint.params("eth_sendUserOperation")[0]
     # Zero-ETH onboarding on Monad: the op carries its own deployment...
-    assert sent["factory"].lower() == (
-        safe_deployment.SAFE_PROXY_FACTORY.lower()
-    )
+    assert sent["factory"].lower() == (safe_deployment.SAFE_PROXY_FACTORY.lower())
     assert sent["factoryData"].startswith("0x")
     # ...pays for it in USDC...
     assert sent["paymaster"] == PAYMASTER_V07

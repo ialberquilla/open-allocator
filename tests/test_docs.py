@@ -101,9 +101,7 @@ def tracked_files() -> frozenset[Path] | None:
     if result.returncode != 0:
         return None
     return frozenset(
-        (REPO_ROOT / name).resolve()
-        for name in result.stdout.split("\0")
-        if name
+        (REPO_ROOT / name).resolve() for name in result.stdout.split("\0") if name
     )
 
 
@@ -209,7 +207,9 @@ def test_workflow_review_focus_items_are_known_checks() -> None:
         for stage in workflow["stages"]:
             for focus in stage["review_focus"]:
                 if focus not in REVIEW_FOCUS_CHECKS:
-                    missing_focus.append(f"{workflow_path.name}:{stage['stage']}:{focus}")
+                    missing_focus.append(
+                        f"{workflow_path.name}:{stage['stage']}:{focus}"
+                    )
 
     assert missing_focus == []
 

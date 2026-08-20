@@ -113,7 +113,8 @@ def test_every_chain_defaults_to_the_entry_point_a_safe_can_use() -> None:
 def test_paymaster_address_tracks_the_entry_point_version() -> None:
     # Pimlico's ERC-20 paymaster is a different contract per EntryPoint version,
     # so the address cannot be a single constant.
-    assert require_paymaster_chain(BASE).paymaster_address == (
-        registry.ERC20_PAYMASTERS["v0.7"]
+    assert (
+        require_paymaster_chain(BASE).paymaster_address
+        == (registry.ERC20_PAYMASTERS["v0.7"])
     )
     assert len(set(registry.ERC20_PAYMASTERS.values())) == 3

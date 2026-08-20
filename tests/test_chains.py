@@ -77,8 +77,8 @@ def test_usdc_address_prefers_config_override_over_registry() -> None:
 
 def test_rpc_mapping_does_not_answer_the_gas_token_lookup() -> None:
     """Both lookups accepted a bare chain-id key would cross-answer."""
-    assert usdc_address(8453, {8453: "https://rpc.example/base"}) == (
-        USDC_ADDRESSES[8453]
+    assert (
+        usdc_address(8453, {8453: "https://rpc.example/base"}) == (USDC_ADDRESSES[8453])
     )
 
 

@@ -203,8 +203,7 @@ def test_paymaster_config_accepts_no_private_key(
     assert config.paymaster_bundler_url == "https://bundler.example"
     assert config.paymaster_bundler_credential is not None
     assert (
-        config.paymaster_bundler_credential.get_secret_value()
-        == "bundler-credential"
+        config.paymaster_bundler_credential.get_secret_value() == "bundler-credential"
     )
     assert config.paymaster_url == "https://paymaster.example"
     assert config.paymaster_credential is not None

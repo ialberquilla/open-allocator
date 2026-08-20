@@ -31,8 +31,7 @@ class SchemaValidationError(ValueError):
         self.violations = tuple(violations)
         paths = ", ".join(violation.path for violation in self.violations)
         details = "; ".join(
-            f"{violation.path}: {violation.message}"
-            for violation in self.violations
+            f"{violation.path}: {violation.message}" for violation in self.violations
         )
         super().__init__(
             f"{schema_name} schema validation failed at {paths}: {details}"

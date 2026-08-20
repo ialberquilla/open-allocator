@@ -212,9 +212,7 @@ def test_remote_signer_requests_remote_signature_without_raw_key_material() -> N
     assert adapter.address_calls == 1
     assert len(adapter.transactions) == 1
     assert adapter.transactions[0] == {
-        "to": Web3.to_checksum_address(
-            "0x00000000000000000000000000000000000000bb"
-        ),
+        "to": Web3.to_checksum_address("0x00000000000000000000000000000000000000bb"),
         "data": "0x1234",
         "value": 42,
         "chainId": 8453,

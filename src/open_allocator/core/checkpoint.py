@@ -314,9 +314,9 @@ def allocation_log_totals(
         )
         if model.usd is None:
             continue
-        totals[model.instrument_id] = (
-            totals.get(model.instrument_id, 0.0) + _signed_usd(model)
-        )
+        totals[model.instrument_id] = totals.get(
+            model.instrument_id, 0.0
+        ) + _signed_usd(model)
     return {key: round(value, 6) for key, value in sorted(totals.items())}
 
 

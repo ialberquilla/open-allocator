@@ -66,8 +66,7 @@ class PolicyCheckFailed(ExecutionError):
     def __init__(self, result: policy_core.PolicyResult) -> None:
         self.result = result
         violations = ", ".join(
-            f"{violation.rule}:{violation.entity}"
-            for violation in result.violations
+            f"{violation.rule}:{violation.entity}" for violation in result.violations
         )
         super().__init__(f"policy check failed: {violations}")
 
@@ -370,13 +369,11 @@ def pending_receipt_messages(
             )
         elif execution_status == "user_operation_submitted":
             messages.append(
-                f"user operation {tx_hash} was submitted but is not confirmed "
-                "on chain"
+                f"user operation {tx_hash} was submitted but is not confirmed on chain"
             )
         else:
             messages.append(
-                f"transaction {tx_hash} was submitted but is not confirmed "
-                "on chain"
+                f"transaction {tx_hash} was submitted but is not confirmed on chain"
             )
     return tuple(messages)
 
@@ -796,10 +793,8 @@ def _store_completed(store: object | None, key: str) -> bool:
     if isinstance(completed, set | frozenset | list | tuple):
         return key in completed
 
-
     if isinstance(store, Mapping):
         return bool(store.get(key))
-
 
     contains = getattr(store, "__contains__", None)
     if callable(contains):

@@ -27,9 +27,7 @@ def vault(**updates: object) -> Vault:
 
 
 def recompute(score: object) -> float:
-    known_factors = [
-        factor for factor in score.factors.values() if not factor.unknown
-    ]
+    known_factors = [factor for factor in score.factors.values() if not factor.unknown]
     total_weight = sum(factor.weight for factor in known_factors)
     return (
         sum(
@@ -114,11 +112,17 @@ def test_replaced_weight_vector_changes_ranking_as_expected() -> None:
     tvl_weighted = {"tvl": 1, "reward_dependence": 0.1}
     reward_weighted = {"tvl": 0.1, "reward_dependence": 1}
 
-    assert score_vault(deep_emissions_vault, tvl_weighted).score > score_vault(
-        small_organic_vault,
-        tvl_weighted,
-    ).score
-    assert score_vault(small_organic_vault, reward_weighted).score > score_vault(
-        deep_emissions_vault,
-        reward_weighted,
-    ).score
+    assert (
+        score_vault(deep_emissions_vault, tvl_weighted).score
+        > score_vault(
+            small_organic_vault,
+            tvl_weighted,
+        ).score
+    )
+    assert (
+        score_vault(small_organic_vault, reward_weighted).score
+        > score_vault(
+            deep_emissions_vault,
+            reward_weighted,
+        ).score
+    )

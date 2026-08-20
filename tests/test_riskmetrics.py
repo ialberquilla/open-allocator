@@ -72,9 +72,7 @@ def test_max_drawdown_zero_when_monotonic_up() -> None:
 def test_realized_below_advertised_gives_nonpositive_gap() -> None:
     series = (2.0, 8.0)  # volatile -> geometric < arithmetic
     gap = riskmetrics.delivery_gap(series)
-    assert gap == pytest.approx(
-        riskmetrics.realized_apy(series) - 5.0
-    )
+    assert gap == pytest.approx(riskmetrics.realized_apy(series) - 5.0)
     assert gap <= 0
 
 
