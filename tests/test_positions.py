@@ -230,3 +230,41 @@ def test_read_positions_handles_a_wallet_with_no_holdings() -> None:
     assert result.total_position_usd == 0
     assert result.total_idle_usdc == 0
     assert result.total_usd == 0
+
+
+def test_reconcile_honours_a_target_that_deliberately_holds_cash() -> None:
+    """Weights under 1.0 mean "leave the rest as USDC", not "scale me up".
+
+    Normalising them to 1.0 deploys the book to its last cent, which leaves a
+    rebalance with no USDC to pay for its own final transaction — gas is
+    sponsored out of this same balance.
+    """
+    current = positions_snapshot(
+        (
+            holding("vault-a", "50"),
+            holding("vault-b", "50"),
+        ),
+        idle_usdc="20",
+    )
+
+    # 0.475 + 0.475 = 0.95 of a $120 book: deploy $114, keep $6 for gas.
+    diff = reconcile(current, allocation(("vault-a", 0.475), ("vault-b", 0.475)))
+
+    assert diff.total_buy_usd == 14
+    assert diff.deploy_usdc == 14, "$6 of the $20 idle stays put"
+    deploys = [(d.instrument_id, d.action, d.buy_usd) for d in diff.deltas]
+    assert deploys == [("vault-a", "buy", 7), ("vault-b", "buy", 7)]
+
+
+def test_reconcile_still_scales_down_a_target_asking_for_more_than_the_book() -> None:
+    current = positions_snapshot(
+        (
+            holding("vault-a", "50"),
+            holding("vault-b", "50"),
+        ),
+    )
+
+    diff = reconcile(current, allocation(("vault-a", 1.0), ("vault-b", 1.0)))
+
+    assert diff.total_buy_usd == 0
+    assert diff.total_sell_usd == 0, "1.0/1.0 normalises to a half-and-half book"

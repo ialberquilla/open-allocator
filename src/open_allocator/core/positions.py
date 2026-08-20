@@ -322,6 +322,17 @@ def _target_weights(allocation: Allocation) -> dict[str, Decimal]:
     total_weight = sum(weights.values(), Decimal("0"))
     if total_weight <= 0:
         return {}
+    # Weights BELOW 1.0 mean the allocation deliberately holds cash — a gas
+    # reserve, or weight the caps could not place (`caps_binding`). Normalising
+    # those up to 1.0 silently deploys the book to its last cent, which is how a
+    # rebalance ends up with no USDC left to pay for its own final transaction.
+    # Only scale DOWN, when an allocation asks for more than the book has.
+    if total_weight <= 1:
+        return {
+            instrument_id: weight
+            for instrument_id, weight in weights.items()
+            if weight > 0
+        }
     return {
         instrument_id: weight / total_weight
         for instrument_id, weight in weights.items()

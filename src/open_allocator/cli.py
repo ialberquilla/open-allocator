@@ -1147,6 +1147,19 @@ def build_allocation(
         float | None,
         typer.Option("--apy-weight", min=0, help="Override the preset APY tilt."),
     ] = None,
+    caps_headroom_bps: Annotated[
+        float,
+        typer.Option(
+            "--caps-headroom-bps",
+            min=0,
+            help=(
+                "Build under the policy's concentration caps by this many bps, "
+                "RELATIVE (300 = caps x 0.97). check-policy still scores against "
+                "the untightened policy. Room for the friction between building "
+                "a book and holding one."
+            ),
+        ),
+    ] = 0.0,
     exclude: Annotated[
         list[str] | None,
         typer.Option("--exclude", help="Instrument id to veto (repeatable)."),
@@ -1220,6 +1233,7 @@ def build_allocation(
         amount,
         risk=risk_value,
         caps=policy.caps,
+        caps_headroom_bps=caps_headroom_bps,
         strategy=strategy,
         strategy_params=strategy_params,
         max_positions=max_positions,

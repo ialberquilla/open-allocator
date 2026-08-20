@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import floor, isfinite
 from typing import Any, Literal
 
@@ -86,6 +86,7 @@ def build_allocation(
     exclude: Iterable[str] | None = None,
     score_power: float | None = None,
     apy_weight: float | None = None,
+    caps_headroom_bps: float = 0.0,
 ) -> Allocation:
     """Build a policy-shaped allocation proposal.
 
@@ -103,11 +104,42 @@ def build_allocation(
     - ``score_power`` / ``apy_weight``: tilt the ``score_weighted`` formula
       beyond the three presets.
     - ``exclude``: veto specific instruments before allocating.
+    - ``caps_headroom_bps``: build under the caps rather than *at* them. Every
+      concentration cap is multiplied by ``1 - bps/10_000`` for the purpose of
+      building, and the untightened values are recorded in metadata as
+      ``gate_caps``. See the note below on why this is relative rather than a
+      flat subtraction, and why it belongs here rather than in the policy.
     - ``overrides``: pin per-instrument weights. When any pin is supplied the
       agent "takes the wheel": pinned weights are honored as-is, remaining mass
       is distributed by the chosen strategy, and internal cap-clamping plus
       ``max_positions``/``min_position_usd`` are skipped. Cap enforcement then
       belongs to the policy layer (``check-policy``), which is block-only.
+
+    WHY HEADROOM IS RELATIVE, AND WHY IT IS NOT A POLICY KNOB
+
+    A cap is enforced on a *weight*, but execution places *dollars*. A leg built
+    at ``cap x amount`` keeps its dollars while the book it is a share of loses
+    some fraction ``s`` to friction that lands nowhere — a paymaster reserve, a
+    bridge fee, a leg that failed to deposit. Its weight becomes
+    ``cap x amount / (amount x (1 - s)) = cap / (1 - s)``, which is over the cap
+    for any ``s > 0``. Surviving the gate therefore requires building at
+    ``cap x (1 - s)``: the correction is MULTIPLICATIVE, and a flat bps
+    subtraction would under-protect the large caps and over-protect the small
+    ones. One headroom number, one meaning: *the book may shrink by this much,
+    relative, and every cap still holds*.
+
+    It is deliberately NOT a field in the policy. The policy is the boundary the
+    gate scores against, and moving it would only relocate the knife edge —
+    a book built at 0.19 against a 0.19 cap breaches exactly as fast as one
+    built at 0.20 against 0.20. The whole content of headroom is that the number
+    used to BUILD and the number used to CHECK are two different numbers, so it
+    has to live on the builder.
+
+    Note the asymmetry with floors: ``min_effective_positions`` and friends are
+    already routinely derived with margin, because a floor's margin is visible
+    as a number you clear. A ceiling's margin is invisible — nothing in the
+    output distinguishes a book built at its cap from one built under it — which
+    is why this defaults to 0.0 and must be asked for.
     """
     if strategy not in strategies.STRATEGIES:
         supported = ", ".join(strategies.available())
@@ -117,7 +149,9 @@ def build_allocation(
     params = dict(strategy_params or {})
     amount = _finite_nonnegative(amount_usd, "amount_usd")
     preset = _effective_preset(_preset(risk), score_power, apy_weight)
-    cap_settings = _caps(caps)
+    gate_caps = _caps(caps)
+    headroom = _validated_headroom_bps(caps_headroom_bps)
+    cap_settings = _with_headroom(gate_caps, headroom)
     exclude_set = {str(item) for item in (exclude or ())}
     override_map = _normalized_overrides(overrides)
     max_pos = _validated_max_positions(max_positions)
@@ -134,6 +168,24 @@ def build_allocation(
         if record.vault.instrument_id not in exclude_set
     )
 
+    # Recorded whenever it was asked for, so a book built under its caps is
+    # distinguishable from one built at them. Without this the artifact shows
+    # only the tightened numbers and reads as a tighter policy.
+    headroom_metadata: dict[str, Any] = (
+        {
+            "caps_headroom_bps": headroom,
+            "gate_caps": {
+                "max_weight_per_instrument": gate_caps.max_weight_per_instrument,
+                "max_weight_per_protocol": gate_caps.max_weight_per_protocol,
+                "max_weight_per_curator": gate_caps.max_weight_per_curator,
+                "max_weight_per_chain": gate_caps.max_weight_per_chain,
+                "max_weight_per_sector": gate_caps.max_weight_per_sector,
+            },
+        }
+        if headroom > 0
+        else {}
+    )
+
     base_warnings: list[str] = []
     if exclude_set:
         base_warnings.append(f"excluded:count={len(exclude_set)}")
@@ -148,6 +200,7 @@ def build_allocation(
             warnings=[*base_warnings, "empty_universe:no allocation built"],
             extra_metadata={
                 "strategy": strategy,
+                **headroom_metadata,
                 **({"excluded": sorted(exclude_set)} if exclude_set else {}),
             },
         )
@@ -160,6 +213,11 @@ def build_allocation(
             )
         if max_pos is not None or min_ticket > 0:
             base_warnings.append("shaping_knobs_ignored:overrides_present")
+        if headroom > 0:
+            # Pins skip cap clamping entirely, so there is nothing for headroom
+            # to tighten. Silence here would let a caller believe the book was
+            # built with room it does not have.
+            base_warnings.append("caps_headroom_ignored:overrides_present")
         solution = _solve_overrides(
             records, amount, preset, override_map, strategy, params
         )
@@ -169,7 +227,34 @@ def build_allocation(
             records, amount, preset, cap_settings, max_pos, min_ticket, strategy, params
         )
 
-    extra_metadata: dict[str, Any] = {"strategy": strategy}
+    if headroom > 0 and not override_map:
+        # 🔴 HEADROOM CANCELS ITSELF WHEN IT CANNOT BE SPENT.
+        # Caps bound a leg's share of the DEPLOYED book, not of the requested
+        # amount. So weight the caps refuse to place does not sit in the book
+        # diluting it — it leaves as idle cash and shrinks the very denominator
+        # the caps are measured against. Tighten by h, fail to place u, and a
+        # clamped leg lands at cap*(1-h)/(1-u): the two cancel exactly at u = h.
+        #
+        # The precondition for headroom to mean anything is therefore that the
+        # shelf can hold MORE than 1.0 under the tightened caps — i.e. that the
+        # caps summed across their tightest partition exceed 1.0 with room to
+        # spare. A book whose caps sum to exactly 1.0 (every axis at its
+        # ceiling) cannot be given headroom at all; it needs another leg on an
+        # unbound axis first. `caps_binding:unallocatable_weight` alone does not
+        # say this, so say it.
+        placed = sum(leg.weight for leg in solution.legs)
+        unallocatable = max(0.0, 1.0 - placed)
+        if unallocatable > 1e-9:  # float noise in a sum of weights, not a cap
+            effective = (headroom / 10_000 - unallocatable) / (1 - unallocatable)
+            effective_bps = max(0.0, effective * 10_000)
+            base_warnings.append(
+                f"caps_headroom_cancelled:requested_bps={headroom:.0f}"
+                f":unallocatable_weight={unallocatable:.6f}"
+                f":effective_bps={effective_bps:.0f}"
+            )
+            headroom_metadata["effective_caps_headroom_bps"] = effective_bps
+
+    extra_metadata: dict[str, Any] = {"strategy": strategy, **headroom_metadata}
     if exclude_set:
         extra_metadata["excluded"] = sorted(exclude_set)
     if override_map:
@@ -402,6 +487,34 @@ def _caps(caps: Mapping[str, object] | object | None) -> _Caps:
         max_weight_per_curator=_cap(caps, "max_weight_per_curator", "curator"),
         max_weight_per_chain=_cap(caps, "max_weight_per_chain", "chain"),
         max_weight_per_sector=_cap(caps, "max_weight_per_sector", "sector"),
+    )
+
+
+def _validated_headroom_bps(value: float) -> float:
+    headroom = _finite_nonnegative(value, "caps_headroom_bps")
+    if headroom >= 10_000:
+        raise ValueError(
+            "caps_headroom_bps must be < 10000 (100% headroom leaves no room to build)"
+        )
+    return headroom
+
+
+def _with_headroom(caps: _Caps, headroom_bps: float) -> _Caps:
+    """Every concentration cap, multiplied by ``1 - headroom``.
+
+    An unset cap is 1.0 — "no constraint" — and shrinking that would invent a
+    constraint the policy never stated, turning headroom into a cap of its own.
+    So 1.0 is left alone; headroom narrows what binds, it does not create bounds.
+    """
+    if headroom_bps <= 0:
+        return caps
+    factor = 1.0 - headroom_bps / 10_000
+    return replace(
+        caps,
+        **{
+            field: (value if value >= 1.0 else value * factor)
+            for field, value in vars(caps).items()
+        },
     )
 
 

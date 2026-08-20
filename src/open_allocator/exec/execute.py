@@ -108,6 +108,10 @@ GasChecker = Callable[[str, int, str, object | None], GasCheck | bool]
 
 _PENDING_STATUSES = {"pending", "confirming_source", "confirmingsource"}
 
+# USDC is 6dp, so anything under a cent is rounding rather than money. Sourcing
+# a leg from a chain holding dust produces an op that costs more gas than it moves.
+_DUST_USDC = 0.01
+
 
 @overload
 def execute_allocation(
@@ -440,20 +444,28 @@ def _buy_body(
     vaults_by_id: Mapping[str, Vault],
     config: object | None,
     balances_by_chain: Mapping[int, float] | None = None,
+    *,
+    amount_usd: float | None = None,
+    source_chain_id_override: int | None = None,
 ) -> dict[str, object]:
     leg = allocation.legs[leg_index]
+    usd = leg.usd if amount_usd is None else amount_usd
     body: dict[str, object] = {
         "userAddress": address,
         "instrumentId": leg.instrument_id,
-        "amountUsdc": _amount_usdc(leg.usd),
+        "amountUsdc": _amount_usdc(usd),
     }
-    source_chain_id = _source_chain_id(
-        allocation,
-        leg.instrument_id,
-        vaults_by_id,
-        config,
-        leg.usd,
-        balances_by_chain,
+    source_chain_id = (
+        source_chain_id_override
+        if source_chain_id_override is not None
+        else _source_chain_id(
+            allocation,
+            leg.instrument_id,
+            vaults_by_id,
+            config,
+            usd,
+            balances_by_chain,
+        )
     )
     if source_chain_id is not None:
         body["sourceChainId"] = source_chain_id
@@ -496,6 +508,110 @@ def _source_chain_id(
     vault = vaults_by_id.get(instrument_id)
     vault_chain = vault.chain_id if vault is not None else None
     return _select_source_chain(vault_chain, leg_usd, balances_by_chain)
+
+
+class FundingLedger:
+    """Per-chain USDC as it actually is DURING a plan, not as it was before it.
+
+    A sell frees USDC on the chain the position sat on, and a buy spends it on
+    the chain it sources from. Both happen inside one batch, ordered sells-first,
+    so the balances that matter to leg N are the starting balances plus every
+    credit and debit from legs 0..N-1. Planning every buy against the balances
+    the wallet held BEFORE the batch is what makes 1Tx reject a sell-funded buy
+    with "No chain has sufficient USDC balance" — the money is there by the time
+    the transaction runs, just not when the plan was built.
+
+    Not a forecast of settlement: 1Tx still validates, and a sell that reverts is
+    caught by reconcile. This only stops the planner from asking for something it
+    has itself already made possible.
+    """
+
+    def __init__(
+        self,
+        balances: Mapping[int, float] | None = None,
+        *,
+        reserve_usd: float = 0.0,
+    ) -> None:
+        # `reserve_usd` is held back per chain because gas is paid in USDC out of
+        # this same balance. A book deployed to the last cent cannot pay for the
+        # transaction that deploys it, and the failure lands on the final op —
+        # the least recoverable place for it.
+        self._reserve = max(0.0, float(reserve_usd))
+        self._available: dict[int, float] = {
+            int(chain): max(0.0, float(usdc) - self._reserve)
+            for chain, usdc in (balances or {}).items()
+            if isinstance(chain, int) and not isinstance(chain, bool)
+        }
+
+    @property
+    def available(self) -> dict[int, float]:
+        return dict(self._available)
+
+    def credit(self, chain: int | None, usd: float) -> None:
+        """Proceeds of a sell, landing on the chain the position was held on.
+
+        Credited in full: the reserve is a floor on the wallet, not a toll on
+        every movement, and it was already withheld when the chain was opened.
+        """
+        if chain is None or usd <= 0:
+            return
+        if chain not in self._available:
+            self._available[chain] = -self._reserve
+        self._available[chain] = self._available.get(chain, 0.0) + float(usd)
+
+    def plan_sources(
+        self,
+        vault_chain: int | None,
+        amount: float | None,
+        *,
+        allow_partial: bool = False,
+    ) -> tuple[tuple[int, float], ...]:
+        """Which chains fund this buy, and for how much each. Debits as it goes.
+
+        Prefers the vault's own chain so no bridge is needed, then draws from the
+        best-funded chains. When one chain cannot cover the leg the buy is SPLIT
+        across several — 1Tx bridges each source to the destination over CCTP, so
+        several smaller ops succeed where one large one cannot.
+
+        An empty result means "let 1Tx auto-select": either nothing is funded or
+        the amount is unknown, and inventing a source there would pin the buy to
+        a chain for no reason.
+
+        `allow_partial` returns whatever is fundable right now instead of
+        refusing. That is for the staged executor, which broadcasts what it can,
+        waits for the money to land, and comes back for the remainder — as
+        opposed to a single batch, where a buy that can only be part-funded is
+        better left for 1Tx to reject than half-sent.
+        """
+        required = float(amount) if amount is not None else 0.0
+        funded = {c: u for c, u in self._available.items() if u > _DUST_USDC}
+        if not funded or required <= 0:
+            return ()
+
+        order = sorted(
+            funded,
+            key=lambda chain: (chain != vault_chain, -funded[chain], chain),
+        )
+        sources: list[tuple[int, float]] = []
+        remaining = required
+        for chain in order:
+            if remaining <= _DUST_USDC:
+                break
+            take = min(funded[chain], remaining)
+            if take <= _DUST_USDC:
+                continue
+            sources.append((chain, take))
+            remaining -= take
+
+        if remaining > _DUST_USDC and not allow_partial:
+            # Underfunded even in aggregate. Debit nothing and hand 1Tx the
+            # single best chain, so the shortfall is reported by the venue
+            # rather than silently split into ops that cannot all settle.
+            return ()
+
+        for chain, take in sources:
+            self._available[chain] = self._available.get(chain, 0.0) - take
+        return tuple(sources)
 
 
 def _select_source_chain(
@@ -961,6 +1077,7 @@ def _walk_values(value: object) -> Iterable[object]:
 
 
 __all__ = [
+    "FundingLedger",
     "ExecutionBroadcastError",
     "ExecutionError",
     "ExecutionReport",
