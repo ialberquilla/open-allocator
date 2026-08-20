@@ -388,7 +388,7 @@ def test_min_position_usd_drops_dust_legs() -> None:
 
 
 def test_equal_weight_dust_drop_breaks_ties_on_score_not_instrument_id() -> None:
-    """Under equal weighting the id tiebreak IS the selection rule, so it must not decide.
+    """Equal weighting makes the id tiebreak the selection rule, so it must not decide.
 
     `equal_weight` gives every leg an identical `usd`, so `min(sub_min, key=usd)`
     is always a tie and whatever comes next in the key chooses which instrument
