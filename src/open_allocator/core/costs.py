@@ -475,11 +475,7 @@ def estimate_rebalance(
 
     threshold = max(min_trade_usd, 0.0)
     moved = [m for m in moves if abs(m.delta_usd) > threshold and m.delta_usd != 0.0]
-    skipped = [
-        m
-        for m in moves
-        if m.delta_usd != 0.0 and abs(m.delta_usd) <= threshold
-    ]
+    skipped = [m for m in moves if m.delta_usd != 0.0 and abs(m.delta_usd) <= threshold]
 
     buy_usd = sum(m.delta_usd for m in moved if m.delta_usd > 0)
     sell_usd = sum(-m.delta_usd for m in moved if m.delta_usd < 0)

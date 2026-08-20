@@ -80,8 +80,7 @@ def assert_policy_caps_compatible(
         for weight in curator_weights.values()
     )
     assert all(
-        weight <= caps.max_weight_per_chain + 1e-9
-        for weight in chain_weights.values()
+        weight <= caps.max_weight_per_chain + 1e-9 for weight in chain_weights.values()
     )
 
 
@@ -308,9 +307,7 @@ def _unknown_curator_vaults() -> list[Vault]:
             curator="Unknown",
             chain_id=8453,
         )
-        for index, protocol in enumerate(
-            ["morpho", "aave", "fluid", "morpho", "aave"]
-        )
+        for index, protocol in enumerate(["morpho", "aave", "fluid", "morpho", "aave"])
     ]
 
 

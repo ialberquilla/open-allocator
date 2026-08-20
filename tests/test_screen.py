@@ -43,9 +43,7 @@ def test_min_sharpe_drops_unknown_and_low() -> None:
     steady = vault("steady", apy_series=(9.0, 9.1, 8.9, 9.0))
     noisy = vault("noisy", apy_series=(1.0, 20.0, 1.0, 20.0))
     no_history = vault("nohist")
-    result = screen(
-        [steady, noisy, no_history], ScreenCriteria(min_sharpe=1.0)
-    )
+    result = screen([steady, noisy, no_history], ScreenCriteria(min_sharpe=1.0))
     assert "steady" in ids(result.kept)
     assert "no_history" not in ids(result.kept)
     dropped_rules = {d.instrument_id: d.rule for d in result.dropped}

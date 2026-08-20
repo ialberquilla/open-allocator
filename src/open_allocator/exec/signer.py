@@ -94,10 +94,7 @@ class LocalEoaSigner:
         self._receipt_timeout = receipt_timeout
 
     def __repr__(self) -> str:
-        return (
-            f"LocalEoaSigner(address={self.address()!r}, "
-            "private_key=<redacted>)"
-        )
+        return f"LocalEoaSigner(address={self.address()!r}, private_key=<redacted>)"
 
     def address(self) -> str:
         return self._account.address

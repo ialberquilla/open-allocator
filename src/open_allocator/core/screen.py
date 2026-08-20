@@ -59,8 +59,7 @@ class ScreenResult:
 
     def warnings(self) -> list[str]:
         return [
-            f"screen_excluded:{drop.instrument_id}:{drop.rule}"
-            for drop in self.dropped
+            f"screen_excluded:{drop.instrument_id}:{drop.rule}" for drop in self.dropped
         ]
 
 

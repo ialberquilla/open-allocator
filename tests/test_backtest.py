@@ -51,8 +51,7 @@ def test_beat_rate_and_benchmark_present() -> None:
     # Portfolio is the high-yield leg; TVL benchmark is dominated by 'lo'.
     assert report.beat_rate == 1.0
     assert (
-        report.portfolio.annualized_return_pct
-        > report.benchmark.annualized_return_pct
+        report.portfolio.annualized_return_pct > report.benchmark.annualized_return_pct
     )
 
 

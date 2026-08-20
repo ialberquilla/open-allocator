@@ -472,8 +472,7 @@ def _apply_caps(
 
     while remaining > _EPSILON:
         capacities = [
-            _capacity(records, weights, caps, index)
-            for index in range(len(records))
+            _capacity(records, weights, caps, index) for index in range(len(records))
         ]
         # Only ever place capital in instruments the strategy actually chose
         # (desired > 0). Redistributing capped-out weight onto zero-desire
@@ -495,8 +494,7 @@ def _apply_caps(
         priority_total = sum(desired[index] for index in active)
         if priority_total > _EPSILON:
             increments = {
-                index: remaining * desired[index] / priority_total
-                for index in active
+                index: remaining * desired[index] / priority_total for index in active
             }
         else:
             equal_increment = remaining / len(active)

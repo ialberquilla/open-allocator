@@ -296,14 +296,11 @@ class OneTxHTTPError(OneTxClientError):
         self.path = path
         self.status_code = status_code
         self.response_text = response_text
-        super().__init__(
-            f"{method} {path} failed ({status_code}): {response_text}"
-        )
+        super().__init__(f"{method} {path} failed ({status_code}): {response_text}")
 
 
 class OneTxDecodeError(OneTxClientError):
     pass
-
 
 
 class OneTxClient:

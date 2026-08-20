@@ -26,9 +26,9 @@ MULTISEND_CALL_ONLY = "0x9641d764fc13c8B624c04430C7356C1C7C8102e2"
 CALL = 0
 DELEGATECALL = 1
 
-_EXECUTE_USER_OP_SELECTOR = keccak(
-    text="executeUserOp(address,uint256,bytes,uint8)"
-)[:4]
+_EXECUTE_USER_OP_SELECTOR = keccak(text="executeUserOp(address,uint256,bytes,uint8)")[
+    :4
+]
 _MULTISEND_SELECTOR = keccak(text="multiSend(bytes)")[:4]
 _APPROVE_SELECTOR = keccak(text="approve(address,uint256)")[:4]
 

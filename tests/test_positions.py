@@ -53,9 +53,7 @@ class MockPositionsClient:
                     "shareBalanceRaw": "74999123",
                     "shareDecimals": 6,
                     "currentApy": 0.04,
-                    "yieldTokenAddress": (
-                        "0x0000000000000000000000000000000000000002"
-                    ),
+                    "yieldTokenAddress": ("0x0000000000000000000000000000000000000002"),
                     "chainId": 8453,
                 }
             ],
@@ -179,8 +177,7 @@ def test_reconcile_surfaces_idle_usdc_as_deploy_deltas() -> None:
     assert diff.total_buy_usd == 20
     assert diff.total_sell_usd == 0
     deploys = [
-        (delta.instrument_id, delta.action, delta.buy_usd)
-        for delta in diff.deltas
+        (delta.instrument_id, delta.action, delta.buy_usd) for delta in diff.deltas
     ]
     assert deploys == [
         ("vault-a", "buy", 10),
@@ -199,8 +196,7 @@ def test_reconcile_computes_buy_and_sell_deltas() -> None:
     diff = reconcile(current, allocation(("vault-a", 0.5), ("vault-b", 0.5)))
 
     assert [
-        (delta.instrument_id, delta.action, delta.delta_usd)
-        for delta in diff.deltas
+        (delta.instrument_id, delta.action, delta.delta_usd) for delta in diff.deltas
     ] == [("vault-a", "sell", -30), ("vault-b", "buy", 30)]
     assert diff.total_buy_usd == 30
     assert diff.total_sell_usd == 30

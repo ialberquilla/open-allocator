@@ -19,8 +19,7 @@ class RebalancePolicyError(ValueError):
     def __init__(self, result: policy_core.PolicyResult) -> None:
         self.result = result
         violations = ", ".join(
-            f"{violation.rule}:{violation.entity}"
-            for violation in result.violations
+            f"{violation.rule}:{violation.entity}" for violation in result.violations
         )
         super().__init__(f"policy check failed: {violations}")
 

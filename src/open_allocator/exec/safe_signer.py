@@ -542,7 +542,9 @@ def _optional_threshold(value: object) -> int | None:
     return int(value)
 
 
-def _proposal_status(value: object) -> Literal[
+def _proposal_status(
+    value: object,
+) -> Literal[
     "proposed",
     "pending",
     "executable",
