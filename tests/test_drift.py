@@ -602,7 +602,9 @@ def test_opportunity_stays_quiet_when_the_switch_never_repays() -> None:
             vault("vault-b", apy=5.60, chain_id=1),
         ],
         cost_params=costs.CostParams(
-            gas=costs.GasPricing(gas_price_wei={1: 15_000_000_000}, eth_usd=3_000.0)
+            gas=costs.GasPricing(
+                gas_price_wei={1: 15_000_000_000}, native_usd={1: 3_000.0}
+            )
         ),
     )
 
@@ -768,7 +770,9 @@ def test_opportunity_evaluates_l1_when_gas_is_priced_live() -> None:
             vault("vault-b", apy=9.0, chain_id=1),
         ],
         cost_params=costs.CostParams(
-            gas=costs.GasPricing(gas_price_wei={1: 15_000_000_000}, eth_usd=3_000.0)
+            gas=costs.GasPricing(
+                gas_price_wei={1: 15_000_000_000}, native_usd={1: 3_000.0}
+            )
         ),
     )
 

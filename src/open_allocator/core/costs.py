@@ -7,6 +7,16 @@ allocation's legs and turns them into a net-of-cost view plus a blunt verdict
 (``ok`` / ``marginal`` / ``uneconomic``) that callers surface before anyone
 signs.
 
+🔑 **TWO QUESTIONS, TWO FUNCTIONS, AND THE SECOND IS NOT THE FIRST.**
+:func:`estimate` prices *deploying cash into a book* and judges the cost against
+the yield that book will earn — correct when the alternative is holding USDC.
+:func:`estimate_rebalance` prices *moving an existing book to a different one*
+and judges the cost against the **difference** between them, because the book is
+already earning and only the change is new. Asking :func:`estimate` about a
+rebalance returns a breakeven computed against yield that was never at stake,
+which flatters every trade and flatters compliance-only trades infinitely: they
+improve yield by nothing and would still report a short payback.
+
 The model is intentionally simple and conservative, not a gas oracle:
 
 - **Gas** is charged per signed transaction on the *source* chain, because with
@@ -96,6 +106,18 @@ class CostParams:
     gas: GasPricing | None = None
     # A deposit is approve + buy; two signed txs per leg on the source chain.
     txs_per_leg: int = 2
+    # An exit is one redeem. Kept separate from ``txs_per_leg`` because a
+    # rebalance pays both and they are not the same number: charging a sell two
+    # txs overstates every trim, and the trims are where a small book lives.
+    # Matches ``core.drift``'s ``_EXIT_TXS_PER_SWITCH`` so the gate's payback and
+    # this module's payback are the same arithmetic on the same trade.
+    txs_per_exit: int = 1
+    # Payback thresholds for a REBALANCE verdict, in days. The uneconomic line
+    # is ``core.drift``'s ``_PAYBACK_HORIZON_DAYS`` restated: a switch that does
+    # not repay within a year is not a switch, and the two modules disagreeing
+    # about that would let the gate fire something this module then blesses.
+    marginal_payback_days: float = 90.0
+    uneconomic_payback_days: float = 365.0
     # Circle CCTP v2 fast-transfer fee on bridged notional (always fast mode).
     cctp_fast_fee_bps: float = 1.0
     # Max adverse swap slippage tolerance; reported, not counted as expected cost.
@@ -319,14 +341,332 @@ def estimate_from_allocation_legs(
     return estimate(inputs, source_chain_id=source_chain_id, params=params)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Rebalancing an existing book, which is a different question from deploying one
+
+
+@dataclass(frozen=True)
+class MoveInput:
+    """One instrument's before and after. ``current_usd == target_usd`` is fine.
+
+    An unchanged leg costs nothing and still belongs in the list: it is part of
+    the book whose blended yield is the denominator on both sides of the
+    comparison, and leaving it out would price a six-leg book's improvement as
+    if it were a two-leg book's.
+    """
+
+    instrument_id: str
+    chain_id: int
+    current_usd: float
+    target_usd: float
+    apy_pct: float
+
+    @property
+    def delta_usd(self) -> float:
+        return self.target_usd - self.current_usd
+
+
+@dataclass(frozen=True)
+class RebalanceEstimate:
+    """What moving from the current book to a target one costs and earns.
+
+    🔑 THE FIELD THAT MATTERS IS ``annual_gain_usd``, AND IT CAN BE ZERO.
+    :func:`estimate` prices a fresh deployment and judges it against the book's
+    *gross* yield, which is the right question when the alternative is holding
+    cash and the wrong one here: a rebalance is already invested, so its payback
+    comes only from the *difference* between the two books. A move that changes
+    the weights without improving the yield — a compliance fix, most obviously —
+    has no yield to repay out of, and asking ``estimate`` about it returns a
+    flattering breakeven computed against yield the book was already earning.
+    """
+
+    # What actually moves
+    moved_leg_count: int
+    skipped_leg_count: int
+    skipped_usd: float
+    buy_usd: float
+    sell_usd: float
+    turnover_usd: float
+    tx_count: int
+
+    # What it costs
+    gas_cost_usd: float
+    bridge_fee_usd: float
+    total_expected_cost_usd: float
+    max_slippage_usd: float
+
+    # Whether each chain can pay for its own buys
+    bridged_usd: float
+    unfundable_usd: float
+    net_flow_by_chain: Mapping[int, float]
+
+    # What it earns
+    current_blended_apy_pct: float
+    target_blended_apy_pct: float
+    apy_delta_pct: float
+    annual_gain_usd: float
+    payback_days: float | None
+
+    verdict: str
+    gas_priced_live: bool
+    unpriced_chain_ids: tuple[int, ...]
+
+    def as_metadata(self) -> dict[str, float | int | str | bool]:
+        """Flat, schema-safe scalar dict. ``net_flow_by_chain`` is dropped."""
+        data: dict[str, float | int | str | bool] = {
+            "moved_leg_count": self.moved_leg_count,
+            "skipped_leg_count": self.skipped_leg_count,
+            "skipped_usd": self.skipped_usd,
+            "buy_usd": self.buy_usd,
+            "sell_usd": self.sell_usd,
+            "turnover_usd": self.turnover_usd,
+            "tx_count": self.tx_count,
+            "gas_cost_usd": self.gas_cost_usd,
+            "bridge_fee_usd": self.bridge_fee_usd,
+            "total_expected_cost_usd": self.total_expected_cost_usd,
+            "max_slippage_usd": self.max_slippage_usd,
+            "bridged_usd": self.bridged_usd,
+            "unfundable_usd": self.unfundable_usd,
+            "current_blended_apy_pct": self.current_blended_apy_pct,
+            "target_blended_apy_pct": self.target_blended_apy_pct,
+            "apy_delta_pct": self.apy_delta_pct,
+            "annual_gain_usd": self.annual_gain_usd,
+            "verdict": self.verdict,
+            "gas_priced_live": self.gas_priced_live,
+        }
+        # None means "never repays", which is not the same as a large number and
+        # must not be flattened into one.
+        if self.payback_days is not None:
+            data["payback_days"] = self.payback_days
+        return data
+
+    def warning(self) -> str | None:
+        if self.verdict in {"ok", "nothing_to_do"}:
+            return None
+        return f"rebalance:{self.verdict}"
+
+
+def estimate_rebalance(
+    moves: Sequence[MoveInput],
+    *,
+    params: CostParams | None = None,
+    min_trade_usd: float = 0.0,
+    idle_usd_by_chain: Mapping[int, float] | None = None,
+) -> RebalanceEstimate | None:
+    """Cost, funding and payback of moving a book from current to target.
+
+    ``min_trade_usd`` is the executor's own threshold
+    (``core.rebalance.plan_rebalance``, default $1.00). It is an input here
+    rather than an afterthought because **a move below it does not happen**: the
+    caller is otherwise told the cost of a plan the executor will silently
+    decline to run, and the book that actually results is neither the current
+    one nor the target. Skipped legs are reported, not hidden.
+
+    ``idle_usd_by_chain`` is what each chain can already pay with. Omit it and
+    every net inflow is assumed to need bridging, which overstates cost rather
+    than understating it — the safe direction, and the honest one when the
+    caller does not know.
+
+    Returns ``None`` when the move list is empty.
+    """
+    params = params or CostParams()
+    if not moves:
+        return None
+
+    threshold = max(min_trade_usd, 0.0)
+    moved = [m for m in moves if abs(m.delta_usd) > threshold and m.delta_usd != 0.0]
+    skipped = [
+        m
+        for m in moves
+        if m.delta_usd != 0.0 and abs(m.delta_usd) <= threshold
+    ]
+
+    buy_usd = sum(m.delta_usd for m in moved if m.delta_usd > 0)
+    sell_usd = sum(-m.delta_usd for m in moved if m.delta_usd < 0)
+
+    # Gas is charged on the leg's OWN chain, for both directions: you redeem
+    # where the vault is and you deposit where the vault is. This is the same
+    # convention ``core.drift`` prices a switch with, and it deliberately
+    # differs from :func:`estimate`, which charges a first deployment on the
+    # single chain the USDC is funded from.
+    gas_cost = 0.0
+    tx_count = 0
+    for move in moved:
+        txs = params.txs_per_leg if move.delta_usd > 0 else params.txs_per_exit
+        tx_count += txs
+        gas_cost += txs * params.gas_usd_per_tx(move.chain_id)
+
+    # Can each chain pay for its own buys? Net flow plus whatever idle already
+    # sits there; a shortfall has to arrive from somewhere else, and that is a
+    # bridge whether or not anyone planned one.
+    idle = dict(idle_usd_by_chain or {})
+    net_flow: dict[int, float] = {}
+    for move in moved:
+        net_flow[move.chain_id] = net_flow.get(move.chain_id, 0.0) + move.delta_usd
+
+    shortfall = 0.0
+    surplus = 0.0
+    for chain_id, net in net_flow.items():
+        available = idle.get(chain_id, 0.0) - net
+        if available < 0:
+            shortfall += -available
+        else:
+            surplus += available
+    # Idle on a chain with no movement is still capital that can be bridged out.
+    for chain_id, amount in idle.items():
+        if chain_id not in net_flow:
+            surplus += amount
+
+    bridged_usd = shortfall
+    # 🔴 What no chain can cover. A positive number here means the plan cannot
+    # be executed as written, which is a different failure from an expensive
+    # one and must not be reported as a cost.
+    unfundable_usd = max(shortfall - surplus, 0.0)
+    bridge_fee = bridged_usd * params.cctp_fast_fee_bps / 10_000
+
+    turnover = buy_usd + sell_usd
+    total_cost = gas_cost + bridge_fee
+    max_slippage = turnover * params.slippage_bps / 10_000
+
+    # Blended yield on both sides, over the WHOLE book each time. The target
+    # side uses the post-threshold book — what will actually be held — so a plan
+    # whose improvement lives entirely in skipped legs shows no improvement.
+    effective = {m.instrument_id: m.current_usd for m in moves}
+    for move in moved:
+        effective[move.instrument_id] = move.target_usd
+    apy_by_id = {m.instrument_id: m.apy_pct for m in moves}
+
+    current_total = sum(m.current_usd for m in moves)
+    target_total = sum(effective.values())
+    current_blended = (
+        sum(m.current_usd * m.apy_pct for m in moves) / current_total
+        if current_total > 0
+        else 0.0
+    )
+    target_blended = (
+        sum(usd * apy_by_id[i] for i, usd in effective.items()) / target_total
+        if target_total > 0
+        else 0.0
+    )
+
+    # Dollars per year, not percentage points: deploying idle capital raises the
+    # book's earnings while barely moving its blended rate, and a rebalance that
+    # trades yield for compliance lowers the rate while still being correct.
+    # Only the dollar figure answers "does this repay its own gas".
+    annual_gain_usd = (
+        target_total * target_blended / 100 - current_total * current_blended / 100
+    )
+
+    payback_days = (
+        total_cost / (annual_gain_usd / 365.0) if annual_gain_usd > 0 else None
+    )
+
+    unpriced = tuple(
+        sorted(
+            {
+                move.chain_id
+                for move in moved
+                if not params.gas_priced_live(move.chain_id)
+            }
+        )
+    )
+
+    if not moved:
+        verdict = "nothing_to_do"
+    elif unfundable_usd > 0:
+        verdict = "unfundable"
+    elif payback_days is None:
+        # No yield to repay out of. Not automatically wrong — a compliance fix
+        # buys compliance — but the caller has to justify it on something other
+        # than money, and saying so is this module's whole job.
+        verdict = "no_yield_gain"
+    elif payback_days > params.uneconomic_payback_days:
+        verdict = "uneconomic"
+    elif payback_days > params.marginal_payback_days:
+        verdict = "marginal"
+    else:
+        verdict = "ok"
+
+    return RebalanceEstimate(
+        moved_leg_count=len(moved),
+        skipped_leg_count=len(skipped),
+        skipped_usd=round(sum(abs(m.delta_usd) for m in skipped), 4),
+        buy_usd=round(buy_usd, 4),
+        sell_usd=round(sell_usd, 4),
+        turnover_usd=round(turnover, 4),
+        tx_count=tx_count,
+        gas_cost_usd=round(gas_cost, 4),
+        bridge_fee_usd=round(bridge_fee, 4),
+        total_expected_cost_usd=round(total_cost, 4),
+        max_slippage_usd=round(max_slippage, 4),
+        bridged_usd=round(bridged_usd, 4),
+        unfundable_usd=round(unfundable_usd, 4),
+        net_flow_by_chain={k: round(v, 4) for k, v in sorted(net_flow.items())},
+        current_blended_apy_pct=round(current_blended, 4),
+        target_blended_apy_pct=round(target_blended, 4),
+        apy_delta_pct=round(target_blended - current_blended, 4),
+        annual_gain_usd=round(annual_gain_usd, 4),
+        payback_days=round(payback_days, 2) if payback_days is not None else None,
+        verdict=verdict,
+        gas_priced_live=not unpriced,
+        unpriced_chain_ids=unpriced,
+    )
+
+
+def estimate_rebalance_from_holdings(
+    current_usd_by_instrument: Mapping[str, float],
+    target_usd_by_instrument: Mapping[str, float],
+    *,
+    chain_by_instrument: Mapping[str, int],
+    apy_by_instrument: Mapping[str, float],
+    params: CostParams | None = None,
+    min_trade_usd: float = 0.0,
+    idle_usd_by_chain: Mapping[int, float] | None = None,
+) -> RebalanceEstimate | None:
+    """Build :func:`estimate_rebalance` inputs from two plain USD maps.
+
+    The union of both maps is priced, so an instrument being exited entirely
+    (present in current, absent from target) and one being opened (the reverse)
+    are both moves rather than omissions. An instrument with no known chain is
+    skipped — it cannot be priced — and a missing APY is treated as 0 so the leg
+    still carries its execution cost.
+    """
+    moves: list[MoveInput] = []
+    for instrument_id in sorted(
+        set(current_usd_by_instrument) | set(target_usd_by_instrument)
+    ):
+        chain_id = chain_by_instrument.get(instrument_id)
+        if chain_id is None:
+            continue
+        moves.append(
+            MoveInput(
+                instrument_id=instrument_id,
+                chain_id=chain_id,
+                current_usd=float(current_usd_by_instrument.get(instrument_id, 0.0)),
+                target_usd=float(target_usd_by_instrument.get(instrument_id, 0.0)),
+                apy_pct=float(apy_by_instrument.get(instrument_id, 0.0)),
+            )
+        )
+    return estimate_rebalance(
+        moves,
+        params=params,
+        min_trade_usd=min_trade_usd,
+        idle_usd_by_chain=idle_usd_by_chain,
+    )
+
+
 __all__ = [
     "DEFAULT_GAS_UNITS_PER_TX",
     "CostEstimate",
     "CostParams",
     "GasPricing",
     "LegInput",
+    "MoveInput",
+    "RebalanceEstimate",
     "default_source_chain_id",
     "estimate",
     "estimate_from_allocation_legs",
+    "estimate_rebalance",
+    "estimate_rebalance_from_holdings",
     "min_economic_leg_usd",
 ]
