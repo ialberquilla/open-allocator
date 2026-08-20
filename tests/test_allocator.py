@@ -587,3 +587,235 @@ def test_omitted_sector_cap_leaves_allocation_unchanged() -> None:
 
     assert sum(leg.weight for leg in allocation.legs) == pytest.approx(1.0)
     assert allocation.metadata["caps"]["max_weight_per_sector"] == 1.0
+
+
+# ── caps headroom: build UNDER the caps, gate AT them ────────────────────────
+#
+# The bug these pin down (agent-showcase A7): `build-allocation` clamped a leg to
+# exactly `max_weight_per_instrument` and `check-policy` then scored that same
+# book against that same number, so the first dollar of execution friction put
+# the book in permanent violation. Weights are built; dollars are executed.
+
+
+def _six_vault_shelf() -> list[Vault]:
+    """The shape of agent-showcase's live book: 4 morpho + 2 singletons.
+
+    Under caps of 0.20/instrument and 0.60/protocol this shelf can place
+    0.60 + 0.20 + 0.20 = EXACTLY 1.0. Fully deployed only by sitting on every
+    ceiling at once, which is what makes it unable to carry headroom.
+    """
+    return [
+        vault(instrument_id="v-a", protocol="avantis", curator="c-a", chain_id=8453),
+        vault(instrument_id="v-b", protocol="tokemak", curator="c-b", chain_id=8453),
+        vault(instrument_id="v-c", protocol="morpho", curator="c-c", chain_id=143),
+        vault(instrument_id="v-d", protocol="morpho", curator="c-d", chain_id=8453),
+        vault(instrument_id="v-e", protocol="morpho", curator="c-e", chain_id=8453),
+        vault(instrument_id="v-f", protocol="morpho", curator="c-f", chain_id=143),
+    ]
+
+
+def _seven_vault_shelf() -> list[Vault]:
+    """The same book plus a leg on a fourth protocol — 1.20 placeable."""
+    return [
+        *_six_vault_shelf(),
+        vault(instrument_id="v-g", protocol="fluid", curator="c-g", chain_id=8453),
+    ]
+
+
+def _after_friction(
+    allocation: object, lost_usd: float, instrument_id: str
+) -> dict[str, float]:
+    """Weights as `positions` will report them once a leg lands short.
+
+    The book keeps every other leg's dollars and loses `lost_usd` off the total,
+    which is what a paymaster reserve or an undelivered bridge leg actually does.
+    """
+    held = {
+        leg.instrument_id: (
+            leg.usd - lost_usd if leg.instrument_id == instrument_id else leg.usd
+        )
+        for leg in allocation.legs  # type: ignore[attr-defined]
+    }
+    total = sum(held.values())
+    return {key: value / total for key, value in held.items()}
+
+
+def test_without_headroom_a_capped_leg_breaches_on_the_first_dollar_of_friction() -> (
+    None
+):
+    """A7, reproduced. This is the behaviour, not a bug in the test."""
+    vaults = _six_vault_shelf()
+    caps = {"max_weight_per_instrument": 0.20, "max_weight_per_protocol": 0.60}
+
+    allocation = build_allocation(
+        [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)],
+        100.0,
+        caps=caps,
+    )
+
+    built = weights_by_instrument(allocation)
+    assert built["v-a"] == pytest.approx(0.20), (
+        "the cap binds, which is the precondition"
+    )
+
+    # $0.78 of the Monad leg never arrives — the measured 2026-08-16 shortfall.
+    held = _after_friction(allocation, 0.78, "v-f")
+
+    assert held["v-a"] > 0.20
+    assert held["v-a"] == pytest.approx(0.20 / (1 - 0.0078), rel=1e-6), (
+        "the breach is exactly cap/(1-s): dollars held, book shrunk"
+    )
+
+
+def test_headroom_is_cancelled_when_the_caps_sum_to_exactly_one() -> None:
+    """🔴 The trap. Headroom is not free room — it has to be spendable.
+
+    Caps bound a share of the DEPLOYED book. Weight the caps refuse to place
+    leaves as idle cash rather than diluting the book, so it shrinks the
+    denominator by exactly the amount the numerator was tightened.
+    """
+    vaults = _six_vault_shelf()
+    caps = {"max_weight_per_instrument": 0.20, "max_weight_per_protocol": 0.60}
+
+    allocation = build_allocation(
+        [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)],
+        100.0,
+        caps=caps,
+        caps_headroom_bps=300,
+    )
+
+    assert allocation.total_usd == pytest.approx(97.0), "3% could not be placed"
+    assert weights_by_instrument(allocation)["v-a"] == pytest.approx(0.194)
+
+    held = _after_friction(allocation, 0.0, "v-f")
+    assert held["v-a"] == pytest.approx(0.20), "straight back at the cap, 0 bps gained"
+
+    assert allocation.metadata["effective_caps_headroom_bps"] == pytest.approx(0.0)
+    assert any(
+        warning.startswith("caps_headroom_cancelled:")
+        for warning in allocation.metadata["warnings"]
+    ), "a bare caps_binding warning does not say the headroom was cancelled"
+
+
+def test_headroom_survives_the_same_friction_once_an_axis_is_unbound() -> None:
+    vaults = _seven_vault_shelf()
+    caps = {"max_weight_per_instrument": 0.20, "max_weight_per_protocol": 0.60}
+
+    allocation = build_allocation(
+        [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)],
+        100.0,
+        caps=caps,
+        caps_headroom_bps=300,
+    )
+
+    assert sum(leg.usd for leg in allocation.legs) == pytest.approx(100.0), (
+        "headroom must not leave capital idle when an axis can absorb it"
+    )
+    assert "effective_caps_headroom_bps" not in allocation.metadata
+
+    held = _after_friction(allocation, 0.78, "v-f")
+
+    assert max(held.values()) <= 0.20
+    morpho = sum(held[key] for key in ("v-c", "v-d", "v-e", "v-f"))
+    assert morpho <= 0.60
+
+
+def test_headroom_tolerance_is_exactly_the_bps_it_was_given() -> None:
+    """The promise: the book may shrink this much, relative, and caps still hold."""
+    vaults = _seven_vault_shelf()
+    allocation = build_allocation(
+        [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)],
+        100.0,
+        caps={"max_weight_per_instrument": 0.20},
+        caps_headroom_bps=300,
+    )
+
+    for shrink, still_holds in ((0.0299, True), (0.0301, False)):
+        held = _after_friction(allocation, 100.0 * shrink, "v-f")
+        assert (max(held.values()) <= 0.20) is still_holds
+
+
+def test_headroom_is_relative_so_it_scales_with_the_cap() -> None:
+    """A flat bps subtraction would under-protect the big caps. This does not."""
+    vaults = _six_vault_shelf()
+    allocation = build_allocation(
+        [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)],
+        100.0,
+        caps={"max_weight_per_instrument": 0.20, "max_weight_per_protocol": 0.60},
+        caps_headroom_bps=500,
+    )
+
+    caps = allocation.metadata["caps"]
+    assert caps["max_weight_per_instrument"] == pytest.approx(0.19)  # 100 bps of room
+    assert caps["max_weight_per_protocol"] == pytest.approx(0.57)  # 300 bps of room
+
+
+def test_headroom_records_the_gate_caps_so_the_artifact_is_not_misread() -> None:
+    vaults = _six_vault_shelf()
+    allocation = build_allocation(
+        [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)],
+        100.0,
+        caps={"max_weight_per_instrument": 0.20},
+        caps_headroom_bps=300,
+    )
+
+    assert allocation.metadata["caps_headroom_bps"] == 300
+    assert allocation.metadata["gate_caps"]["max_weight_per_instrument"] == 0.20
+    assert allocation.metadata["caps"]["max_weight_per_instrument"] == pytest.approx(
+        0.194
+    )
+    validate(allocation.model_dump(mode="json"), "allocation")
+
+
+def test_zero_headroom_leaves_metadata_and_weights_byte_for_byte_unchanged() -> None:
+    vaults = _six_vault_shelf()
+    scored_vaults = [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)]
+    caps = {"max_weight_per_instrument": 0.20}
+
+    without = build_allocation(scored_vaults, 100.0, caps=caps)
+    explicit_zero = build_allocation(
+        scored_vaults, 100.0, caps=caps, caps_headroom_bps=0
+    )
+
+    assert without.model_dump() == explicit_zero.model_dump()
+    assert "caps_headroom_bps" not in without.metadata
+
+
+def test_headroom_does_not_invent_a_cap_where_the_policy_set_none() -> None:
+    """An unset cap is 1.0. Shrinking it would be a constraint nobody asked for."""
+    vaults = _six_vault_shelf()
+    allocation = build_allocation(
+        [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)],
+        100.0,
+        caps={"max_weight_per_instrument": 0.20},
+        caps_headroom_bps=1_000,
+    )
+
+    assert allocation.metadata["caps"]["max_weight_per_sector"] == 1.0
+    assert allocation.metadata["caps"]["max_weight_per_protocol"] == 1.0
+
+
+def test_headroom_is_ignored_under_pins_and_says_so() -> None:
+    vaults = _six_vault_shelf()
+    allocation = build_allocation(
+        [scored(v, 1.0 - index * 0.05) for index, v in enumerate(vaults)],
+        100.0,
+        caps={"max_weight_per_instrument": 0.20},
+        caps_headroom_bps=300,
+        overrides={"v-a": 0.5},
+    )
+
+    assert weights_by_instrument(allocation)["v-a"] == pytest.approx(0.5)
+    assert "caps_headroom_ignored:overrides_present" in allocation.metadata["warnings"]
+
+
+@pytest.mark.parametrize("bad", [-1, 10_000, 12_000, float("nan"), float("inf")])
+def test_headroom_outside_zero_to_ten_thousand_bps_is_rejected(bad: float) -> None:
+    vaults = _six_vault_shelf()
+    with pytest.raises(ValueError, match="caps_headroom_bps"):
+        build_allocation(
+            [scored(v, 1.0) for v in vaults],
+            100.0,
+            caps={"max_weight_per_instrument": 0.20},
+            caps_headroom_bps=bad,
+        )
