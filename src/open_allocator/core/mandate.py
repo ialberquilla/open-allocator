@@ -121,6 +121,10 @@ class RationaleEntry(FrozenModel):
 class MandateBands(FrozenModel):
     weight_drift_bps: int = Field(ge=0, le=10_000)
     sleeve_drift_bps: int = Field(ge=0, le=10_000)
+    # Optional so mandates written before the opportunity check still validate.
+    # Absent is not zero: `drift` reports the check unevaluated rather than
+    # inventing a churn tolerance the mandate never stated.
+    min_uplift_bps: int | None = Field(default=None, ge=0, le=10_000)
 
 
 class Mandate(BaseModel):
