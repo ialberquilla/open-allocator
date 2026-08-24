@@ -10,7 +10,7 @@ nothing has been sent, and sends it again. The state is not incidental to
 correctness here; it *is* the correctness argument, and it cannot live somewhere
 the platform erases between attempts.
 
-So persistence becomes a port. `StateBackend` names the six operations that
+So persistence becomes a port. `StateBackend` names the seven operations that
 touch durable state, `LocalFsBackend` implements them against the same files as
 before, and a caller that needs state to outlive the filesystem supplies its own
 implementation.
@@ -135,6 +135,10 @@ class StateBackend(Protocol):
         """
         ...
 
+    def completed_value(self, scope: str, key: str) -> JsonValue:
+        """Return the durable value recorded for a completed idempotency key."""
+        ...
+
 
 class ScopedIdempotencyStore:
     """A backend and a scope, presented as the store the executors already take.
@@ -158,6 +162,9 @@ class ScopedIdempotencyStore:
 
     def mark_completed(self, key: str, value: JsonValue = None) -> None:
         self._backend.mark_completed(self._scope, key, value)
+
+    def completed_value(self, key: str) -> JsonValue:
+        return self._backend.completed_value(self._scope, key)
 
 
 class LocalFsBackend:
@@ -280,6 +287,12 @@ class LocalFsBackend:
         with temp_path.open("w", encoding="utf-8") as file:
             json.dump(payload, file, sort_keys=True, separators=(",", ":"))
         temp_path.replace(path)
+
+    def completed_value(self, scope: str, key: str) -> JsonValue:
+        entry = self._scope_data(self._read_idempotency(), scope).get(key)
+        if isinstance(entry, Mapping):
+            return entry.get("value")
+        return None
 
     def _read_idempotency(self) -> dict[str, JsonValue]:
         path = self._require(self.idempotency_store_path, "idempotency_store_path")

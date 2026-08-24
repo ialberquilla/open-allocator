@@ -97,6 +97,9 @@ class InMemoryBackend:
     def mark_completed(self, scope: str, key: str, value: Any = None) -> None:
         self.completed[(scope, key)] = value
 
+    def completed_value(self, scope: str, key: str) -> Any:
+        return self.completed.get((scope, key))
+
 
 @dataclass
 class MockOneTxClient:
@@ -315,6 +318,7 @@ def test_every_protocol_method_is_implemented_with_the_same_signature() -> None:
         "read_allocation_log",
         "is_completed",
         "mark_completed",
+        "completed_value",
     }
     for name in protocol_methods:
         expected = inspect.signature(getattr(StateBackend, name))

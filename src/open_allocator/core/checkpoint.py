@@ -70,6 +70,9 @@ class CheckpointIdempotencyStore:
     def mark_completed(self, key: str, value: object | None = None) -> None:
         self.completed[key] = _json_compatible(value) if value is not None else True
 
+    def completed_value(self, key: str) -> object | None:
+        return self.completed.get(key)
+
 
 class AllocationLogEntry(FrozenModel):
     """One executed action, recorded so cost basis survives the transaction.
@@ -110,7 +113,16 @@ class AllocationLogEntry(FrozenModel):
         shares = values.get("shares")
         share_price = values.get("share_price")
 
-        if share_price is not None:
+        if (
+            share_price is not None
+            and values.get("basis") == "derived"
+            and usd is not None
+            and shares is not None
+        ):
+            # A serialized derived entry already contains all three values.
+            # Preserve its provenance when validating it back from storage.
+            values["basis"] = "derived"
+        elif share_price is not None:
             # The caller was quoted a price by the venue. Trust it over
             # anything computed here, and fill the missing dollar amount from
             # it so the entry's own three numbers agree with each other.
