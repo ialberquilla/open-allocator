@@ -9,6 +9,7 @@ from pydantic import Field
 
 from open_allocator.core import policy as policy_core
 from open_allocator.core import rebalance as rebalance_core
+from open_allocator.core.state import backend_from_config
 from open_allocator.core.types import (
     Allocation,
     AllocationLeg,
@@ -75,6 +76,7 @@ class _StepRef(FrozenModel):
     # build endpoint neither takes nor returns a share amount, and the receipt
     # carries no logs, so the price is unknown until the position is next read.
     share_price: str | None = None
+    settlement_chain_id: int | None = None
     action_type: str
 
 
@@ -216,7 +218,11 @@ def execute_rebalance(
 
     execution_steps: list[ExecutionStepReport] = []
     receipts: list[Receipt] = []
-    _broadcast(
+    share_baselines = _share_balances(positions)
+    attribution_messages = _broadcast(
+        client,
+        address,
+        positions,
         signer,
         step_refs,
         rpc_urls,
@@ -228,10 +234,11 @@ def execute_rebalance(
         messages,
         execution_steps,
         receipts,
+        share_baselines,
     )
 
     unconfirmed = pending_receipt_messages(receipts)
-    in_progress = in_progress or bool(unconfirmed)
+    in_progress = in_progress or bool(unconfirmed) or bool(attribution_messages)
     report = RebalanceExecutionReport(
         status="in_progress" if in_progress else "success",
         rebalance_plan=rebalance_plan,
@@ -241,7 +248,7 @@ def execute_rebalance(
         receipts=tuple(receipts),
         gas_checks=gas_checks,
         in_progress=in_progress,
-        messages=(*messages, *unconfirmed),
+        messages=(*messages, *unconfirmed, *attribution_messages),
     )
     _write_checkpoint(
         config,
@@ -291,13 +298,17 @@ def _execute_staged(
     all_refs: list[_StepRef] = []
     all_steps: list[TxStep] = []
     messages: list[str] = []
+    share_baselines = _share_balances(positions)
 
     def run(built: _BuiltPlan) -> None:
         rpc_urls, gas = _preflight(address, built.step_refs, config, idempotency_store)
         all_refs.extend(built.step_refs)
         all_steps.extend(built.plan.steps)
         messages.extend(built.messages)
-        _broadcast(
+        attribution_messages = _broadcast(
+            client,
+            address,
+            positions,
             signer,
             built.step_refs,
             rpc_urls,
@@ -309,7 +320,9 @@ def _execute_staged(
             tuple(messages),
             steps,
             receipts,
+            share_baselines,
         )
+        messages.extend(attribution_messages)
 
     run(
         _build_tx_plan(
@@ -395,7 +408,11 @@ def _execute_staged(
         )
 
     unconfirmed = pending_receipt_messages(receipts)
-    in_progress = bool(unconfirmed) or bool(outstanding)
+    in_progress = (
+        bool(unconfirmed)
+        or bool(outstanding)
+        or any("cost basis" in message for message in messages)
+    )
     tx_plan = TxPlan(
         steps=tuple(all_steps),
         summary=(
@@ -448,6 +465,9 @@ def _settle(config: object | None) -> None:
 
 
 def _broadcast(
+    client: object,
+    address: str,
+    initial_positions: object,
     signer: Signer,
     step_refs: Sequence[_StepRef],
     rpc_urls: Mapping[int, str],
@@ -459,7 +479,8 @@ def _broadcast(
     messages: Sequence[str],
     execution_steps: list[ExecutionStepReport],
     receipts: list[Receipt],
-) -> None:
+    share_baselines: dict[str, Decimal],
+) -> tuple[str, ...]:
     """Send every step, appending to `execution_steps`/`receipts` as it goes.
 
     Mutates the two lists rather than returning them so that a failure part-way
@@ -467,8 +488,40 @@ def _broadcast(
     caller holds the accumulator, and the checkpoint written on the way out
     carries everything sent so far, not just this stage.
     """
+    attribution_messages: list[str] = []
+    attribution_required = (
+        backend_from_config(config, needs="allocation_log_path") is not None
+    )
     for ref in step_refs:
         if _store_completed(idempotency_store, ref.idempotency_key):
+            allocation_key = f"{ref.idempotency_key}:allocation-log"
+            if attribution_required and not _store_completed(
+                idempotency_store, allocation_key
+            ):
+                receipt = _stored_receipt(idempotency_store, ref.idempotency_key)
+                if receipt is not None and receipt.status == 1:
+                    logged_ref = ref
+                    if ref.action_type == "buy" and ref.step.kind != "approve":
+                        shares = _settled_buy_delta(
+                            client,
+                            address,
+                            initial_positions,
+                            ref,
+                            config,
+                            share_baselines,
+                        )
+                        if shares is None:
+                            attribution_messages.append(
+                                "confirmed buy cost basis is not yet observable: "
+                                f"{ref.instrument_id}"
+                            )
+                        else:
+                            logged_ref = ref.model_copy(update={"shares": shares})
+                    if logged_ref.action_type != "buy" or logged_ref.shares is not None:
+                        _append_allocation_log(config, logged_ref, receipt)
+                        _store_mark_completed(
+                            idempotency_store, allocation_key, receipt.transaction_hash
+                        )
             execution_steps.append(
                 ExecutionStepReport(
                     leg_index=ref.leg_index,
@@ -479,11 +532,18 @@ def _broadcast(
                     idempotency_key=ref.idempotency_key,
                 )
             )
-            _mark_leg_if_complete(ref, step_refs, idempotency_store)
+            _mark_leg_if_complete(
+                ref, step_refs, idempotency_store, attribution_required
+            )
             continue
 
         try:
-            receipt = signer.send(ref.step, rpc_urls[ref.step.chain_id])
+            raw_receipt = signer.send(ref.step, rpc_urls[ref.step.chain_id])
+            receipt = (
+                raw_receipt
+                if isinstance(raw_receipt, Receipt)
+                else Receipt.model_validate(raw_receipt)
+            )
         except Exception as error:
             partial_report = ExecutionReport(
                 status="failed",
@@ -510,8 +570,43 @@ def _broadcast(
 
         receipts.append(receipt)
         _store_mark_completed(idempotency_store, ref.idempotency_key, receipt)
-        _append_allocation_log(config, ref, receipt)
-        _mark_leg_if_complete(ref, step_refs, idempotency_store)
+        logged_ref = ref
+        if (
+            ref.action_type == "buy"
+            and ref.step.kind != "approve"
+            and receipt.status == 1
+            and attribution_required
+        ):
+            shares = _settled_buy_delta(
+                client,
+                address,
+                initial_positions,
+                ref,
+                config,
+                share_baselines,
+            )
+            if shares is not None:
+                logged_ref = ref.model_copy(update={"shares": shares})
+        if receipt.status != 1:
+            pass
+        elif (
+            attribution_required
+            and ref.action_type == "buy"
+            and ref.step.kind != "approve"
+            and logged_ref.shares is None
+        ):
+            attribution_messages.append(
+                f"confirmed buy cost basis is not yet observable: {ref.instrument_id}"
+            )
+        else:
+            _append_allocation_log(config, logged_ref, receipt)
+            if attribution_required:
+                _store_mark_completed(
+                    idempotency_store,
+                    f"{ref.idempotency_key}:allocation-log",
+                    receipt.transaction_hash,
+                )
+        _mark_leg_if_complete(ref, step_refs, idempotency_store, attribution_required)
         execution_steps.append(
             ExecutionStepReport(
                 leg_index=ref.leg_index,
@@ -523,6 +618,101 @@ def _broadcast(
                 idempotency_key=ref.idempotency_key,
             )
         )
+    return tuple(attribution_messages)
+
+
+def _stored_receipt(store: object | None, key: str) -> Receipt | None:
+    value: object | None = None
+    getter = getattr(store, "completed_value", None)
+    if callable(getter):
+        value = getter(key)
+    elif isinstance(store, Mapping):
+        value = store.get(key)
+    else:
+        completed = getattr(store, "completed", None)
+        if isinstance(completed, Mapping):
+            value = completed.get(key)
+    if isinstance(value, Receipt):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return Receipt.model_validate(value)
+        except Exception:  # noqa: BLE001 - old stores may contain only True
+            return None
+    return None
+
+
+def _settled_buy_delta(
+    client: object,
+    address: str,
+    initial_positions: object,
+    ref: _StepRef,
+    config: object | None,
+    share_baselines: dict[str, Decimal],
+) -> str | None:
+    """Return the exact newly settled shares for one confirmed buy."""
+    read = getattr(client, "positions", None)
+    if not callable(read):
+        return None
+    baseline = share_baselines.get(
+        ref.instrument_id,
+        _share_balance(initial_positions, ref.instrument_id) or Decimal("0"),
+    )
+    attempts_value = _config_value(config, "position_settlement_attempts")
+    try:
+        attempts = max(1, int(attempts_value or 1))
+    except (TypeError, ValueError):
+        attempts = 1
+    for attempt in range(attempts):
+        response = read(
+            {
+                "address": address,
+                "chainId": ref.settlement_chain_id or ref.step.chain_id,
+            }
+        )
+        observed = _share_balance(response, ref.instrument_id)
+        if observed is not None:
+            delta = observed - baseline
+            if delta > 0:
+                share_baselines[ref.instrument_id] = observed
+                return format(delta, "f")
+            if delta < 0:
+                return None
+        if attempt + 1 < attempts:
+            _settle(config)
+    return None
+
+
+def _share_balances(value: object) -> dict[str, Decimal]:
+    balances: dict[str, Decimal] = {}
+    holdings = getattr(value, "holdings", ()) or ()
+    for holding in holdings:
+        instrument_id = getattr(holding, "instrument_id", None)
+        balance = getattr(holding, "share_balance", None)
+        if instrument_id is not None and balance is not None:
+            balances[str(instrument_id)] = balances.get(
+                str(instrument_id), Decimal("0")
+            ) + Decimal(str(balance))
+    return balances
+
+
+def _share_balance(value: object, instrument_id: str) -> Decimal | None:
+    holdings = getattr(value, "holdings", None)
+    if holdings is None and isinstance(value, Mapping):
+        holdings = value.get("positions", value.get("holdings", ()))
+    for holding in holdings or ():
+        if isinstance(holding, Mapping):
+            held_id = holding.get("instrumentId", holding.get("instrument_id"))
+            balance = holding.get("shareBalance", holding.get("share_balance"))
+        else:
+            held_id = getattr(holding, "instrument_id", None)
+            balance = getattr(holding, "share_balance", None)
+        if str(held_id) == instrument_id and balance is not None:
+            try:
+                return Decimal(str(balance))
+            except InvalidOperation:
+                return None
+    return None
 
 
 def _require_autonomous_rebalance(
@@ -598,7 +788,7 @@ def _build_tx_plan(
         if _store_completed(idempotency_store, leg_key):
             continue
 
-        responses: list[tuple[object, str]] = []
+        responses: list[tuple[object, str, float]] = []
         if trade.action == "sell":
             responses.append(
                 (
@@ -607,6 +797,7 @@ def _build_tx_plan(
                         _sell_body(address, positions, trade, config),
                     ),
                     leg_key,
+                    float(trade.usd),
                 )
             )
             # Proceeds land as USDC on the chain the position was held on.
@@ -650,6 +841,7 @@ def _build_tx_plan(
                             ),
                         ),
                         leg_key,
+                        wanted,
                     )
                 )
             else:
@@ -674,11 +866,12 @@ def _build_tx_plan(
                             f"{leg_key}:src:{chain_id}"
                             if len(sources) > 1
                             else leg_key,
+                            usd,
                         )
                     )
                     del source_index
 
-        for response, response_key in responses:
+        for response, response_key, operation_usd in responses:
             build_payloads.append(response)
             raw_steps = _raw_transactions(response)
             for step_index, raw_step in enumerate(raw_steps):
@@ -697,8 +890,14 @@ def _build_tx_plan(
                         instrument_id=trade.instrument_id,
                         step=step,
                         idempotency_key=step_key,
-                        usd=trade.usd,
+                        usd=operation_usd,
                         shares=trade.yield_token_amount,
+                        settlement_chain_id=(
+                            vaults_by_id[trade.instrument_id].chain_id
+                            if trade.action == "buy"
+                            and trade.instrument_id in vaults_by_id
+                            else _trade_chain(trade, positions, vaults_by_id)
+                        ),
                         action_type=trade.action,
                     )
                 )
@@ -847,10 +1046,17 @@ def _mark_leg_if_complete(
     ref: _StepRef,
     step_refs: Sequence[_StepRef],
     store: object | None,
+    require_attribution: bool = False,
 ) -> None:
     leg_refs = [item for item in step_refs if item.leg_index == ref.leg_index]
     if leg_refs and all(
-        _store_completed(store, item.idempotency_key) for item in leg_refs
+        _store_completed(store, item.idempotency_key)
+        and (
+            not require_attribution
+            or item.step.kind == "approve"
+            or _store_completed(store, f"{item.idempotency_key}:allocation-log")
+        )
+        for item in leg_refs
     ):
         _store_mark_completed(store, _leg_key(ref.leg_index, ref.instrument_id), True)
 

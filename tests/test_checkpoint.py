@@ -326,6 +326,7 @@ def test_a_quoted_price_is_kept_and_completes_the_dollar_amount(
 
 
 def test_a_price_is_derived_when_both_amounts_are_known(tmp_path: Path) -> None:
+    log_path = tmp_path / "log.jsonl"
     entry = write_allocation_log_entry(
         instrument_id="vault-a",
         chain_id=8453,
@@ -333,11 +334,12 @@ def test_a_price_is_derived_when_both_amounts_are_known(tmp_path: Path) -> None:
         tx_hash="0x1",
         usd=1050.0,
         shares="1000",
-        log_path=tmp_path / "log.jsonl",
+        log_path=log_path,
     )
 
     assert entry.basis == "derived"
     assert entry.share_price == "1.05"
+    assert read_allocation_log(log_path=log_path)[0].basis == "derived"
 
 
 def test_a_quoted_price_wins_over_the_derivable_one(tmp_path: Path) -> None:

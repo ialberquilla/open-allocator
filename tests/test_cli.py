@@ -474,6 +474,16 @@ class RebalanceOneTxClient:
             ]
         }
 
+    def positions(self, _body: dict[str, object]) -> dict[str, Any]:
+        return {
+            "positions": [
+                {
+                    "instrumentId": "vault-b",
+                    "shareBalance": "50.000000",
+                }
+            ]
+        }
+
 
 class WithdrawOneTxClient:
     instances: list["WithdrawOneTxClient"] = []
@@ -1555,7 +1565,7 @@ def test_rebalance_with_confirm_broadcasts_sell_before_buy(
         ],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, (result.stdout, result.stderr, result.exception)
     payload = parse_single_stdout_object(result.stdout)
     assert payload["status"] == "success"
     assert [step["status"] for step in payload["steps"]] == ["sent", "sent"]

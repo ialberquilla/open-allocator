@@ -5,8 +5,14 @@ from typing import Any
 
 import pytest
 
+from open_allocator.core.checkpoint import (
+    AllocationLogEntry,
+    Checkpoint,
+    read_allocation_log,
+)
 from open_allocator.core.positions import IdleBalance, PositionHolding, Positions
 from open_allocator.core.rebalance import RebalancePolicyError, plan_rebalance
+from open_allocator.core.state import CheckpointExists, CheckpointNotFound
 from open_allocator.core.types import (
     Allocation,
     AllocationLeg,
@@ -190,6 +196,73 @@ class Config:
     paymaster_reserve_usd: float = 0.0
 
 
+class MemoryStateBackend:
+    def __init__(self) -> None:
+        self.checkpoints: dict[str, Checkpoint] = {}
+        self.log: list[AllocationLogEntry] = []
+        self.completed: dict[tuple[str, str], Any] = {}
+
+    def write_checkpoint(self, checkpoint: Checkpoint) -> None:
+        if checkpoint.id in self.checkpoints:
+            raise CheckpointExists(checkpoint.id)
+        self.checkpoints[checkpoint.id] = checkpoint
+
+    def read_checkpoint(self, checkpoint_id: str) -> Checkpoint:
+        try:
+            return self.checkpoints[checkpoint_id]
+        except KeyError as error:
+            raise CheckpointNotFound(checkpoint_id) from error
+
+    def append_allocation_log_entry(self, entry: AllocationLogEntry) -> None:
+        self.log.append(entry)
+
+    def read_allocation_log(self) -> tuple[AllocationLogEntry, ...]:
+        return tuple(self.log)
+
+    def is_completed(self, scope: str, key: str) -> bool:
+        return (scope, key) in self.completed
+
+    def mark_completed(self, scope: str, key: str, value: Any = None) -> None:
+        self.completed[(scope, key)] = value
+
+    def completed_value(self, scope: str, key: str) -> Any:
+        return self.completed.get((scope, key))
+
+
+@dataclass(frozen=True)
+class StateConfig(Config):
+    state_backend: object = field(default_factory=MemoryStateBackend)
+    position_settlement_attempts: int = 1
+
+
+@dataclass
+class PositionAwareClient(MockRebalanceClient):
+    observed_shares: list[str | None] = field(default_factory=list)
+
+    def positions(self, _body: dict[str, object]) -> dict[str, Any]:
+        value = self.observed_shares.pop(0)
+        if value is None:
+            return {"positions": []}
+        return {
+            "positions": [
+                {
+                    "instrumentId": "vault-b",
+                    "protocol": "aave",
+                    "symbol": "USDC",
+                    "balance": value,
+                    "balanceRaw": value.replace(".", ""),
+                    "decimals": 6,
+                    "usdValue": value,
+                    "shareBalance": value,
+                    "shareBalanceRaw": value.replace(".", ""),
+                    "shareDecimals": 6,
+                    "yieldTokenSymbol": "aUSDC",
+                    "yieldTokenAddress": "0x0000000000000000000000000000000000000002",
+                }
+            ]
+        }
+
+
 def response(data: str, *, type_: str | None = None) -> dict[str, Any]:
     transaction: dict[str, object] = {
         "to": "0x0000000000000000000000000000000000000002",
@@ -200,6 +273,112 @@ def response(data: str, *, type_: str | None = None) -> dict[str, Any]:
     if type_ is not None:
         transaction["type"] = type_
     return {"transactions": [transaction]}
+
+
+def test_confirmed_buy_persists_the_settled_share_boundary() -> None:
+    backend = MemoryStateBackend()
+    config = StateConfig(state_backend=backend)
+    client = PositionAwareClient([], [response("0xbuy")], observed_shares=["9.5"])
+
+    report = execute_rebalance(
+        client,
+        MockSigner(),
+        positions_snapshot(holding("vault-a", "90"), idle_usdc="10"),
+        allocation(("vault-a", 0.9), ("vault-b", 0.1)),
+        policy(),
+        confirm=True,
+        known_instruments=known("vault-a", "vault-b"),
+        config=config,
+        idempotency_store={},
+    )
+
+    entries = read_allocation_log(backend=backend)
+    assert report.status == "success"
+    assert len(entries) == 1
+    assert entries[0].usd == 10
+    assert entries[0].shares == "9.5"
+    assert entries[0].share_price == "1.05263157894736842"
+    assert entries[0].basis == "derived"
+    assert entries[0].tx_hash == f"0x{1:064x}"
+
+
+def test_confirmed_top_up_logs_only_the_new_shares() -> None:
+    backend = MemoryStateBackend()
+    client = PositionAwareClient([], [response("0xbuy")], observed_shares=["49.5"])
+    execute_rebalance(
+        client,
+        MockSigner(),
+        positions_snapshot(
+            holding("vault-a", "50"), holding("vault-b", "40"), idle_usdc="10"
+        ),
+        allocation(("vault-a", 0.5), ("vault-b", 0.5)),
+        policy(),
+        confirm=True,
+        known_instruments=known("vault-a", "vault-b"),
+        config=StateConfig(state_backend=backend),
+        idempotency_store={},
+    )
+
+    assert read_allocation_log(backend=backend)[0].shares == "9.5"
+
+
+def test_confirmed_buy_with_stale_positions_remains_unattributed() -> None:
+    backend = MemoryStateBackend()
+    client = PositionAwareClient([], [response("0xbuy")], observed_shares=[None])
+    report = execute_rebalance(
+        client,
+        MockSigner(),
+        positions_snapshot(holding("vault-a", "90"), idle_usdc="10"),
+        allocation(("vault-a", 0.9), ("vault-b", 0.1)),
+        policy(),
+        confirm=True,
+        known_instruments=known("vault-a", "vault-b"),
+        config=StateConfig(state_backend=backend),
+        idempotency_store={},
+    )
+
+    assert report.status == "in_progress"
+    assert read_allocation_log(backend=backend) == ()
+    assert any("cost basis" in message for message in report.messages)
+
+
+def test_retry_attributes_a_confirmed_buy_without_rebroadcasting() -> None:
+    backend = MemoryStateBackend()
+    config = StateConfig(state_backend=backend)
+    store: dict[str, object] = {}
+    current = positions_snapshot(holding("vault-a", "90"), idle_usdc="10")
+    target = allocation(("vault-a", 0.9), ("vault-b", 0.1))
+
+    first_signer = MockSigner()
+    first = execute_rebalance(
+        PositionAwareClient([], [response("0xbuy")], observed_shares=[None]),
+        first_signer,
+        current,
+        target,
+        policy(),
+        confirm=True,
+        known_instruments=known("vault-a", "vault-b"),
+        config=config,
+        idempotency_store=store,
+    )
+    second_signer = MockSigner()
+    second = execute_rebalance(
+        PositionAwareClient([], [response("0xbuy-retry")], observed_shares=["9.5"]),
+        second_signer,
+        current,
+        target,
+        policy(),
+        confirm=True,
+        known_instruments=known("vault-a", "vault-b"),
+        config=config,
+        idempotency_store=store,
+    )
+
+    assert first.status == "in_progress"
+    assert second.status == "success"
+    assert len(first_signer.sent) == 1
+    assert second_signer.sent == []
+    assert len(read_allocation_log(backend=backend)) == 1
 
 
 def test_plan_rebalance_executes_only_changed_legs_and_skips_dust() -> None:
@@ -588,6 +767,48 @@ def test_split_buy_ops_get_distinct_idempotency_keys() -> None:
 
     buy_keys = [key for key in store if "src" in str(key)]
     assert len(buy_keys) == len(set(buy_keys)) == 2
+
+
+def test_split_buy_ops_log_their_own_share_deltas_and_usd() -> None:
+    class SettlingSplitClient(BalanceAwareClient):
+        settled = iter(("4", "10"))
+
+        def positions(self, body: dict[str, object]) -> dict[str, Any]:
+            assert body["chainId"] == 10, "read the destination, not funding chain"
+            shares = next(self.settled)
+            return {"positions": [{"instrumentId": "vault-c", "shareBalance": shares}]}
+
+    backend = MemoryStateBackend()
+    current = bare_positions(
+        chain_holding("vault-a", "50", 8453),
+        chain_holding("vault-b", "50", 42161),
+    )
+    client = SettlingSplitClient(
+        [response("0xsell-a"), response("0xsell-b")],
+        [response("0xbuy-1"), response("0xbuy-2")],
+        idle={},
+        sell_credits={"vault-a": (8453, 10.0), "vault-b": (42161, 10.0)},
+    )
+
+    execute_rebalance(
+        client,
+        MockSigner(),
+        current,
+        allocation(("vault-a", 0.4), ("vault-b", 0.4), ("vault-c", 0.2)),
+        policy(autonomous_rebalance=True),
+        known_instruments=[
+            chain_vault("vault-a", 8453),
+            chain_vault("vault-b", 42161),
+            chain_vault("vault-c", 10),
+        ],
+        config=StateConfig(state_backend=backend),
+        idempotency_store={},
+        confirm=True,
+    )
+
+    buys = [entry for entry in backend.log if entry.action_type == "buy"]
+    assert [(entry.usd, entry.shares) for entry in buys] == [(10.0, "4"), (10.0, "6")]
+    assert all(entry.basis == "derived" for entry in buys)
 
 
 def test_a_buy_too_big_for_one_round_comes_back_for_the_remainder() -> None:
