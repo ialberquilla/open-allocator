@@ -382,6 +382,28 @@ def pending_receipt_messages(
     return tuple(messages)
 
 
+def _safe_rpc_chains_without_service(
+    config: object | None,
+    chain_ids: Sequence[int],
+) -> tuple[int, ...]:
+    """Plan chains a Safe could not propose on. Empty for every other signer."""
+    if config is None:
+        return ()
+    if getattr(config, "account", None) != "safe":
+        return ()
+    if getattr(config, "submission", None) != "rpc":
+        return ()
+
+    named = getattr(config, "safe_chain_id", None)
+    explicit = getattr(config, "safe_transaction_service_url", None)
+    return tuple(
+        chain_id
+        for chain_id in chain_ids
+        if chains.safe_tx_service_url(chain_id) is None
+        and not (explicit and (named is None or int(named) == chain_id))
+    )
+
+
 def submit_steps(signer: object, refs: Sequence[Any], rpc_url: str) -> Receipt:
     steps = [ref.step for ref in refs]
     if len(steps) == 1:
@@ -812,6 +834,24 @@ def _preflight(
                 )
             )
         return rpc_urls, tuple(checks)
+
+    # A Safe proposing over RPC needs a Transaction Service per chain the plan
+    # touches. Checked here, against the real chain ids, because config cannot
+    # know them: the alternative is discovering it mid-execution, after earlier
+    # chains have already been proposed.
+    for chain_id in _safe_rpc_chains_without_service(config, chain_ids):
+        checks.append(
+            GasCheck(
+                chain_id=chain_id,
+                ok=False,
+                message=(
+                    f"no Safe Transaction Service for "
+                    f"{chains.chain_name(chain_id)} (chain {chain_id}); "
+                    f"set SAFE_TRANSACTION_SERVICE_URL with "
+                    f"SAFE_CHAIN_ID={chain_id}, or drop the chain from the plan"
+                ),
+            )
+        )
 
     for chain_id in chain_ids:
         try:

@@ -636,11 +636,10 @@ def _safe_address_payload(chain_ids: tuple[int, ...] | None) -> JsonObject:
     if config.account != "safe":
         raise ValueError("safe-address requires SIGNER_ACCOUNT=safe")
 
-    targets = chain_ids or (
-        (config.safe_chain_id,) if config.safe_chain_id is not None else ()
-    )
-    if not targets:
-        raise ValueError("no chain to report; pass --chain or set SAFE_CHAIN_ID")
+    # No chain is configured in the common case, so fall back to the one the
+    # address would be derived from. The address is the same everywhere; the
+    # chain only decides who answers the eth_call.
+    targets = chain_ids or (safe_deployment.derivation_chain_id(config),)
 
     seed = _safe_seed_from_config(config)
     predicted: str | None = config.safe_address
@@ -1046,7 +1045,7 @@ def safe_address(
         list[int] | None,
         typer.Option(
             "--chain",
-            help="Chain to report; repeatable. Defaults to SAFE_CHAIN_ID.",
+            help="Chain to report; repeatable. Defaults to the derivation chain.",
         ),
     ] = None,
 ) -> JsonObject:

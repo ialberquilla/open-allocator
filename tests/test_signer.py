@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -20,6 +21,7 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
+from open_allocator.exec import chains
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
     PaymasterConfigurationError,
@@ -310,6 +312,75 @@ def test_safe_signer_collects_signatures_then_executes_after_threshold() -> None
     assert receipt.pending is False
     assert receipt.execution_status == "safe_executed"
     assert adapter.executed == [proposal_receipt.safe_tx_hash]
+
+
+def test_a_safe_proposes_each_chain_to_its_own_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from open_allocator.exec import safe_signer as safe_signer_module
+
+    built: list[tuple[str, int, str]] = []
+
+    class RecordingAdapter(MockSafeTransactionServiceAdapter):
+        def __init__(self, *, safe_address: str, chain_id: int, **kwargs: Any) -> None:
+            built.append((safe_address, chain_id, kwargs["transaction_service_url"]))
+            super().__init__(safe_address=safe_address, safe_chain_id=chain_id)
+
+    monkeypatch.setattr(
+        safe_signer_module,
+        "SafeEthPyTransactionServiceAdapter",
+        RecordingAdapter,
+    )
+    monkeypatch.setattr(
+        safe_signer_module,
+        "safe_address_from_config",
+        lambda config: SAFE_ADDRESS,
+    )
+
+    config = SimpleNamespace(
+        safe_address=SAFE_ADDRESS,
+        safe_chain_id=None,
+        safe_transaction_service_url=None,
+        safe_proposer_address=None,
+        safe_proposer_credential=None,
+    )
+    signer = SafeSigner(config=config)
+
+    for chain_id in (8453, 42161, 8453):
+        signer.send(
+            TxStep(
+                to="0x00000000000000000000000000000000000000bb",
+                data="0x1234abcd",
+                value=1,
+                chain_id=chain_id,
+                kind="buy",
+            ),
+            f"rpc://{chain_id}",
+        )
+
+    # One adapter per distinct chain, each pointed at that chain's service, and
+    # the same Safe address throughout — the address does not vary by chain, so
+    # a second visit to a chain reuses the adapter rather than re-deriving it.
+    assert [chain_id for _, chain_id, _ in built] == [8453, 42161]
+    assert {address for address, _, _ in built} == {SAFE_ADDRESS}
+    assert [url for _, _, url in built] == [
+        chains.safe_tx_service_url(8453),
+        chains.safe_tx_service_url(42161),
+    ]
+
+
+def test_an_explicit_service_url_answers_only_for_its_own_chain() -> None:
+    from open_allocator.exec.safe_signer import _transaction_service_url
+
+    config = SimpleNamespace(
+        safe_chain_id=8453,
+        safe_transaction_service_url="https://self-hosted.example/tx",
+    )
+
+    # Pinning the override to its chain is what stops an Arbitrum step being
+    # proposed to the Base service on a plan that spans both.
+    assert _transaction_service_url(config, 8453) == "https://self-hosted.example/tx"
+    assert _transaction_service_url(config, 42161) == chains.safe_tx_service_url(42161)
 
 
 def test_safe_guard_rejects_tx_outside_policy() -> None:

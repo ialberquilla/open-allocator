@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from eth_abi import encode as abi_encode
@@ -124,6 +125,26 @@ class SafeDeployment:
     address: str
     chain_id: int
     deployed: bool
+
+
+def derivation_chain_id(config: object) -> int:
+    """A chain to read the proxy factory from when none was named.
+
+    The derived address is identical on every chain, so this picks only which
+    RPC answers one eth_call, not where the Safe lives. An explicitly named
+    chain wins; then a chain the caller configured an RPC for, since that is
+    the endpoint they trust and pay for; then Ethereum, where the canonical
+    factory is deployed.
+    """
+    named = getattr(config, "safe_chain_id", None)
+    if named is not None:
+        return int(named)
+
+    overrides = getattr(config, "_rpc_overrides", None)
+    if isinstance(overrides, Mapping) and overrides:
+        return min(int(chain_id) for chain_id in overrides)
+
+    return chains.DEFAULT_SAFE_DERIVATION_CHAIN_ID
 
 
 def enable_modules_calldata(modules: tuple[str, ...]) -> bytes:

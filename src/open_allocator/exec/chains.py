@@ -92,6 +92,48 @@ USDC_ADDRESSES: Mapping[int, str] = {
 }
 
 
+# The Safe Transaction Service is one endpoint per chain: proposing a Safe
+# transaction needs the row for the chain it is proposed on, and there is no
+# multi-chain endpoint to fall back to. Read from Safe's own chain config
+# (safe-config.safe.global), which is why these are the current
+# api.safe.global/tx-service/<shortName> form rather than the retired
+# safe-transaction-<network>.safe.global hosts — those now answer 308.
+#
+# Only chains Safe actually runs a service for have a row. A chain missing here
+# cannot be proposed to unless SAFE_TRANSACTION_SERVICE_URL names one, which is
+# what execute's preflight checks against the chains a plan actually touches.
+# Of the chains above, Fantom, Polygon zkEVM, Soneium, Mode and Blast have none.
+SAFE_TX_SERVICES: Mapping[int, str] = {
+    1: "https://api.safe.global/tx-service/eth",
+    10: "https://api.safe.global/tx-service/oeth",
+    56: "https://api.safe.global/tx-service/bnb",
+    100: "https://api.safe.global/tx-service/gno",
+    130: "https://api.safe.global/tx-service/unichain",
+    137: "https://api.safe.global/tx-service/pol",
+    143: "https://api.safe.global/tx-service/monad",
+    146: "https://api.safe.global/tx-service/sonic",
+    324: "https://api.safe.global/tx-service/zksync",
+    480: "https://api.safe.global/tx-service/wc",
+    5000: "https://api.safe.global/tx-service/mantle",
+    8453: "https://api.safe.global/tx-service/base",
+    42161: "https://api.safe.global/tx-service/arb1",
+    42220: "https://api.safe.global/tx-service/celo",
+    43114: "https://api.safe.global/tx-service/avax",
+    57073: "https://api.safe.global/tx-service/ink",
+    59144: "https://api.safe.global/tx-service/linea",
+    80094: "https://api.safe.global/tx-service/berachain",
+    534352: "https://api.safe.global/tx-service/scr",
+}
+
+# Which chain to read the Safe proxy factory from when deriving an address and
+# no chain was named. The derived address does not depend on it — the seed is
+# the whole preimage — so this only decides which RPC answers one eth_call, and
+# Ethereum is the chain likeliest to have the canonical factory deployed. A
+# configured RPC override is preferred over it; see
+# safe_deployment.derivation_chain_id.
+DEFAULT_SAFE_DERIVATION_CHAIN_ID = 1
+
+
 class MissingRPCError(RuntimeError):
     def __init__(self, chain_id: int) -> None:
         self.chain_id = chain_id
@@ -121,6 +163,11 @@ def usdc_address(chain_id: int, config: object | None = None) -> str | None:
     if override is not None:
         return override
     return USDC_ADDRESSES.get(chain_id)
+
+
+def safe_tx_service_url(chain_id: int) -> str | None:
+    """The Safe Transaction Service for this chain, or None if Safe runs none."""
+    return SAFE_TX_SERVICES.get(chain_id)
 
 
 def chain_name(chain_id: int) -> str:

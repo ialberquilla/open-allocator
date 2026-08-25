@@ -433,7 +433,14 @@ def pimlico_adapter_from_config(config: object) -> PimlicoUserOperationAdapter:
         api_key=_secret(getattr(config, "pimlico_api_key", None)) or "",
         owner_keys=_owner_keys(config),
         seed=seed,
-        account_address=getattr(config, "paymaster_account_address", None),
+        # SAFE_ADDRESS answers here too: with SIGNER_ACCOUNT=safe the Safe is
+        # the smart account, so an adopted Safe should not have to be named
+        # twice. Only reached when there is no seed — a seed derives the sender
+        # itself, and per chain, which an adopted address cannot do.
+        account_address=(
+            getattr(config, "paymaster_account_address", None)
+            or getattr(config, "safe_address", None)
+        ),
         fee_tier=getattr(config, "paymaster_fee_tier", None) or DEFAULT_FEE_TIER,
         config=config,
     )

@@ -337,6 +337,34 @@ def test_gas_preflight_failure_aborts_before_sends() -> None:
     assert signer.sent == []
 
 
+def test_a_safe_cannot_propose_on_a_chain_with_no_service() -> None:
+    # Blast is depositable but Safe runs no Transaction Service for it, so the
+    # plan has to be refused before anything is proposed — on a multi-chain
+    # plan, failing at the step itself would leave earlier chains proposed.
+    @dataclass(frozen=True)
+    class SafeRpcConfig(Config):
+        account: str = "safe"
+        submission: str = "rpc"
+        safe_chain_id: int | None = None
+        safe_transaction_service_url: str | None = None
+
+    client = MockOneTxClient([buy_response(tx(2, "0x", chain_id=81457))])
+    signer = MockSigner()
+
+    with pytest.raises(GasPreflightError, match="no Safe Transaction Service"):
+        execute_allocation(
+            client,
+            signer,
+            allocation("blast-vault"),
+            permissive_policy(),
+            confirm=True,
+            known_instruments=[vault("blast-vault", chain_id=81457)],
+            config=SafeRpcConfig(_rpc_overrides={81457: "rpc://blast"}),
+        )
+
+    assert signer.sent == []
+
+
 def test_missing_rpc_fails_preflight_before_sends() -> None:
     client = MockOneTxClient([buy_response(tx(2, "0x", chain_id=999999))])
     signer = MockSigner()
