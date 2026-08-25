@@ -10,6 +10,7 @@ This is the operating contract for agents and humans working in this repository.
 - Never hardcode protocol, chain, or instrument universes; discover from 1Tx and narrow by policy.
 - Do not sign, broadcast, rebalance, or withdraw without first announcing the exact action and obtaining the required confirmation.
 - Frame APY as descriptive, not predictive.
+- Never hand-derive a policy. A model-authored policy is legitimate only as a mandate: derive it per [skills/mandate.md](src/open_allocator/skills/mandate.md), give every moved knob a `because` naming the measurement, and gate it through `validate-mandate` against the baseline. A derived policy may only narrow.
 - Never split a chain's plan steps into separate smart-account operations; they are batched deliberately (see [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) safety invariants).
 
 ## Command Inventory
@@ -41,7 +42,10 @@ Every command must print one JSON object to stdout. Errors must print one JSON o
 
 Use this loop for deposits and new books.
 
-1. Load policy and signer configuration.
+1. Load policy and signer configuration. If a mandate governs the book, run
+   `drift` **first** — it is the daily gate, and if `drifted` is false, stop here
+   rather than running anything expensive. It reports drift when a check cannot
+   be run, so a `false` is a real answer.
 2. Run `wallet-status` and check wallet address, USDC, and gas readiness per chain.
    Each row names the gas model it was judged under in `gas_mode`: `native` reports a
    native balance, `usdc_paymaster` reports none to hold — gas is paid in USDC by the
@@ -77,7 +81,7 @@ not say, ask, or build more than one and present the measured difference.
 | --- | --- | --- |
 | Highest scored yield | `score_weighted` (default) | — |
 | Most independent book | `decorrelated` | `top_n`, `unknown_correlation` |
-| A declared risk budget | `sleeves` / `ladder` | `tiers` |
+| A declared risk budget | `sleeves` / `ladder` | `tiers` — **what a mandate derives into** |
 | No opinion | `equal_weight` | — |
 | Volatility-balanced | `risk_parity` / `inverse_vol` | — |
 | Core plus bets | `core_satellite` | `core_weight`, `core_count`, `core_selector`, `satellite_selector` |

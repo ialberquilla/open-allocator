@@ -13,7 +13,7 @@ Use this stage to inspect deterministic vault scores from `open_allocator.core.s
 ## Quality Bar
 
 - Every proposed instrument has a current score artifact.
-- Reward dependence, liquidity, TVL, LLTV, APY stability, and unknown factors are called out when present.
+- Reward dependence, liquidity, TVL, APY stability, oracle, fee, curator, market concentration, collateral mix, and unknown factors are called out when present.
 - APY is framed as a current/descriptive input, not a forecast.
 - Low scores or unknown critical fields are surfaced; do not hide them by averaging prose.
 
