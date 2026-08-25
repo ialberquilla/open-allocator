@@ -410,22 +410,16 @@ class AllocatorConfig(BaseSettings):
                     )
                 for owner in self.safe_owners:
                     _validate_address(owner, "SAFE_OWNERS")
-            # No chain is required on either path. A Safe is at the same
-            # address on every chain, and both paths now resolve per chain from
-            # the plan: the paymaster path from the bundler, the rpc path from
-            # one Transaction Service per chain. SAFE_CHAIN_ID survives as a
-            # narrowing hint — it says which chain an explicit
-            # SAFE_TRANSACTION_SERVICE_URL belongs to, and which chain to
-            # derive the address against.
+            # An explicit URL makes the registry irrelevant. Without one, a
+            # named chain can be checked against it here; an unnamed one cannot,
+            # because which chains a plan touches is unknown until there is a
+            # plan — execute's preflight makes the same check against real ids.
             if self.safe_transaction_service_url is not None:
                 _validate_http_url(
                     self.safe_transaction_service_url,
                     "SAFE_TRANSACTION_SERVICE_URL",
                 )
             elif self.safe_chain_id is not None and self.submission == "rpc":
-                # Only checkable when a chain is named. Otherwise the chains a
-                # plan touches are unknown until there is a plan, so execute's
-                # preflight makes the same check against real chain ids.
                 if chains.safe_tx_service_url(int(self.safe_chain_id)) is None:
                     raise ValueError(
                         f"no Safe Transaction Service is known for "

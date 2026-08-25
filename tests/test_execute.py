@@ -338,9 +338,9 @@ def test_gas_preflight_failure_aborts_before_sends() -> None:
 
 
 def test_a_safe_cannot_propose_on_a_chain_with_no_service() -> None:
-    # Blast is depositable but Safe runs no Transaction Service for it. The old
-    # single-adapter signer only discovered this when the step was sent, which
-    # on a multi-chain plan is after earlier chains have already been proposed.
+    # Blast is depositable but Safe runs no Transaction Service for it, so the
+    # plan has to be refused before anything is proposed — on a multi-chain
+    # plan, failing at the step itself would leave earlier chains proposed.
     @dataclass(frozen=True)
     class SafeRpcConfig(Config):
         account: str = "safe"

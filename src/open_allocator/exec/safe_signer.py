@@ -128,8 +128,7 @@ class SafeSigner:
         # One adapter per chain, built on demand. The Safe is at the same
         # address everywhere, but the Transaction Service that carries the
         # propose -> co-sign -> execute flow is one endpoint per chain, so a
-        # plan that touches three chains proposes to three services. Holding a
-        # single adapter was what made this path single-chain.
+        # plan that touches three chains proposes to three services.
         self._pinned = adapter
         self._config = config
         self._adapters: dict[int, SafeTransactionServiceAdapter] = {}
@@ -149,7 +148,7 @@ class SafeSigner:
         adapter = self._adapter_for(tx.chain_id)
         # Only reachable for an adapter injected by the caller, which is pinned
         # to its chain by construction. A config-built signer resolves the
-        # right service for the step's chain instead of rejecting it.
+        # service for the step's own chain.
         if tx.chain_id != adapter.chain_id():
             raise SafeSignerError(
                 f"tx chain_id {tx.chain_id} does not match Safe chain_id "

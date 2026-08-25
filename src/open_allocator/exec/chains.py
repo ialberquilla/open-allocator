@@ -101,7 +101,7 @@ USDC_ADDRESSES: Mapping[int, str] = {
 #
 # Only chains Safe actually runs a service for have a row. A chain missing here
 # cannot be proposed to unless SAFE_TRANSACTION_SERVICE_URL names one, which is
-# why config requires that variable exactly when the lookup comes back empty.
+# what execute's preflight checks against the chains a plan actually touches.
 # Of the chains above, Fantom, Polygon zkEVM, Soneium, Mode and Blast have none.
 SAFE_TX_SERVICES: Mapping[int, str] = {
     1: "https://api.safe.global/tx-service/eth",
@@ -129,7 +129,8 @@ SAFE_TX_SERVICES: Mapping[int, str] = {
 # no chain was named. The derived address does not depend on it — the seed is
 # the whole preimage — so this only decides which RPC answers one eth_call, and
 # Ethereum is the chain likeliest to have the canonical factory deployed. A
-# configured RPC override is preferred over it; see safe_signer.
+# configured RPC override is preferred over it; see
+# safe_deployment.derivation_chain_id.
 DEFAULT_SAFE_DERIVATION_CHAIN_ID = 1
 
 
