@@ -410,23 +410,40 @@ class AllocatorConfig(BaseSettings):
                     )
                 for owner in self.safe_owners:
                     _validate_address(owner, "SAFE_OWNERS")
-            if self.submission == "rpc":
-                _require_axis_value(
-                    self.safe_transaction_service_url,
-                    "SAFE_TRANSACTION_SERVICE_URL",
-                    "SIGNER_ACCOUNT=safe with SIGNER_SUBMISSION=rpc",
-                )
+            # No chain is required on either path. A Safe is at the same
+            # address on every chain, and both paths now resolve per chain from
+            # the plan: the paymaster path from the bundler, the rpc path from
+            # one Transaction Service per chain. SAFE_CHAIN_ID survives as a
+            # narrowing hint — it says which chain an explicit
+            # SAFE_TRANSACTION_SERVICE_URL belongs to, and which chain to
+            # derive the address against.
+            if self.safe_transaction_service_url is not None:
                 _validate_http_url(
                     self.safe_transaction_service_url,
                     "SAFE_TRANSACTION_SERVICE_URL",
                 )
-            _require_axis_value(
-                self.safe_chain_id,
-                "SAFE_CHAIN_ID",
-                "SIGNER_ACCOUNT=safe",
-            )
+            elif self.safe_chain_id is not None and self.submission == "rpc":
+                # Only checkable when a chain is named. Otherwise the chains a
+                # plan touches are unknown until there is a plan, so execute's
+                # preflight makes the same check against real chain ids.
+                if chains.safe_tx_service_url(int(self.safe_chain_id)) is None:
+                    raise ValueError(
+                        f"no Safe Transaction Service is known for "
+                        f"{chains.chain_name(int(self.safe_chain_id))} "
+                        f"(chain {self.safe_chain_id}); set "
+                        f"SAFE_TRANSACTION_SERVICE_URL explicitly"
+                    )
             if self.safe_address is not None:
                 _validate_address(self.safe_address, "SAFE_ADDRESS")
+                # With SIGNER_ACCOUNT=safe the Safe *is* the smart account, so
+                # an adopted Safe answers for PAYMASTER_ACCOUNT_ADDRESS too.
+                # Filling it here rather than making the user repeat the
+                # address keeps the two from ever naming different accounts.
+                if (
+                    self.submission == "erc4337-paymaster"
+                    and self.paymaster_account_address is None
+                ):
+                    self.paymaster_account_address = self.safe_address
             if self.safe_proposer_address is not None:
                 _validate_address(self.safe_proposer_address, "SAFE_PROPOSER_ADDRESS")
 

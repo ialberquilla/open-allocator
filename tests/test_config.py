@@ -3,6 +3,7 @@ import os
 import pytest
 from pydantic import ValidationError
 
+from open_allocator.exec import chains
 from open_allocator.exec.chains import DEFAULT_RPC_URLS
 from open_allocator.exec.config import AllocatorConfig
 
@@ -248,10 +249,7 @@ def test_remote_signer_config_validates_url(
     assert "REMOTE_SIGNER_URL" in str(error.value)
 
 
-@pytest.mark.parametrize(
-    "missing",
-    ["SAFE_ADDRESS", "SAFE_TRANSACTION_SERVICE_URL", "SAFE_CHAIN_ID"],
-)
+@pytest.mark.parametrize("missing", ["SAFE_ADDRESS"])
 def test_safe_signer_config_requires_safe_fields(
     monkeypatch: pytest.MonkeyPatch,
     missing: str,
@@ -264,6 +262,94 @@ def test_safe_signer_config_requires_safe_fields(
         AllocatorConfig()
 
     assert missing in str(error.value)
+
+
+def test_proposing_over_rpc_needs_no_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_safe_env(monkeypatch)
+    monkeypatch.delenv("ONE_TX_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("SAFE_TRANSACTION_SERVICE_URL")
+    monkeypatch.delenv("SAFE_CHAIN_ID")
+
+    # The Safe is at the same address on every chain, and the signer resolves
+    # one Transaction Service per chain the plan touches, so naming a single
+    # chain up front would only narrow what the Safe can already do.
+    config = AllocatorConfig()
+
+    assert config.safe_chain_id is None
+    assert config.safe_transaction_service_url is None
+
+
+def test_the_transaction_service_is_looked_up_from_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_safe_env(monkeypatch)
+    monkeypatch.delenv("ONE_TX_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("SAFE_TRANSACTION_SERVICE_URL")
+
+    # Safe runs one service per chain, so the URL is derivable from the chain
+    # already named. Asking for both invites a pair that disagree, and a
+    # proposal sent to the wrong chain's service is not a legible failure.
+    config = AllocatorConfig()
+
+    assert config.safe_chain_id == 8453
+    assert chains.safe_tx_service_url(8453) is not None
+
+
+def test_a_chain_with_no_transaction_service_still_needs_the_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_safe_env(monkeypatch)
+    monkeypatch.delenv("ONE_TX_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("SAFE_TRANSACTION_SERVICE_URL")
+    # Blast is scorable and depositable but Safe runs no service for it.
+    monkeypatch.setenv("SAFE_CHAIN_ID", "81457")
+
+    with pytest.raises(ValidationError) as error:
+        AllocatorConfig()
+
+    assert "SAFE_TRANSACTION_SERVICE_URL" in str(error.value)
+    assert chains.safe_tx_service_url(81457) is None
+
+
+def test_a_safe_paying_gas_in_usdc_needs_no_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_safe_env(monkeypatch)
+    set_valid_paymaster_env(monkeypatch)
+    monkeypatch.delenv("ONE_TX_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("SIGNER_MODE", raising=False)
+    monkeypatch.setenv("SIGNER_ACCOUNT", "safe")
+    monkeypatch.setenv("SIGNER_SUBMISSION", "erc4337-paymaster")
+    monkeypatch.setenv("SIGNER_OWNER", "local")
+    monkeypatch.delenv("SAFE_TRANSACTION_SERVICE_URL")
+    monkeypatch.delenv("SAFE_CHAIN_ID")
+
+    # A Safe is at one address on every chain and this path resolves it per
+    # chain from the plan, so a single configured chain would never be read.
+    config = AllocatorConfig()
+
+    assert config.safe_chain_id is None
+
+
+def test_an_adopted_safe_is_the_paymaster_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_safe_env(monkeypatch)
+    set_valid_paymaster_env(monkeypatch)
+    monkeypatch.delenv("ONE_TX_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("SIGNER_MODE", raising=False)
+    monkeypatch.setenv("SIGNER_ACCOUNT", "safe")
+    monkeypatch.setenv("SIGNER_SUBMISSION", "erc4337-paymaster")
+    monkeypatch.setenv("SIGNER_OWNER", "local")
+    monkeypatch.delenv("PAYMASTER_ACCOUNT_ADDRESS", raising=False)
+
+    # With SIGNER_ACCOUNT=safe the Safe *is* the smart account. Repeating the
+    # address under a second name is what lets the two drift apart.
+    config = AllocatorConfig()
+
+    assert config.paymaster_account_address == config.safe_address
 
 
 def test_a_safe_paying_gas_in_usdc_needs_no_transaction_service(

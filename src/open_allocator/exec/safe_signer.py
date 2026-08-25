@@ -125,22 +125,31 @@ class SafeSigner:
         adapter: SafeTransactionServiceAdapter | None = None,
         guard: SafeGuardPolicy | None = None,
     ) -> None:
-        self._adapter = adapter or (
-            _adapter_from_config(config) if config is not None else None
-        )
+        # One adapter per chain, built on demand. The Safe is at the same
+        # address everywhere, but the Transaction Service that carries the
+        # propose -> co-sign -> execute flow is one endpoint per chain, so a
+        # plan that touches three chains proposes to three services. Holding a
+        # single adapter was what made this path single-chain.
+        self._pinned = adapter
+        self._config = config
+        self._adapters: dict[int, SafeTransactionServiceAdapter] = {}
+        self._address: str | None = None
         self._guard = guard
         self._proposer = _proposer_from_config(config)
 
     def __repr__(self) -> str:
-        if self._adapter is None:
+        if self._pinned is None and self._config is None:
             return "SafeSigner(status=<unconfigured>)"
         return "SafeSigner(status=configured)"
 
     def address(self) -> str:
-        return self._require_adapter().address()
+        return self._adapter_for(None).address()
 
     def send(self, tx: TxStep, rpc_url: str) -> Receipt:
-        adapter = self._require_adapter()
+        adapter = self._adapter_for(tx.chain_id)
+        # Only reachable for an adapter injected by the caller, which is pinned
+        # to its chain by construction. A config-built signer resolves the
+        # right service for the step's chain instead of rejecting it.
         if tx.chain_id != adapter.chain_id():
             raise SafeSignerError(
                 f"tx chain_id {tx.chain_id} does not match Safe chain_id "
@@ -170,14 +179,14 @@ class SafeSigner:
         signer_address: str,
         signature: str | None = None,
     ) -> SafeProposal:
-        return self._require_adapter().submit_confirmation(
+        return self._adapter_for(None).submit_confirmation(
             safe_tx_hash,
             signer_address=signer_address,
             signature=signature,
         )
 
     def execute(self, safe_tx_hash: str, rpc_url: str) -> Receipt:
-        adapter = self._require_adapter()
+        adapter = self._adapter_for(None)
         proposal = adapter.get_transaction(safe_tx_hash)
         if not proposal.executable:
             threshold = (
@@ -189,12 +198,40 @@ class SafeSigner:
             )
         return adapter.execute_transaction(safe_tx_hash, rpc_url=rpc_url)
 
-    def _require_adapter(self) -> SafeTransactionServiceAdapter:
-        if self._adapter is None:
+    def _adapter_for(self, chain_id: int | None) -> SafeTransactionServiceAdapter:
+        if self._pinned is not None:
+            return self._pinned
+        if self._config is None:
             raise ValueError(
                 "SafeSigner requires Safe transaction service configuration"
             )
-        return self._adapter
+        from open_allocator.exec import safe_deployment
+
+        if chain_id is None:
+            chain_id = safe_deployment.derivation_chain_id(self._config)
+
+        adapter = self._adapters.get(chain_id)
+        if adapter is None:
+            adapter = SafeEthPyTransactionServiceAdapter(
+                safe_address=self._safe_address(),
+                chain_id=chain_id,
+                transaction_service_url=_transaction_service_url(
+                    self._config, chain_id
+                ),
+                api_key=_optional_secret_config_value(
+                    self._config,
+                    "safe_proposer_credential",
+                ),
+            )
+            self._adapters[chain_id] = adapter
+        return adapter
+
+    def _safe_address(self) -> str:
+        """Derived once: the address is the same on every chain, and deriving
+        it costs an eth_call that would otherwise repeat per chain."""
+        if self._address is None:
+            self._address = safe_address_from_config(self._config)
+        return self._address
 
 
 class SafeEthPyTransactionServiceAdapter:
@@ -401,10 +438,11 @@ def safe_address_from_config(config: object) -> str:
             "no SAFE_ADDRESS and no SAFE_OWNERS/SAFE_THRESHOLD to derive one"
         )
 
-    chain_id = int(_required_config_value(config, "safe_chain_id"))
     from web3 import HTTPProvider, Web3
 
     from open_allocator.exec import chains, safe_deployment
+
+    chain_id = safe_deployment.derivation_chain_id(config)
 
     rpc_url = chains.require_rpc_url(chain_id, config)
     seed = safe_deployment.SafeSeed(
@@ -419,16 +457,28 @@ def safe_address_from_config(config: object) -> str:
     )
 
 
-def _adapter_from_config(config: object) -> SafeTransactionServiceAdapter:
-    return SafeEthPyTransactionServiceAdapter(
-        safe_address=safe_address_from_config(config),
-        chain_id=int(_required_config_value(config, "safe_chain_id")),
-        transaction_service_url=_required_config_value(
-            config,
-            "safe_transaction_service_url",
-        ),
-        api_key=_optional_secret_config_value(config, "safe_proposer_credential"),
-    )
+def _transaction_service_url(config: object, chain_id: int) -> str:
+    """The explicit URL for the named chain, else the chain's registry row.
+
+    An explicit URL names one chain's service, so it answers only for the chain
+    SAFE_CHAIN_ID names. Letting it answer for every chain is how a plan that
+    spans chains would propose its Arbitrum steps to the Base service.
+    """
+    from open_allocator.exec import chains
+
+    explicit = getattr(config, "safe_transaction_service_url", None)
+    named = getattr(config, "safe_chain_id", None)
+    if explicit and (named is None or int(named) == chain_id):
+        return str(explicit)
+
+    url = chains.safe_tx_service_url(chain_id)
+    if url is None:
+        raise SafeSignerError(
+            f"no Safe Transaction Service is known for "
+            f"{chains.chain_name(chain_id)} (chain {chain_id}); "
+            f"set SAFE_TRANSACTION_SERVICE_URL"
+        )
+    return url
 
 
 def _proposer_from_config(config: object | None) -> SafeProposer | None:
