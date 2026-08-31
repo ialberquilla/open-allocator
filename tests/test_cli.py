@@ -285,6 +285,7 @@ def set_execution_config(
         _rpc_overrides={8453: "rpc://base", 999999: "rpc://missing"},
         gas_checker=lambda _address, _chain_id, _rpc_url, _config: True,
         idempotency_store_path=idempotency_store_path,
+        settle_waiter=lambda: None,  # never sleep in tests
     )
     monkeypatch.setattr(cli, "AllocatorConfig", lambda: config)
     return config

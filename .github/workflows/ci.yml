@@ -24,10 +24,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Pinned release binary rather than docker://rhysd/actionlint: the image
+      # pull cost 8s to run a lint that finishes in under one. The checksum is
+      # the point — an unpinned installer script would make the one step that
+      # guards the pipeline the least reproducible thing in it.
       - name: Lint workflow
-        uses: docker://rhysd/actionlint:1.7.12
-        with:
-          args: -color
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          curl -sSfL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+          rm -f actionlint actionlint.tar.gz
 
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
@@ -53,3 +65,15 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      # The runner is destroyed when the job ends, so without this the wheel we
+      # just built exists for about a second. Uploading it makes the build step
+      # produce something a human can download and install, and turns "it built"
+      # into "here is what it built".
+      - name: Upload the built distributions
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dist-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
