@@ -18,6 +18,11 @@ from open_allocator.exec.paymaster_types import (
     PaymasterUserOperationSubmission,
     UserOperationCall,
 )
+from open_allocator.exec.pimlico import (
+    PimlicoClient,
+    PimlicoError,
+    PimlicoPaymasterAdapter,
+)
 from open_allocator.exec.pimlico_adapter import pimlico_adapter_from_config
 from open_allocator.exec.signer import Receipt
 
@@ -397,12 +402,6 @@ def _live_token_quoter(
     api_key = _optional_secret_config_value(config, "pimlico_api_key")
     if api_key is None:
         return None
-
-    from open_allocator.exec.pimlico import (
-        PimlicoClient,
-        PimlicoError,
-        PimlicoPaymasterAdapter,
-    )
 
     def quote(chain_id: int) -> object | None:
         # Per chain: quoting one chain's USDC against another's paymaster prices
