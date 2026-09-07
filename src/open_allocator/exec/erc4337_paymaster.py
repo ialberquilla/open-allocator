@@ -1,78 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal
 
 import httpx
-from pydantic import Field
 
-from open_allocator.core.types import FrozenModel, TxStep
+from open_allocator.core.types import TxStep
 from open_allocator.exec import chains, paymaster_registry
 from open_allocator.exec.composition import composition_from_config
-from open_allocator.exec.signer import Receipt, SignerError
-
-
-class PaymasterError(SignerError):
-    pass
-
-
-class PaymasterConfigurationError(PaymasterError):
-    pass
-
-
-class PaymasterRejected(PaymasterError):
-    pass
-
-
-class PaymasterUnsupportedChain(PaymasterError):
-    def __init__(self, chain_id: int) -> None:
-        self.chain_id = chain_id
-        super().__init__(
-            f"ERC-4337 USDC paymaster is not configured for chain {chain_id}"
-        )
-
-
-class UserOperationCall(FrozenModel):
-    to: str
-    data: str
-    value: int = Field(ge=0)
-
-
-class PaymasterUserOperationRequest(FrozenModel):
-    sender: str
-    chain_id: int
-    entry_point: str
-    # A sequence because a smart account can batch: the calls of one plan ride in
-    # a single operation, so the gas the paymaster pulls in postOp can be paid
-    # out of USDC the same operation just produced.
-    calls: tuple[UserOperationCall, ...] = Field(min_length=1)
-    gas_token: Literal["USDC"] = "USDC"
-    gas_token_address: str
-    account_type: Literal["smart-account", "safe"] = "smart-account"
-
-    @property
-    def call_data(self) -> UserOperationCall:
-        """The first call — the whole operation when it is not a batch."""
-        return self.calls[0]
-
-
-class PaymasterUserOperationSubmission(FrozenModel):
-    user_op_hash: str
-    transaction_hash: str | None = None
-    status: Literal["submitted", "included"] = "submitted"
-    block_number: int = Field(default=0, ge=0)
-    gas_used: int = Field(default=0, ge=0)
-    message: str | None = None
-
-
-@runtime_checkable
-class PaymasterUserOperationAdapter(Protocol):
-    def address(self) -> str: ...
-
-    def submit_user_operation(
-        self,
-        request: PaymasterUserOperationRequest,
-    ) -> PaymasterUserOperationSubmission: ...
+from open_allocator.exec.paymaster_types import (
+    PaymasterConfigurationError,
+    PaymasterError,
+    PaymasterRejected,
+    PaymasterUnsupportedChain,
+    PaymasterUserOperationAdapter,
+    PaymasterUserOperationRequest,
+    PaymasterUserOperationSubmission,
+    UserOperationCall,
+)
+from open_allocator.exec.pimlico_adapter import pimlico_adapter_from_config
+from open_allocator.exec.signer import Receipt
 
 
 class Erc4337PaymasterSigner:
@@ -478,11 +425,6 @@ def _live_token_quoter(
 def _adapter_from_config(config: object) -> PaymasterUserOperationAdapter:
     provider = getattr(config, "paymaster_provider", None)
     if provider == "pimlico":
-        # Imported here rather than at module scope: pimlico_adapter imports the
-        # request/submission types from this module, so a top-level import would
-        # be a cycle.
-        from open_allocator.exec.pimlico_adapter import pimlico_adapter_from_config
-
         return pimlico_adapter_from_config(config)
     if provider == "circle":
         raise PaymasterConfigurationError(

@@ -17,7 +17,7 @@ from open_allocator.exec import (
 from open_allocator.exec import (
     entry_point as entry_point_reads,
 )
-from open_allocator.exec.erc4337_paymaster import (
+from open_allocator.exec.paymaster_types import (
     PaymasterConfigurationError,
     PaymasterError,
     PaymasterUnsupportedChain,
