@@ -11,10 +11,10 @@ from typing import Annotated, Any, ParamSpec, TypeVar
 import typer
 
 from open_allocator.core import allocator as allocation_core
+from open_allocator.core import apy_accounting, eligibility, metrics, universe
 from open_allocator.core import backtest as backtest_core
 from open_allocator.core import costs as costs_core
 from open_allocator.core import drift as drift_core
-from open_allocator.core import eligibility, metrics, universe
 from open_allocator.core import mandate as mandate_core
 from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
@@ -890,6 +890,12 @@ def _allocation_payload_with_policy_result(
     metadata = dict(allocation.metadata)
     warnings = [str(item) for item in metadata.get("warnings", [])]
     warnings.extend(exclusions)
+    accounting = apy_accounting.for_allocation(allocation, discovered)
+    warnings.extend(accounting.warnings())
+    # Selection remains headline-based in this compatibility release.  The
+    # accounting block separately states whether accruing yield is measurable.
+    metadata["apy_basis"] = "advertised"
+    metadata["apy_accounting"] = accounting.model_dump(mode="json")
     if cost_estimate is not None:
         metadata["cost_estimate"] = cost_estimate.as_metadata()
         cost_warning = cost_estimate.warning()
@@ -918,6 +924,11 @@ def _vault_summary(vault: Vault, score: VaultScore) -> JsonObject:
         "chain_id": vault.chain_id,
         "asset": vault.asset,
         "apy": vault.apy,
+        "advertised_apy": vault.apy,
+        "base_apy": vault.apy_base,
+        "reward_apy": vault.apy_reward,
+        "reward_tokens": list(vault.reward_tokens),
+        "reward_dependence": json_safe(vault.reward_dependence),
         "tvl_usd": vault.tvl_usd,
         "score": score.score,
         "risk_metrics": _risk_metrics(vault),
@@ -1248,6 +1259,7 @@ def build_allocation(
         [leg.model_dump() for leg in allocation.legs],
         chain_by_instrument=chain_by_instrument,
         apy_by_instrument={v.instrument_id: v.apy for v in discovered},
+        base_apy_by_instrument={v.instrument_id: v.apy_base for v in discovered},
         source_chain_id=source_chain_id,
         params=_live_cost_params(allocation, chain_by_instrument, source_chain_id),
     )

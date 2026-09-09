@@ -141,6 +141,7 @@ def vault(
         "chain_id": chain_id,
         "asset": "USDC",
         "apy": apy,
+        "apy_base": apy,
         "tvl_usd": 1_000_000,
         "curator": "curator-a",
         "reward_dependence": 0.1,
@@ -559,7 +560,24 @@ def test_opportunity_fires_when_a_better_same_sleeve_candidate_appears() -> None
     assert found[0].held_instrument_id == "vault-a"
     assert found[0].candidate_instrument_id == "vault-b"
     assert found[0].uplift_bps == 400
+    assert found[0].apy_basis == "base"
     assert report.drifted is True
+
+
+def test_opportunity_is_unevaluated_when_held_base_apy_is_unknown() -> None:
+    held = vault("vault-a", apy=5.0).model_copy(update={"apy_base": None})
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[held, vault("vault-b", apy=9.0)],
+    )
+
+    assert any(
+        reason.check == "opportunity" and "unknown apyBase" in reason.because
+        for reason in reasons_of(report, "unevaluated")
+    )
 
 
 def test_opportunity_stays_quiet_below_the_mandate_band() -> None:

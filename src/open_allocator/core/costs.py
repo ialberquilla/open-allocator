@@ -149,6 +149,11 @@ class LegInput:
     chain_id: int
     usd: float
     apy_pct: float
+    # ``apy_pct`` remains the advertised rate for compatibility.  Callers that
+    # know the split supply base separately; direct legacy callers explicitly
+    # default to treating their sole rate as accruing.
+    base_apy_pct: float | None = None
+    base_apy_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -161,7 +166,7 @@ class CostEstimate:
     max_slippage_usd: float
     cost_pct_of_deploy: float
     gross_blended_apy_pct: float
-    net_apy_pct_year1: float
+    net_apy_pct_year1: float | None
     breakeven_days: float | None
     bridged_usd: float
     bridged_leg_count: int
@@ -171,10 +176,13 @@ class CostEstimate:
     # than a live read. Surfaced because a fallback-priced gas number should not
     # be read with the same confidence as a measured one.
     gas_priced_live: bool = True
+    measured_base_apy_pct: float | None = None
+    base_apy_coverage_bps: int = 10_000
+    accruing_income_available: bool = True
 
-    def as_metadata(self) -> dict[str, float | int | str | bool]:
+    def as_metadata(self) -> dict[str, float | int | str | bool | None]:
         """Flat, schema-safe scalar dict for allocation ``metadata``."""
-        data: dict[str, float | int | str | bool] = {
+        data: dict[str, float | int | str | bool | None] = {
             "source_chain_id": self.source_chain_id,
             "deploy_usd": self.deploy_usd,
             "gas_cost_usd": self.gas_cost_usd,
@@ -185,12 +193,16 @@ class CostEstimate:
             "cost_pct_of_deploy": self.cost_pct_of_deploy,
             "gross_blended_apy_pct": self.gross_blended_apy_pct,
             "net_apy_pct_year1": self.net_apy_pct_year1,
+            "advertised_blended_apy_pct": self.gross_blended_apy_pct,
+            "measured_base_apy_pct": self.measured_base_apy_pct,
+            "base_apy_coverage_bps": self.base_apy_coverage_bps,
+            "accruing_income_available": self.accruing_income_available,
             "bridged_usd": self.bridged_usd,
             "bridged_leg_count": self.bridged_leg_count,
             "leg_count": self.leg_count,
             "verdict": self.verdict,
         }
-        # breakeven_days is None when gross yield is non-positive (never repays).
+        # Missing means either non-positive base yield or incomplete coverage.
         if self.breakeven_days is not None:
             data["breakeven_days"] = self.breakeven_days
         return data
@@ -278,9 +290,30 @@ def estimate(
         if deploy_usd > 0
         else 0.0
     )
-    net_apy_year1 = gross_apy - cost_pct
+    base_priced = [leg for leg in priced if leg.base_apy_known]
+    base_usd = sum(leg.usd for leg in base_priced)
+    base_coverage_bps = int(round(base_usd / deploy_usd * 10_000))
+    measured_base = (
+        sum(
+            leg.usd * (leg.apy_pct if leg.base_apy_pct is None else leg.base_apy_pct)
+            for leg in base_priced
+        )
+        / base_usd
+        if base_usd > 0
+        else None
+    )
+    accruing_available = base_coverage_bps == 10_000
+    net_apy_year1 = (
+        measured_base - cost_pct
+        if accruing_available and measured_base is not None
+        else None
+    )
 
-    gross_annual_usd = deploy_usd * gross_apy / 100
+    gross_annual_usd = (
+        deploy_usd * measured_base / 100
+        if accruing_available and measured_base is not None
+        else 0.0
+    )
     breakeven_days = (
         total_cost / (gross_annual_usd / 365) if gross_annual_usd > 0 else None
     )
@@ -301,13 +334,20 @@ def estimate(
         max_slippage_usd=round(max_slippage, 4),
         cost_pct_of_deploy=round(cost_pct, 3),
         gross_blended_apy_pct=round(gross_apy, 3),
-        net_apy_pct_year1=round(net_apy_year1, 3),
+        net_apy_pct_year1=(
+            round(net_apy_year1, 3) if net_apy_year1 is not None else None
+        ),
         breakeven_days=round(breakeven_days, 1) if breakeven_days is not None else None,
         bridged_usd=round(bridged_usd, 2),
         bridged_leg_count=len(bridged),
         leg_count=len(priced),
         verdict=verdict,
         gas_priced_live=params.gas_priced_live(source),
+        measured_base_apy_pct=(
+            round(measured_base, 3) if measured_base is not None else None
+        ),
+        base_apy_coverage_bps=base_coverage_bps,
+        accruing_income_available=accruing_available,
     )
 
 
@@ -316,6 +356,7 @@ def estimate_from_allocation_legs(
     *,
     chain_by_instrument: Mapping[str, int],
     apy_by_instrument: Mapping[str, float],
+    base_apy_by_instrument: Mapping[str, float | None] | None = None,
     source_chain_id: int | None = None,
     params: CostParams | None = None,
 ) -> CostEstimate | None:
@@ -323,6 +364,8 @@ def estimate_from_allocation_legs(
 
     Legs whose instrument is missing a chain are skipped (cannot be priced);
     a missing APY is treated as 0 so the leg still carries its execution cost.
+    When a base map is supplied, missing/null values stay unknown and make
+    whole-book income and breakeven unavailable.
     """
     inputs: list[LegInput] = []
     for leg in legs:
@@ -336,6 +379,15 @@ def estimate_from_allocation_legs(
                 chain_id=chain_id,
                 usd=float(leg["usd"]),
                 apy_pct=float(apy_by_instrument.get(instrument_id, 0.0)),
+                base_apy_pct=(
+                    base_apy_by_instrument.get(instrument_id)
+                    if base_apy_by_instrument is not None
+                    else None
+                ),
+                base_apy_known=(
+                    base_apy_by_instrument is None
+                    or base_apy_by_instrument.get(instrument_id) is not None
+                ),
             )
         )
     return estimate(inputs, source_chain_id=source_chain_id, params=params)
@@ -360,6 +412,8 @@ class MoveInput:
     current_usd: float
     target_usd: float
     apy_pct: float
+    base_apy_pct: float | None = None
+    base_apy_known: bool = True
 
     @property
     def delta_usd(self) -> float:
@@ -401,19 +455,24 @@ class RebalanceEstimate:
     net_flow_by_chain: Mapping[int, float]
 
     # What it earns
-    current_blended_apy_pct: float
-    target_blended_apy_pct: float
-    apy_delta_pct: float
-    annual_gain_usd: float
+    current_blended_apy_pct: float | None
+    target_blended_apy_pct: float | None
+    apy_delta_pct: float | None
+    annual_gain_usd: float | None
     payback_days: float | None
 
     verdict: str
     gas_priced_live: bool
     unpriced_chain_ids: tuple[int, ...]
+    advertised_current_blended_apy_pct: float = 0.0
+    advertised_target_blended_apy_pct: float = 0.0
+    current_base_apy_coverage_bps: int = 10_000
+    target_base_apy_coverage_bps: int = 10_000
+    apy_basis: str = "base"
 
-    def as_metadata(self) -> dict[str, float | int | str | bool]:
+    def as_metadata(self) -> dict[str, float | int | str | bool | None]:
         """Flat, schema-safe scalar dict. ``net_flow_by_chain`` is dropped."""
-        data: dict[str, float | int | str | bool] = {
+        data: dict[str, float | int | str | bool | None] = {
             "moved_leg_count": self.moved_leg_count,
             "skipped_leg_count": self.skipped_leg_count,
             "skipped_usd": self.skipped_usd,
@@ -429,6 +488,15 @@ class RebalanceEstimate:
             "unfundable_usd": self.unfundable_usd,
             "current_blended_apy_pct": self.current_blended_apy_pct,
             "target_blended_apy_pct": self.target_blended_apy_pct,
+            "advertised_current_blended_apy_pct": (
+                self.advertised_current_blended_apy_pct
+            ),
+            "advertised_target_blended_apy_pct": (
+                self.advertised_target_blended_apy_pct
+            ),
+            "current_base_apy_coverage_bps": self.current_base_apy_coverage_bps,
+            "target_base_apy_coverage_bps": self.target_base_apy_coverage_bps,
+            "apy_basis": self.apy_basis,
             "apy_delta_pct": self.apy_delta_pct,
             "annual_gain_usd": self.annual_gain_usd,
             "verdict": self.verdict,
@@ -530,19 +598,52 @@ def estimate_rebalance(
     effective = {m.instrument_id: m.current_usd for m in moves}
     for move in moved:
         effective[move.instrument_id] = move.target_usd
-    apy_by_id = {m.instrument_id: m.apy_pct for m in moves}
+    advertised_by_id = {m.instrument_id: m.apy_pct for m in moves}
+    base_by_id = {
+        m.instrument_id: (m.apy_pct if m.base_apy_pct is None else m.base_apy_pct)
+        for m in moves
+        if m.base_apy_known
+    }
 
     current_total = sum(m.current_usd for m in moves)
     target_total = sum(effective.values())
-    current_blended = (
+    advertised_current = (
         sum(m.current_usd * m.apy_pct for m in moves) / current_total
         if current_total > 0
         else 0.0
     )
-    target_blended = (
-        sum(usd * apy_by_id[i] for i, usd in effective.items()) / target_total
+    advertised_target = (
+        sum(usd * advertised_by_id[i] for i, usd in effective.items()) / target_total
         if target_total > 0
         else 0.0
+    )
+
+    current_base_usd = sum(
+        m.current_usd for m in moves if m.instrument_id in base_by_id
+    )
+    target_base_usd = sum(
+        usd for instrument_id, usd in effective.items() if instrument_id in base_by_id
+    )
+    current_coverage = (
+        int(round(current_base_usd / current_total * 10_000))
+        if current_total > 0
+        else 10_000
+    )
+    target_coverage = (
+        int(round(target_base_usd / target_total * 10_000))
+        if target_total > 0
+        else 10_000
+    )
+    base_complete = current_coverage == 10_000 and target_coverage == 10_000
+    current_blended = (
+        sum(m.current_usd * base_by_id[m.instrument_id] for m in moves) / current_total
+        if base_complete and current_total > 0
+        else (0.0 if base_complete else None)
+    )
+    target_blended = (
+        sum(usd * base_by_id[i] for i, usd in effective.items()) / target_total
+        if base_complete and target_total > 0
+        else (0.0 if base_complete else None)
     )
 
     # Dollars per year, not percentage points: deploying idle capital raises the
@@ -551,10 +652,14 @@ def estimate_rebalance(
     # Only the dollar figure answers "does this repay its own gas".
     annual_gain_usd = (
         target_total * target_blended / 100 - current_total * current_blended / 100
+        if current_blended is not None and target_blended is not None
+        else None
     )
 
     payback_days = (
-        total_cost / (annual_gain_usd / 365.0) if annual_gain_usd > 0 else None
+        total_cost / (annual_gain_usd / 365.0)
+        if annual_gain_usd is not None and annual_gain_usd > 0
+        else None
     )
 
     unpriced = tuple(
@@ -571,6 +676,8 @@ def estimate_rebalance(
         verdict = "nothing_to_do"
     elif unfundable_usd > 0:
         verdict = "unfundable"
+    elif not base_complete:
+        verdict = "apy_unavailable"
     elif payback_days is None:
         # No yield to repay out of. Not automatically wrong — a compliance fix
         # buys compliance — but the caller has to justify it on something other
@@ -598,14 +705,29 @@ def estimate_rebalance(
         bridged_usd=round(bridged_usd, 4),
         unfundable_usd=round(unfundable_usd, 4),
         net_flow_by_chain={k: round(v, 4) for k, v in sorted(net_flow.items())},
-        current_blended_apy_pct=round(current_blended, 4),
-        target_blended_apy_pct=round(target_blended, 4),
-        apy_delta_pct=round(target_blended - current_blended, 4),
-        annual_gain_usd=round(annual_gain_usd, 4),
+        current_blended_apy_pct=(
+            round(current_blended, 4) if current_blended is not None else None
+        ),
+        target_blended_apy_pct=(
+            round(target_blended, 4) if target_blended is not None else None
+        ),
+        apy_delta_pct=(
+            round(target_blended - current_blended, 4)
+            if target_blended is not None and current_blended is not None
+            else None
+        ),
+        annual_gain_usd=(
+            round(annual_gain_usd, 4) if annual_gain_usd is not None else None
+        ),
         payback_days=round(payback_days, 2) if payback_days is not None else None,
         verdict=verdict,
         gas_priced_live=not unpriced,
         unpriced_chain_ids=unpriced,
+        advertised_current_blended_apy_pct=round(advertised_current, 4),
+        advertised_target_blended_apy_pct=round(advertised_target, 4),
+        current_base_apy_coverage_bps=current_coverage,
+        target_base_apy_coverage_bps=target_coverage,
+        apy_basis="base" if base_complete else "mixed_unknown",
     )
 
 
@@ -615,6 +737,7 @@ def estimate_rebalance_from_holdings(
     *,
     chain_by_instrument: Mapping[str, int],
     apy_by_instrument: Mapping[str, float],
+    base_apy_by_instrument: Mapping[str, float | None] | None = None,
     params: CostParams | None = None,
     min_trade_usd: float = 0.0,
     idle_usd_by_chain: Mapping[int, float] | None = None,
@@ -641,6 +764,15 @@ def estimate_rebalance_from_holdings(
                 current_usd=float(current_usd_by_instrument.get(instrument_id, 0.0)),
                 target_usd=float(target_usd_by_instrument.get(instrument_id, 0.0)),
                 apy_pct=float(apy_by_instrument.get(instrument_id, 0.0)),
+                base_apy_pct=(
+                    base_apy_by_instrument.get(instrument_id)
+                    if base_apy_by_instrument is not None
+                    else None
+                ),
+                base_apy_known=(
+                    base_apy_by_instrument is None
+                    or base_apy_by_instrument.get(instrument_id) is not None
+                ),
             )
         )
     return estimate_rebalance(
