@@ -396,7 +396,7 @@ class OneTxClient:
         return self._request_json("POST", "/transactions/sell", body=body)
 
     def positions(self, body: Mapping[str, object]) -> PositionsResponse:
-        payload = self._request_json("POST", "/positions", body=body)
+        payload = self._request_json("GET", "/positions", query=_aliases(body))
         return PositionsResponse.model_validate(payload)
 
     def balances(self, address: str) -> BalancesResponse:
