@@ -5,6 +5,7 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Literal, Protocol
 
+from open_allocator.core import apy_accounting as apy_core
 from open_allocator.core import diversify
 from open_allocator.core.types import (
     UNKNOWN_SECTOR,
@@ -60,6 +61,8 @@ class PortfolioScorecard(FrozenModel):
     # The measured view. None when the universe carries no dated history —
     # again absent, never "diversified".
     diversification: diversify.DiversificationReport | None = None
+    apy_accounting: apy_core.ApyAccounting | None = None
+    apy_warnings: tuple[str, ...] = ()
 
 
 class PortfolioComparison(FrozenModel):
@@ -73,6 +76,8 @@ class PortfolioSimulation(FrozenModel):
     simulation: SimulationResult
     sector_concentration: SectorConcentration | None = None
     diversification: diversify.DiversificationReport | None = None
+    apy_accounting: apy_core.ApyAccounting | None = None
+    apy_warnings: tuple[str, ...] = ()
 
 
 class _PortfolioClient(Protocol):
@@ -150,6 +155,9 @@ def analyze(
     analysis = PortfolioAnalysis.model_validate(
         client.analyze_portfolio(_allocation_payload(allocation))
     )
+    accounting = (
+        apy_core.for_allocation(allocation, vaults) if vaults is not None else None
+    )
     return PortfolioScorecard(
         analysis=analysis,
         concentration_flags=analysis.concentration.limit_flags,
@@ -159,6 +167,8 @@ def analyze(
         diversification=(
             diversification(allocation, vaults) if vaults is not None else None
         ),
+        apy_accounting=accounting,
+        apy_warnings=accounting.warnings() if accounting is not None else (),
     )
 
 
@@ -190,6 +200,9 @@ def simulate(
         body["benchmark"] = benchmark
 
     simulation = SimulationResult.model_validate(client.simulate_portfolio(body))
+    accounting = (
+        apy_core.for_allocation(allocation, vaults) if vaults is not None else None
+    )
     return PortfolioSimulation(
         simulation=simulation,
         sector_concentration=(
@@ -198,6 +211,8 @@ def simulate(
         diversification=(
             diversification(allocation, vaults) if vaults is not None else None
         ),
+        apy_accounting=accounting,
+        apy_warnings=accounting.warnings() if accounting is not None else (),
     )
 
 

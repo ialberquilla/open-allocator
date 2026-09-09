@@ -726,6 +726,11 @@ def test_list_vaults_returns_json_array_with_summaries(
         "chain_id": 8453,
         "asset": "USDC",
         "apy": 0.04,
+        "advertised_apy": 0.04,
+        "base_apy": None,
+        "reward_apy": None,
+        "reward_tokens": [],
+        "reward_dependence": 0.1,
         "tvl_usd": 10_000_000.0,
         "score": pytest.approx(payload[0]["score"]),
         "risk_metrics": payload[0]["risk_metrics"],
@@ -736,6 +741,11 @@ def test_list_vaults_returns_json_array_with_summaries(
         "chain_id",
         "asset",
         "apy",
+        "advertised_apy",
+        "base_apy",
+        "reward_apy",
+        "reward_tokens",
+        "reward_dependence",
         "tvl_usd",
         "score",
         "risk_metrics",
@@ -861,6 +871,9 @@ def test_build_allocation_outputs_schema_valid_policy_passing_allocation(
     assert allocation["total_usd"] == 10_000
     assert allocation["metadata"]["policy_ok"] is True
     assert allocation["metadata"]["policy_violations"] == []
+    assert allocation["metadata"]["apy_basis"] == "advertised"
+    assert allocation["metadata"]["apy_accounting"]["apy_basis"] == "mixed_unknown"
+    assert allocation["metadata"]["apy_accounting"]["accruing_apy_pct"] is None
 
     allocation_path = tmp_path / "allocation.json"
     allocation_path.write_text(result.stdout, encoding="utf-8")
@@ -1153,6 +1166,10 @@ def test_simulate_outputs_descriptive_scorecard_from_allocation_file(
     assert payload["label"] == "descriptive-not-predictive"
     assert payload["simulation"]["headline"] == "descriptive backtest"
     assert payload["simulation"]["benchmark"]["label"] == "USD_INDEX"
+    assert payload["apy_accounting"]["advertised_blended_apy_pct"] == 0.04
+    assert payload["apy_accounting"]["base_apy_coverage_bps"] == 0
+    assert payload["apy_accounting"]["accruing_apy_pct"] is None
+    assert any("apy_base_unknown" in item for item in payload["apy_warnings"])
 
 
 def test_read_only_commands_need_no_wallet_private_key_or_rpc(

@@ -126,6 +126,26 @@ def test_from_allocation_legs_skips_unknown_chain() -> None:
     assert est.deploy_usd == 100.0
 
 
+def test_incomplete_base_coverage_hides_income_and_breakeven() -> None:
+    est = costs.estimate_from_allocation_legs(
+        [
+            {"instrument_id": "known", "usd": 60.0},
+            {"instrument_id": "unknown", "usd": 40.0},
+        ],
+        chain_by_instrument={"known": 8453, "unknown": 8453},
+        apy_by_instrument={"known": 5.0, "unknown": 8.0},
+        base_apy_by_instrument={"known": 4.0, "unknown": None},
+    )
+
+    assert est is not None
+    assert est.gross_blended_apy_pct == 6.2
+    assert est.measured_base_apy_pct == 4.0
+    assert est.base_apy_coverage_bps == 6000
+    assert est.accruing_income_available is False
+    assert est.net_apy_pct_year1 is None
+    assert est.breakeven_days is None
+
+
 def test_a_chain_is_priced_in_its_own_token_not_in_eth() -> None:
     """A cheap token at a high gas price is not an expensive chain.
 
@@ -324,6 +344,27 @@ def test_rebalance_from_holdings_treats_an_exit_as_a_move() -> None:
     assert est.sell_usd == 30.0
     assert est.buy_usd == 30.0
     assert est.target_blended_apy_pct == pytest.approx(7.0)
+
+
+def test_rebalance_with_unknown_base_rate_does_not_publish_mixed_payback() -> None:
+    est = costs.estimate_rebalance_from_holdings(
+        {"known": 50.0, "unknown": 50.0},
+        {"known": 60.0, "unknown": 40.0},
+        chain_by_instrument={"known": 8453, "unknown": 8453},
+        apy_by_instrument={"known": 5.0, "unknown": 9.0},
+        base_apy_by_instrument={"known": 4.0, "unknown": None},
+    )
+
+    assert est is not None
+    assert est.advertised_current_blended_apy_pct == 7.0
+    assert est.current_base_apy_coverage_bps == 5000
+    assert est.target_base_apy_coverage_bps == 6000
+    assert est.current_blended_apy_pct is None
+    assert est.target_blended_apy_pct is None
+    assert est.annual_gain_usd is None
+    assert est.payback_days is None
+    assert est.apy_basis == "mixed_unknown"
+    assert est.verdict == "apy_unavailable"
 
 
 def test_rebalance_returns_none_on_an_empty_book() -> None:

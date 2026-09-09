@@ -121,6 +121,7 @@ class OpportunityReason(FrozenModel):
     candidate_instrument_id: str
     held_apy_pct: float
     candidate_apy_pct: float
+    apy_basis: Literal["base"] = "base"
     uplift_bps: int
     band_bps: int
     position_usd: float
@@ -412,6 +413,18 @@ def _opportunity_reasons(
             )
         ]
 
+    unknown_held_base = sorted(key for key in held if vault_by_id[key].apy_base is None)
+    if unknown_held_base:
+        return [
+            UnevaluatedReason(
+                check="opportunity",
+                because=(
+                    "held instruments have unknown apyBase and cannot be compared "
+                    "base-to-base: " + ", ".join(unknown_held_base)
+                ),
+            )
+        ]
+
     params = cost_params or costs.CostParams()
     usd_by_id = _usd_by_instrument(positions)
 
@@ -436,14 +449,21 @@ def _opportunity_reasons(
         candidates = [
             vault
             for vault in by_tier.get(sleeve, ())
-            if vault.instrument_id not in held and vault.apy > current.apy
+            if vault.instrument_id not in held
+            and vault.apy_base is not None
+            and current.apy_base is not None
+            and vault.apy_base > current.apy_base
         ]
         if not candidates:
             continue
         # Deterministic: best APY wins, ties broken by instrument id.
-        best = min(candidates, key=lambda v: (-v.apy, v.instrument_id))
+        best = min(
+            candidates,
+            key=lambda v: (-(v.apy_base or 0.0), v.instrument_id),
+        )
 
-        uplift_bps = int(round((best.apy - current.apy) * 100))
+        assert best.apy_base is not None and current.apy_base is not None
+        uplift_bps = int(round((best.apy_base - current.apy_base) * 100))
         if uplift_bps < band:
             continue
 
@@ -457,7 +477,7 @@ def _opportunity_reasons(
         round_trip_usd = params.txs_per_leg * params.gas_usd_per_tx(
             best.chain_id
         ) + _EXIT_TXS_PER_SWITCH * params.gas_usd_per_tx(current.chain_id)
-        annual_gain_usd = position_usd * (best.apy - current.apy) / 100
+        annual_gain_usd = position_usd * (best.apy_base - current.apy_base) / 100
         if annual_gain_usd <= 0:
             continue
         payback_days = round_trip_usd / (annual_gain_usd / 365.0)
@@ -469,8 +489,8 @@ def _opportunity_reasons(
                 sleeve=sleeve,
                 held_instrument_id=instrument_id,
                 candidate_instrument_id=best.instrument_id,
-                held_apy_pct=current.apy,
-                candidate_apy_pct=best.apy,
+                held_apy_pct=current.apy_base,
+                candidate_apy_pct=best.apy_base,
                 uplift_bps=uplift_bps,
                 band_bps=band,
                 position_usd=round(position_usd, 2),
