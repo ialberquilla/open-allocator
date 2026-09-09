@@ -124,6 +124,13 @@ def _to_vault(instrument: object) -> Vault:
         is_stablecoin=_optional_bool(instrument, "is_stablecoin", "isStablecoin"),
         apy=float(_required(instrument, "apy", "current_apy", "currentApy")),
         tvl_usd=float(_required(instrument, "tvl_usd", "tvlUsd", "tvl")),
+        apy_base=_optional_float(instrument, "apy_base", "apyBase"),
+        apy_reward=_optional_float(instrument, "apy_reward", "apyReward"),
+        reward_tokens=_optional_text_tuple(
+            instrument,
+            "reward_tokens",
+            "rewardTokens",
+        ),
         curator=_optional_risk(instrument, "curator"),
         reward_dependence=_optional_risk(
             instrument,
@@ -165,6 +172,22 @@ def _optional_bool(value: object, *names: str) -> bool | None:
     if found is _MISSING or found is None:
         return None
     return bool(found)
+
+
+def _optional_float(value: object, *names: str) -> float | None:
+    found = _value(value, *names)
+    if found is _MISSING or found is None:
+        return None
+    return float(found)
+
+
+def _optional_text_tuple(value: object, *names: str) -> tuple[str, ...]:
+    found = _value(value, *names)
+    if found is _MISSING or found is None:
+        return ()
+    if not isinstance(found, Sequence) or isinstance(found, str | bytes | bytearray):
+        raise TypeError(f"{names[0]} must be a sequence")
+    return tuple(str(item) for item in found)
 
 
 def _required(value: object, *names: str) -> object:

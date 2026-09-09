@@ -68,8 +68,13 @@ class Vault(FrozenModel):
     # classified it; see sector_bucket for what that costs.
     sector: str | None = None
     is_stablecoin: bool | None = None
+    # Advertised/headline APY. Keep this meaning until APY-basis migration is
+    # explicit so additive split data cannot silently change allocations.
     apy: float
     tvl_usd: float = Field(ge=0)
+    apy_base: float | None = None
+    apy_reward: float | None = None
+    reward_tokens: tuple[str, ...] = ()
     apy_series: tuple[float, ...] = ()
     tvl_usd_series: tuple[float, ...] = ()
     # The same APY history, resampled to one observation per UTC date and
@@ -88,6 +93,11 @@ class Vault(FrozenModel):
     market_concentration: NumericRiskValue = Unknown
     liquidity: NumericRiskValue = Unknown
     collateral_mix: JsonRiskValue = Unknown
+
+    @property
+    def accruing_apy(self) -> float | None:
+        """Yield known to accrue into the yield-token share price."""
+        return self.apy_base
 
 
 class FactorScore(FrozenModel):

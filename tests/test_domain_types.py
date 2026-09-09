@@ -153,6 +153,27 @@ def test_vault_risk_fields_accept_none_and_unknown() -> None:
     assert vault.fee is None
 
 
+def test_vault_reward_fields_have_legacy_defaults_and_preserve_split_values() -> None:
+    legacy = sample_vault()
+    split = legacy.model_copy(
+        update={
+            "apy_base": 0.035,
+            "apy_reward": 0.006,
+            "reward_tokens": ("reward-token",),
+        }
+    )
+
+    assert legacy.apy_base is None
+    assert legacy.apy_reward is None
+    assert legacy.reward_tokens == ()
+    assert legacy.accruing_apy is None
+    assert split.apy == legacy.apy
+    assert split.apy_base == 0.035
+    assert split.apy_reward == 0.006
+    assert split.reward_tokens == ("reward-token",)
+    assert split.accruing_apy == 0.035
+
+
 def test_extra_keys_are_forbidden() -> None:
     data = sample_vault().model_dump()
     data["unexpected"] = "typo"
