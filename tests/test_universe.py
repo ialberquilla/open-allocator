@@ -183,6 +183,45 @@ def test_missing_risk_fields_are_unknown() -> None:
     assert vault.collateral_mix == Unknown
 
 
+def test_discovery_preserves_advertised_and_split_apy_fields() -> None:
+    vault = universe.discover(
+        StubClient(
+            [
+                instrument(
+                    currentApy=4.2,
+                    apyBase=3.7,
+                    apyReward=0.5,
+                    rewardTokens=("reward-a", "reward-b"),
+                )
+            ]
+        )
+    )[0]
+
+    assert vault.apy == 4.2
+    assert vault.apy_base == 3.7
+    assert vault.apy_reward == 0.5
+    assert vault.reward_tokens == ("reward-a", "reward-b")
+    assert vault.accruing_apy == 3.7
+
+
+def test_discovery_preserves_unknown_and_zero_reward_apy() -> None:
+    unknown, zero = universe.discover(
+        StubClient(
+            [
+                instrument(instrumentId="unknown", apyBase=None, apyReward=None),
+                instrument(instrumentId="zero", apyBase=4.2, apyReward=0),
+            ]
+        )
+    )
+
+    assert unknown.apy_base is None
+    assert unknown.apy_reward is None
+    assert unknown.reward_tokens == ()
+    assert unknown.accruing_apy is None
+    assert zero.apy_base == 4.2
+    assert zero.apy_reward == 0
+
+
 def test_universe_module_has_no_hardcoded_protocol_or_chain_literals() -> None:
     source = Path(universe.__file__).read_text()
 

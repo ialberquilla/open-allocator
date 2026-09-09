@@ -48,6 +48,9 @@ def instrument_list_payload() -> dict[str, Any]:
                 "yieldTokenSymbol": "mUSDC",
                 "description": "Morpho USDC vault",
                 "currentApy": 4.2,
+                "apyBase": 3.7,
+                "apyReward": 0.5,
+                "rewardTokens": ["0x0000000000000000000000000000000000000001"],
                 "tvl": 1_000_000,
                 "isActive": True,
                 "isStablecoin": True,
@@ -159,7 +162,49 @@ def test_list_instruments_gets_filters_auth_and_parses() -> None:
     assert result.data[0].instrument_id == "morpho-base-usdc-1"
     assert result.data[0].chain_id == 8453
     assert result.data[0].current_apy == 4.2
+    assert result.data[0].apy_base == 3.7
+    assert result.data[0].apy_reward == 0.5
+    assert result.data[0].reward_tokens == (
+        "0x0000000000000000000000000000000000000001",
+    )
     assert result.pagination.has_more is False
+
+
+def test_instrument_split_fields_are_optional_and_preserve_null_vs_zero() -> None:
+    old_payload = instrument_list_payload()
+    instrument = old_payload["data"][0]
+    instrument.pop("apyBase")
+    instrument["apyReward"] = None
+    instrument.pop("rewardTokens")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=old_payload)
+
+    result = make_client(httpx.MockTransport(handler)).list_instruments()
+
+    assert result.data[0].current_apy == 4.2
+    assert result.data[0].apy_base is None
+    assert result.data[0].apy_reward is None
+    assert result.data[0].reward_tokens is None
+
+    zero_reward = instrument_list_payload()
+    zero_reward["data"][0]["apyReward"] = 0
+    result = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=zero_reward))
+    ).list_instruments()
+
+    assert result.data[0].apy_reward == 0
+
+
+def test_instrument_accepts_null_reward_tokens() -> None:
+    payload = instrument_list_payload()
+    payload["data"][0]["rewardTokens"] = None
+
+    result = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    ).list_instruments()
+
+    assert result.data[0].reward_tokens is None
 
 
 def test_metrics_bulk_gets_repeated_query_params_and_parses() -> None:

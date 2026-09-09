@@ -32,6 +32,9 @@ class Instrument(OneTxModel):
     yield_token_symbol: str | None = Field(default=None, alias="yieldTokenSymbol")
     description: str | None = None
     current_apy: float | None = Field(default=None, alias="currentApy")
+    apy_base: float | None = Field(default=None, alias="apyBase")
+    apy_reward: float | None = Field(default=None, alias="apyReward")
+    reward_tokens: tuple[str, ...] | None = Field(default=None, alias="rewardTokens")
     tvl: float | None = None
     is_active: bool = Field(alias="isActive")
     is_stablecoin: bool = Field(alias="isStablecoin")
