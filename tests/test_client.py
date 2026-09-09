@@ -428,13 +428,16 @@ def test_build_sell_posts_body_and_returns_raw_payload() -> None:
     assert client.build_sell(body) == response_payload
 
 
-def test_positions_posts_body_and_parses() -> None:
+def test_positions_gets_query_and_parses() -> None:
     body = {"address": "0x0000000000000000000000000000000000000001", "chainId": 8453}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "POST"
+        assert request.method == "GET"
         assert request.url.path == "/api/v1/positions"
-        assert read_json_body(request) == body
+        assert dict(request.url.params) == {
+            "address": body["address"],
+            "chainId": str(body["chainId"]),
+        }
         assert_common_headers(request)
         return httpx.Response(
             200,
