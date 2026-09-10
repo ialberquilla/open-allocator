@@ -96,6 +96,65 @@ class InstrumentAnalysis(OneTxModel):
     caveats: tuple[str, ...] = ()
 
 
+class RewardTransaction(OneTxModel):
+    to: str
+    data: str
+    value: str
+    type: Literal["claim", "approve", "swap"]
+
+
+class RewardToken(OneTxModel):
+    address: str
+    chain_id: int | None = Field(default=None, alias="chainId", ge=0, strict=True)
+    decimals: int = Field(ge=0, strict=True)
+    symbol: str
+
+
+class RewardSwap(OneTxModel):
+    status: Literal["ready", "not-needed", "no-route", "unavailable"]
+    venue: str
+    token_out: str = Field(alias="tokenOut")
+    fee: int | None = Field(default=None, ge=0)
+    expected_amount_out: str | None = Field(default=None, alias="expectedAmountOut")
+    minimum_amount_out: str | None = Field(default=None, alias="minimumAmountOut")
+    reason: str | None = None
+    transactions: tuple[RewardTransaction, ...] = ()
+
+
+class RewardItem(OneTxModel):
+    provider: str
+    chain_id: int = Field(alias="chainId", ge=0, strict=True)
+    reward_token: RewardToken = Field(alias="rewardToken")
+    claimable_amount: str = Field(alias="claimableAmount", pattern=r"^\d+$")
+    pending_amount: str = Field(alias="pendingAmount", pattern=r"^\d+$")
+    claim: RewardTransaction
+    swap: RewardSwap
+    instrument_ids: tuple[str, ...] = Field(default=(), alias="instrumentIds")
+
+    @property
+    def claimable_amount_normalized(self) -> str:
+        return _normalized_token_amount(
+            self.claimable_amount,
+            self.reward_token.decimals,
+        )
+
+    @property
+    def pending_amount_normalized(self) -> str:
+        return _normalized_token_amount(
+            self.pending_amount,
+            self.reward_token.decimals,
+        )
+
+
+class RewardsResponse(OneTxModel):
+    wallet: str
+    rewards: tuple[RewardItem, ...]
+    # The API currently returns strings, but the provider-error wire shape is
+    # intentionally kept opaque until a real partial failure can be captured.
+    errors: tuple[Any, ...]
+    expires_at: int = Field(alias="expiresAt", ge=0, strict=True)
+
+
 class PortfolioAllocation(OneTxModel):
     instrument_id: str = Field(alias="instrumentId")
     weight_bps: int = Field(alias="weightBps")
@@ -402,6 +461,15 @@ class OneTxClient:
         payload = self._request_json("GET", "/positions", query=_aliases(body))
         return PositionsResponse.model_validate(payload)
 
+    def rewards(self, wallet: str, chain_id: int | None = None) -> RewardsResponse:
+        query: dict[str, object] = {"wallet": wallet}
+        if chain_id is not None:
+            query["chainId"] = chain_id
+        payload = self._request_json("GET", "/rewards", query=query)
+        response = RewardsResponse.model_validate(payload)
+        _validate_rewards_response(response, wallet=wallet, chain_id=chain_id)
+        return response
+
     def balances(self, address: str) -> BalancesResponse:
         escaped_address = quote(address, safe="")
         payload = self._request_json(
@@ -465,6 +533,40 @@ def _secret_or_str(value: object) -> str:
     if callable(get_secret_value):
         return str(get_secret_value())
     return str(value)
+
+
+def _normalized_token_amount(raw_amount: str, decimals: int) -> str:
+    if decimals == 0:
+        return raw_amount.lstrip("0") or "0"
+    padded = raw_amount.zfill(decimals + 1)
+    whole = padded[:-decimals].lstrip("0") or "0"
+    fraction = padded[-decimals:].rstrip("0")
+    return f"{whole}.{fraction}" if fraction else whole
+
+
+def _validate_rewards_response(
+    response: RewardsResponse,
+    *,
+    wallet: str,
+    chain_id: int | None,
+) -> None:
+    if response.wallet.casefold() != wallet.casefold():
+        raise OneTxDecodeError(
+            f"rewards response wallet {response.wallet!r} does not match {wallet!r}"
+        )
+
+    for reward in response.rewards:
+        if chain_id is not None and reward.chain_id != chain_id:
+            raise OneTxDecodeError(
+                f"reward chain {reward.chain_id} does not match requested "
+                f"chain {chain_id}"
+            )
+        token_chain_id = reward.reward_token.chain_id
+        if token_chain_id is not None and token_chain_id != reward.chain_id:
+            raise OneTxDecodeError(
+                f"reward token chain {token_chain_id} does not match reward chain "
+                f"{reward.chain_id}"
+            )
 
 
 def _aliases(query: Mapping[str, object]) -> dict[str, object]:

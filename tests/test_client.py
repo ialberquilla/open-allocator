@@ -1,12 +1,15 @@
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-from open_allocator.exec.client import OneTxClient, OneTxHTTPError
+from open_allocator.exec.client import OneTxClient, OneTxDecodeError, OneTxHTTPError
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,10 @@ def portfolio_analysis_payload(headline: str = "portfolio ok") -> dict[str, Any]
 
 def read_json_body(request: httpx.Request) -> dict[str, Any]:
     return json.loads(request.content.decode())
+
+
+def reward_payload(name: str = "rewards-bearing.json") -> dict[str, Any]:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
 def test_list_instruments_gets_filters_auth_and_parses() -> None:
@@ -519,6 +526,132 @@ def test_positions_gets_query_and_parses() -> None:
     assert result.chain_id == 8453
     assert result.positions[0].instrument_id == "morpho-base-usdc-1"
     assert result.positions[0].share_balance == "4.9"
+
+
+def test_rewards_gets_query_parses_raw_amounts_and_preserves_no_route() -> None:
+    wallet = "0x1111111111111111111111111111111111111111"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/v1/rewards"
+        assert dict(request.url.params) == {"wallet": wallet, "chainId": "8453"}
+        assert_common_headers(request)
+        return httpx.Response(200, json=reward_payload())
+
+    result = make_client(httpx.MockTransport(handler)).rewards(wallet, 8453)
+
+    assert result.wallet == wallet
+    assert result.errors == ("chain 42161: provider unavailable",)
+    assert result.rewards[0].claimable_amount == "750"
+    assert result.rewards[0].claimable_amount_normalized == "0.00075"
+    assert result.rewards[0].pending_amount_normalized == "0.00005"
+    assert result.rewards[0].swap.status == "no-route"
+    assert result.rewards[0].claim.data == "0xabcdef"
+
+
+def test_rewards_accepts_empty_results_without_a_chain_filter() -> None:
+    wallet = "0x1111111111111111111111111111111111111111"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {"wallet": wallet}
+        return httpx.Response(200, json=reward_payload("rewards-empty.json"))
+
+    result = make_client(httpx.MockTransport(handler)).rewards(wallet)
+
+    assert result.rewards == ()
+
+
+def test_reward_normalization_is_exact_for_large_integer_amounts() -> None:
+    payload = reward_payload()
+    payload["rewards"][0]["claimableAmount"] = "123456789012345678901234567890"
+    payload["rewards"][0]["rewardToken"]["decimals"] = 18
+    client = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    )
+
+    result = client.rewards(
+        "0x1111111111111111111111111111111111111111",
+        8453,
+    )
+
+    assert (
+        result.rewards[0].claimable_amount_normalized
+        == "123456789012.34567890123456789"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda payload: payload.update(
+                wallet="0x9999999999999999999999999999999999999999"
+            ),
+            "wallet",
+        ),
+        (
+            lambda payload: payload["rewards"][0].update(chainId=42161),
+            "requested chain",
+        ),
+        (
+            lambda payload: payload["rewards"][0]["rewardToken"].update(chainId=42161),
+            "reward token chain",
+        ),
+    ],
+)
+def test_rewards_rejects_wallet_and_chain_mismatches(
+    mutation: Any,
+    message: str,
+) -> None:
+    payload = reward_payload()
+    mutation(payload)
+    client = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    )
+
+    with pytest.raises(OneTxDecodeError, match=message):
+        client.rewards("0x1111111111111111111111111111111111111111", 8453)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("claimableAmount", "-1"),
+        ("claimableAmount", "1.5"),
+        ("pendingAmount", "nan"),
+    ],
+)
+def test_rewards_rejects_non_integer_raw_amounts(field: str, value: str) -> None:
+    payload = reward_payload()
+    payload["rewards"][0][field] = value
+    client = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    )
+
+    with pytest.raises(ValueError, match=field):
+        client.rewards("0x1111111111111111111111111111111111111111", 8453)
+
+
+def test_rewards_rejects_negative_expiry() -> None:
+    payload = reward_payload()
+    payload["expiresAt"] = -1
+    client = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    )
+
+    with pytest.raises(ValueError, match="expiresAt"):
+        client.rewards("0x1111111111111111111111111111111111111111")
+
+
+def test_rewards_rejects_non_numeric_expiry_from_the_wire() -> None:
+    payload = reward_payload()
+    payload["expiresAt"] = "4102444800"
+    client = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    )
+
+    with pytest.raises(ValueError, match="expiresAt"):
+        client.rewards("0x1111111111111111111111111111111111111111")
 
 
 def test_balances_gets_address_path_and_parses() -> None:

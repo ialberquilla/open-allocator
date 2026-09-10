@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-allocator.local/schemas/rewards.schema.json",
+  "title": "Rewards",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "wallet": { "type": "string" },
+    "rewards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "provider": { "type": "string" },
+          "chain_id": { "type": "integer", "minimum": 0 },
+          "reward_token": {
+            "type": "object",
+            "properties": {
+              "address": { "type": "string" },
+              "chain_id": { "type": ["integer", "null"], "minimum": 0 },
+              "decimals": { "type": "integer", "minimum": 0 },
+              "symbol": { "type": "string" }
+            },
+            "required": ["address", "chain_id", "decimals", "symbol"]
+          },
+          "claimable_amount": { "type": "string", "pattern": "^[0-9]+$" },
+          "pending_amount": { "type": "string", "pattern": "^[0-9]+$" },
+          "claimable_amount_normalized": { "type": "string" },
+          "pending_amount_normalized": { "type": "string" },
+          "claim": { "type": "object" },
+          "swap": { "type": "object" },
+          "instrument_ids": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": [
+          "provider", "chain_id", "reward_token", "claimable_amount",
+          "pending_amount", "claimable_amount_normalized",
+          "pending_amount_normalized", "claim", "swap", "instrument_ids"
+        ]
+      }
+    },
+    "errors": { "type": "array" },
+    "expires_at": { "type": "integer", "minimum": 0 },
+    "expired": { "type": "boolean" }
+  },
+  "required": ["wallet", "rewards", "errors", "expires_at", "expired"]
+}

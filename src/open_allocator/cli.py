@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from functools import wraps
@@ -682,6 +683,29 @@ def _positions_payload(address: str | None) -> JsonObject:
 
     with OneTxClient(config) as client:
         return positions_core.read_positions(client, address).model_dump(mode="json")
+
+
+def _rewards_payload(wallet: str, chain_id: int | None) -> JsonObject:
+    with OneTxClient(ReadOnlyOneTxConfig()) as client:
+        response = client.rewards(wallet, chain_id)
+
+    payload: JsonObject = {
+        "wallet": response.wallet,
+        "rewards": [],
+        "errors": list(response.errors),
+        "expires_at": response.expires_at,
+        "expired": response.expires_at <= int(time.time()),
+    }
+    rewards = payload["rewards"]
+    assert isinstance(rewards, list)
+    for reward in response.rewards:
+        item = reward.model_dump(mode="json")
+        item["claimable_amount_normalized"] = reward.claimable_amount_normalized
+        item["pending_amount_normalized"] = reward.pending_amount_normalized
+        rewards.append(item)
+
+    validate(payload, "rewards")
+    return payload
 
 
 def _normalize_balances_response(response: object) -> JsonObject:
@@ -1539,6 +1563,15 @@ def positions(
     address: Annotated[str | None, typer.Option("--address")] = None,
 ) -> JsonObject:
     return _positions_payload(address)
+
+
+@app.command("rewards")
+@json_command
+def rewards(
+    wallet: Annotated[str, typer.Option("--wallet")],
+    chain: Annotated[int | None, typer.Option("--chain")] = None,
+) -> JsonObject:
+    return _rewards_payload(wallet, chain)
 
 
 @app.command("rebalance")
