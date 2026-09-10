@@ -32,6 +32,7 @@ The registered CLI commands are exactly:
 - `build-tx`
 - `execute`
 - `positions`
+- `rewards`
 - `rebalance`
 - `withdraw`
 <!-- command-inventory:end -->

@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 from open_allocator import cli
 from open_allocator.cli import JsonObject, json_command
 from open_allocator.core.schema import validate
+from open_allocator.exec.client import RewardsResponse
 
 runner = CliRunner()
 
@@ -27,6 +28,7 @@ COMMANDS = [
     "build-tx",
     "execute",
     "positions",
+    "rewards",
     "rebalance",
     "withdraw",
 ]
@@ -39,7 +41,7 @@ EXECUTION_SURFACE_COMMANDS = {
     "rebalance",
     "withdraw",
 }
-READ_ONLY_COMMANDS = {"list-vaults", "score-vault", "positions"}
+READ_ONLY_COMMANDS = {"list-vaults", "score-vault", "positions", "rewards"}
 ALLOCATION_COMMANDS = {"build-allocation", "simulate", "check-policy"}
 
 
@@ -751,6 +753,90 @@ def test_list_vaults_returns_json_array_with_summaries(
         "risk_metrics",
     }
     assert "history_days" in payload[0]["risk_metrics"]
+
+
+def test_rewards_is_read_only_and_emits_normalized_amounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_read_only_env(monkeypatch)
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "rewards-bearing.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    class RewardsOnlyClient:
+        calls: list[tuple[str, int | None]] = []
+
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def __enter__(self) -> "RewardsOnlyClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def rewards(self, wallet: str, chain_id: int | None) -> RewardsResponse:
+            self.calls.append((wallet, chain_id))
+            return RewardsResponse.model_validate(fixture)
+
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"read-only rewards command accessed {name}")
+
+    monkeypatch.setattr(cli, "OneTxClient", RewardsOnlyClient)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "rewards",
+            "--wallet",
+            fixture["wallet"],
+            "--chain",
+            "8453",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    payload = parse_single_stdout_object(result.stdout)
+    assert RewardsOnlyClient.calls == [(fixture["wallet"], 8453)]
+    assert payload["expired"] is False
+    assert payload["rewards"][0]["claimable_amount"] == "750"
+    assert payload["rewards"][0]["claimable_amount_normalized"] == "0.00075"
+    assert payload["rewards"][0]["pending_amount_normalized"] == "0.00005"
+    assert payload["rewards"][0]["swap"]["status"] == "no-route"
+    validate(payload, "rewards")
+
+
+def test_rewards_labels_expired_calldata(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_read_only_env(monkeypatch)
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "rewards-empty.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    fixture["expiresAt"] = 1
+
+    class ExpiredRewardsClient:
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def __enter__(self) -> "ExpiredRewardsClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def rewards(self, _wallet: str, _chain: int | None) -> RewardsResponse:
+            return RewardsResponse.model_validate(fixture)
+
+    monkeypatch.setattr(cli, "OneTxClient", ExpiredRewardsClient)
+
+    result = runner.invoke(cli.app, ["rewards", "--wallet", fixture["wallet"]])
+
+    assert result.exit_code == 0
+    assert parse_single_stdout_object(result.stdout)["expired"] is True
 
 
 def test_list_vaults_filters_and_sorts(

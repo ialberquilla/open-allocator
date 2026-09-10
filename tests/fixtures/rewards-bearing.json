@@ -1,0 +1,33 @@
+{
+  "wallet": "0x1111111111111111111111111111111111111111",
+  "rewards": [
+    {
+      "provider": "MERKL",
+      "chainId": 8453,
+      "rewardToken": {
+        "address": "0x2222222222222222222222222222222222222222",
+        "chainId": 8453,
+        "decimals": 6,
+        "symbol": "USDC"
+      },
+      "claimableAmount": "750",
+      "pendingAmount": "50",
+      "claim": {
+        "to": "0x3333333333333333333333333333333333333333",
+        "data": "0xabcdef",
+        "value": "0",
+        "type": "claim"
+      },
+      "swap": {
+        "status": "no-route",
+        "venue": "UNISWAP_V3",
+        "tokenOut": "0x4444444444444444444444444444444444444444",
+        "reason": "no liquid route",
+        "transactions": []
+      },
+      "instrumentIds": ["morpho-base-usdc-1"]
+    }
+  ],
+  "errors": ["chain 42161: provider unavailable"],
+  "expiresAt": 4102444800
+}

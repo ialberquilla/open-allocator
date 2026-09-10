@@ -120,6 +120,19 @@ SAMPLES = {
     "tx-plan": sample_tx_plan,
 }
 
+
+def test_rewards_schema_accepts_read_only_artifact() -> None:
+    payload = {
+        "wallet": "0x1111111111111111111111111111111111111111",
+        "rewards": [],
+        "errors": [],
+        "expires_at": 4102444800,
+        "expired": False,
+    }
+
+    assert validate(payload, "rewards") is payload
+
+
 MODEL_BY_SCHEMA_TITLE = {
     "Allocation": Allocation,
     "AllocationLeg": AllocationLeg,
