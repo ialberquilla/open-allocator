@@ -7,6 +7,11 @@ ride in one Safe operation when the signer can batch. Inner calls stay visible i
 reports but are never marked complete on their own inside a batch — they share
 one receipt and cannot partially settle.
 
+Before anything is sent, and again before each later operation, the plan is
+checked against what the account actually holds (``funding``): Darex simulated
+the calls with assumed balances, so a passing simulation says nothing about
+whether this Safe can pay for them.
+
 Two measurements must not be confused. A bundle's ``protocol_gas`` is Darex's
 wallet-neutral simulation of the bare calls. A ``WalletPreparation`` is this
 repo's estimate of the real envelope — deployment, paymaster approval, Safe
@@ -22,7 +27,7 @@ from typing import Literal
 
 from open_allocator.core import policy as policy_core
 from open_allocator.core.types import FrozenModel, TxBundle, TxPlan, TxStep
-from open_allocator.exec import calldata, chains
+from open_allocator.exec import calldata, chains, funding
 from open_allocator.exec.execute import (
     ExecutionBroadcastError,
     ExecutionReport,
@@ -39,6 +44,7 @@ from open_allocator.exec.execute import (
     pending_receipt_messages,
     supports_batching,
 )
+from open_allocator.exec.funding import FundingRequirement
 from open_allocator.exec.paymaster_types import (
     PaymasterError,
     PaymasterPreparationUnavailable,
@@ -49,6 +55,18 @@ from open_allocator.exec.signer import Receipt
 
 class SubmissionModeError(TransactionPlanError):
     """The configured signer cannot submit this plan safely as it was built."""
+
+
+class UnderfundedPlanError(TransactionPlanError):
+    """The account does not hold what the plan spends; nothing was sent for it."""
+
+    def __init__(
+        self,
+        message: str,
+        requirements: Sequence[FundingRequirement] = (),
+    ) -> None:
+        self.requirements = tuple(requirements)
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -89,10 +107,16 @@ class PlanPreparation(FrozenModel):
     """What a dry run can say about executing a plan with this signer."""
 
     preparations: tuple[WalletPreparation, ...] = ()
+    # Every token the plan spends, against the balance read for it.
+    funding: tuple[FundingRequirement, ...] = ()
     messages: tuple[str, ...] = ()
     # Reasons the plan cannot be submitted by this signer at all. A dry run
     # reports them; execution refuses before anything is sent.
     blockers: tuple[str, ...] = ()
+
+    @property
+    def funded(self) -> bool:
+        return all(item.ok for item in self.funding)
 
 
 @dataclass(frozen=True)
@@ -112,6 +136,7 @@ class BundleExecution:
     receipts: tuple[Receipt, ...]
     gas_checks: tuple[GasCheck, ...]
     preparations: tuple[WalletPreparation, ...]
+    funding: tuple[FundingRequirement, ...]
     in_progress: bool
     messages: tuple[str, ...]
     completed_keys: tuple[str, ...]
@@ -182,6 +207,7 @@ def prepare_plan(
     signer: object,
     plan: TxPlan,
     config: object | None = None,
+    idempotency_store: object | None = None,
 ) -> PlanPreparation:
     """Estimate every operation the plan would submit; sign and send nothing.
 
@@ -190,10 +216,25 @@ def prepare_plan(
     the calls in order — and estimated by the bundler. A proposal-only Safe is
     checked for what it cannot do: propose to a Safe that does not exist yet, or
     park an expiring quote in a queue with no execution deadline.
+
+    Then the whole plan is walked against the account's real balances: every
+    bundle's ``requires``, aggregated per chain and token in execution order,
+    plus each operation's bounded paymaster charge. A shortfall is a blocker.
     """
+    preparation, _checked = _prepare(signer, plan, config, idempotency_store)
+    return preparation
+
+
+def _prepare(
+    signer: object,
+    plan: TxPlan,
+    config: object | None,
+    idempotency_store: object | None,
+) -> tuple[PlanPreparation, tuple[str, ...]]:
+    """The preparation, plus which of its blockers are about submission mode."""
     bundles = planned_bundles(plan)
     if not bundles:
-        return PlanPreparation()
+        return PlanPreparation(), ()
 
     blockers = [
         *_submission_mode_blockers(signer, bundles),
@@ -201,9 +242,10 @@ def prepare_plan(
     ]
     preparations: list[WalletPreparation] = []
     messages: list[str] = []
+    grouped = operations(bundles, batching=supports_batching(signer))
     prepare = getattr(signer, "prepare_batch", None)
     if callable(prepare):
-        for operation in operations(bundles, batching=supports_batching(signer)):
+        for operation in grouped:
             try:
                 prepared = prepare(
                     operation.steps,
@@ -216,11 +258,17 @@ def prepare_plan(
                 break
             preparations.append(_wallet_preparation(operation, prepared))
 
-    return PlanPreparation(
-        preparations=tuple(preparations),
-        messages=tuple(messages),
-        blockers=tuple(blockers),
+    ledger, ledger_messages = _ledger_operations(
+        grouped, preparations, signer, idempotency_store
     )
+    check = funding.check_operations(ledger, config)
+    preparation = PlanPreparation(
+        preparations=tuple(preparations),
+        funding=check.requirements,
+        messages=(*messages, *ledger_messages, *check.messages),
+        blockers=(*blockers, *check.blockers),
+    )
+    return preparation, tuple(blockers)
 
 
 def execute_plan(
@@ -255,14 +303,17 @@ def execute_plan(
             receipts=(),
             gas_checks=(),
             preparations=(),
+            funding=(),
             in_progress=False,
             messages=(),
             completed_keys=(),
         )
 
-    preparation = prepare_plan(signer, plan, config)
-    if preparation.blockers:
+    preparation, mode_blockers = _prepare(signer, plan, config, idempotency_store)
+    if mode_blockers:
         raise SubmissionModeError("; ".join(preparation.blockers))
+    if not preparation.funded:
+        raise UnderfundedPlanError("; ".join(preparation.blockers), preparation.funding)
 
     address = str(signer.address())  # type: ignore[attr-defined]
     rpc_urls, gas_checks = _preflight(
@@ -284,6 +335,9 @@ def execute_plan(
     receipts: list[Receipt] = []
     completed: list[str] = []
     messages: list[str] = list(preparation.messages)
+    # Operations this run sent that are not yet included; a fresh balance read
+    # does not show what they spend.
+    unsettled: list[funding.LedgerOperation] = []
 
     def write_partial(operation: Operation) -> ExecutionReport:
         partial = ExecutionReport(
@@ -297,6 +351,7 @@ def execute_plan(
             receipts=tuple(receipts),
             gas_checks=gas_checks,
             preparations=preparation.preparations,
+            funding=preparation.funding,
             messages=tuple(messages),
         )
         _write_checkpoint(config, stage, partial, completed_keys=completed)
@@ -320,9 +375,26 @@ def execute_plan(
             f"{min_ttl}s of expiry"
             for bundle_id in rebuilt
         )
+        if settled or rebuilt:
+            # Balances moved since the plan was checked — earlier operations
+            # spent and produced — and a rebuilt bundle may require other
+            # amounts. Recheck everything still to be sent.
+            ledger, _notes = _ledger_operations(
+                (operation, *pending[1:]),
+                preparation.preparations,
+                signer,
+                idempotency_store,
+            )
+            check = funding.check_operations(ledger, config, unsettled=unsettled)
+            if not check.ok:
+                write_partial(operation)
+                raise UnderfundedPlanError(
+                    "; ".join(check.blockers), check.requirements
+                )
         rpc_url = rpc_urls[operation.chain_id]
         offset = sum(len(item.steps) for item in settled)
         try:
+            sent_receipts = len(receipts)
             if batching:
                 receipt = signer.send_batch(operation.steps, rpc_url)  # type: ignore[attr-defined]
                 receipts.append(receipt)
@@ -393,6 +465,11 @@ def execute_plan(
                 partial_report=partial,
             ) from error
 
+        if pending_receipt_messages(receipts[sent_receipts:]):
+            sent, _notes = _ledger_operations(
+                (operation,), preparation.preparations, signer, None
+            )
+            unsettled.extend(sent)
         settled.extend(operation.bundles)
         pending.pop(0)
 
@@ -403,6 +480,7 @@ def execute_plan(
         receipts=tuple(receipts),
         gas_checks=gas_checks,
         preparations=preparation.preparations,
+        funding=preparation.funding,
         in_progress=bool(unconfirmed),
         messages=(*messages, *unconfirmed),
         completed_keys=tuple(completed),
@@ -453,6 +531,65 @@ def _deployment_blockers(
                 "deploys it"
             )
     return blockers
+
+
+def _ledger_operations(
+    grouped: Sequence[Operation],
+    preparations: Sequence[WalletPreparation],
+    signer: object,
+    store: object | None,
+) -> tuple[tuple[funding.LedgerOperation, ...], tuple[str, ...]]:
+    """Operations as the funding ledger walks them, each with its gas charge."""
+    charges = {item.bundle_ids: item for item in preparations}
+    paymaster = callable(getattr(signer, "prepare_batch", None))
+    ledger: list[funding.LedgerOperation] = []
+    messages: list[str] = []
+    for operation in grouped:
+        # A bundle whose calls were partly sent one at a time by an earlier run
+        # has already spent some of what it requires; checking it again would
+        # refuse the rerun that finishes it.
+        bundles = tuple(
+            item.bundle
+            for item in operation.bundles
+            if not any(
+                _store_completed(store, item.call_key(index))
+                for index in range(len(item.steps))
+            )
+        )
+        for item in operation.bundles:
+            if item.bundle not in bundles:
+                messages.append(
+                    f"bundle {item.bundle.bundle_id} is partly sent; its "
+                    "requirements are not rechecked"
+                )
+        prepared = charges.get(
+            tuple(item.bundle.bundle_id for item in operation.bundles)
+        )
+        gas_token = gas_charge = None
+        if prepared is not None and prepared.paymaster_token is not None:
+            if prepared.max_gas_token_charge_raw is None:
+                messages.append(
+                    f"the paymaster's gas charge for {', '.join(prepared.bundle_ids)} "
+                    "could not be bounded, so no USDC is reserved for it"
+                )
+            else:
+                gas_token = prepared.paymaster_token
+                gas_charge = int(prepared.max_gas_token_charge_raw)
+        elif paymaster and prepared is None:
+            messages.append(
+                f"the paymaster's gas charge for "
+                f"{', '.join(item.bundle.bundle_id for item in operation.bundles)} "
+                "was not estimated, so no USDC is reserved for it"
+            )
+        ledger.append(
+            funding.LedgerOperation(
+                chain_id=operation.chain_id,
+                bundles=bundles,
+                gas_token=gas_token,
+                gas_charge_raw=gas_charge,
+            )
+        )
+    return tuple(ledger), tuple(messages)
 
 
 def _wallet_preparation(
@@ -601,6 +738,7 @@ __all__ = [
     "PlanPreparation",
     "PlannedBundle",
     "SubmissionModeError",
+    "UnderfundedPlanError",
     "assemble_plan",
     "execute_plan",
     "operations",

@@ -27,6 +27,7 @@ from open_allocator.exec.erc4337_paymaster import (
     submits_via_paymaster,
     validate_paymaster_preflight,
 )
+from open_allocator.exec.funding import FundingRequirement
 from open_allocator.exec.signer import Receipt, Signer
 
 
@@ -87,6 +88,8 @@ class ExecutionReport(FrozenModel):
     receipts: tuple[Receipt, ...] = Field(default_factory=tuple)
     gas_checks: tuple[GasCheck, ...] = Field(default_factory=tuple)
     preparations: tuple[WalletPreparation, ...] = Field(default_factory=tuple)
+    # What the plan spends per chain and token, against the balance read.
+    funding: tuple[FundingRequirement, ...] = Field(default_factory=tuple)
     in_progress: bool = False
     messages: tuple[str, ...] = Field(default_factory=tuple)
 
@@ -212,7 +215,10 @@ def execute_allocation(
             idempotency_store,
         )
 
-    balances_by_chain = _idle_usdc_by_chain(client, address)
+    # Each leg is sourced against what earlier legs left, not against the
+    # starting balances: otherwise several legs can each pick the same chain
+    # for money it only holds once.
+    ledger = FundingLedger(_idle_usdc_by_chain(client, address))
     plan_steps: list[TxStep] = []
     step_refs: list[_StepRef] = []
     build_payloads: list[object] = []
@@ -222,17 +228,18 @@ def execute_allocation(
         if _store_completed(idempotency_store, leg_key):
             continue
 
-        response = _build_buy(
-            client,
-            _buy_body(
-                address,
-                allocation_model,
-                leg_index,
-                vaults_by_id,
-                config,
-                balances_by_chain,
-            ),
+        body = _buy_body(
+            address,
+            allocation_model,
+            leg_index,
+            vaults_by_id,
+            config,
+            ledger.available,
         )
+        source = body.get("sourceChainId")
+        if isinstance(source, int):
+            ledger.debit(source, leg.usd)
+        response = _build_buy(client, body)
         build_payloads.append(response)
         raw_steps = _raw_transactions(response)
 
@@ -367,8 +374,9 @@ def _calldata_deposit_plan(
 
     Same-chain only: the instrument endpoint never bridges, so a leg pinned to
     another source chain is rejected rather than quietly deposited from the
-    vault's chain. Funding is not checked here; that is the funding ledger's job
-    before anything can execute.
+    vault's chain. Funding is not checked here: the plan's bundles say what
+    they require, and ``bundle_execution.prepare_plan`` checks all of them
+    together against real balances before anything can execute.
     """
     calldata.ensure_calldata_supported(config)
     steps: list[TxStep] = []
@@ -426,8 +434,8 @@ def _execute_calldata_deposits(
 ) -> ExecutionReport:
     """Submit a calldata deposit plan, one wallet operation per chain run.
 
-    Funding is not checked against the bundles' requirements yet; an
-    underfunded operation fails at the bundler's estimate or on chain.
+    Refused before anything is sent when the Safe does not hold what the
+    bundles require, in aggregate, plus each operation's paymaster charge.
     """
     from open_allocator.exec import bundle_execution
 
@@ -462,6 +470,7 @@ def _execute_calldata_deposits(
         receipts=result.receipts,
         gas_checks=result.gas_checks,
         preparations=result.preparations,
+        funding=result.funding,
         in_progress=result.in_progress,
         messages=result.messages,
     )
@@ -762,6 +771,12 @@ class FundingLedger:
         if chain not in self._available:
             self._available[chain] = -self._reserve
         self._available[chain] = self._available.get(chain, 0.0) + float(usd)
+
+    def debit(self, chain: int, usd: float) -> None:
+        """Spend from a chain the planner already chose to source a buy from."""
+        if usd <= 0:
+            return
+        self._available[chain] = self._available.get(chain, 0.0) - float(usd)
 
     def plan_sources(
         self,

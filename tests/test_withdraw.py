@@ -19,6 +19,7 @@ from open_allocator.core.types import (
     TxStep,
 )
 from open_allocator.core.withdraw import calldata_withdraw_amount, plan_withdraw
+from open_allocator.exec.bundle_execution import UnderfundedPlanError
 from open_allocator.exec.calldata import (
     CalldataUnsupportedError,
     CalldataValidationError,
@@ -595,6 +596,7 @@ class MockCalldataWithdrawClient:
 class CalldataConfig(Config):
     transaction_api: str = "calldata"
     slippage_bps: int = 50
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
     referral_fee_bps: int = 0
     referral_wallet: str | None = None
 
@@ -815,3 +817,51 @@ def test_calldata_withdraw_rejects_referral_configuration() -> None:
         )
 
     assert client.requests == []
+
+
+YIELD_TOKEN = "0x3333333333333333333333333333333333333333"
+
+
+def test_calldata_withdraw_dry_run_checks_the_shares_actually_held() -> None:
+    held = {YIELD_TOKEN.casefold(): 48 * 10**18}
+    config = CalldataConfig(
+        token_balance_reader=lambda _chain, _rpc, token, _account: held.get(
+            token.casefold(), 0
+        )
+    )
+
+    report = withdraw(
+        MockCalldataWithdrawClient(),
+        MockSigner(),
+        holding(),
+        permissive_policy(),
+        config=config,
+    )
+
+    assert report.status == "planned"
+    [shares] = report.funding
+    assert shares.token == YIELD_TOKEN
+    assert shares.required_raw == str(49 * 10**18)
+    assert shares.shortfall_raw == str(10**18)
+    assert any("short by" in message for message in report.messages)
+
+
+def test_calldata_withdraw_of_more_than_is_held_is_refused_unsent() -> None:
+    signer = BatchingWithdrawSigner()
+    store: dict[str, object] = {}
+
+    with pytest.raises(UnderfundedPlanError):
+        withdraw(
+            MockCalldataWithdrawClient(),
+            signer,
+            holding(),
+            permissive_policy(),
+            confirm=True,
+            config=CalldataConfig(
+                token_balance_reader=lambda _chain, _rpc, _token, _account: 0
+            ),
+            idempotency_store=store,
+        )
+
+    assert signer.batches == []
+    assert store == {}

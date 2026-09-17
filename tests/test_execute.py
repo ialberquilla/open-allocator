@@ -21,6 +21,7 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
+from open_allocator.exec.bundle_execution import UnderfundedPlanError
 from open_allocator.exec.calldata import (
     CalldataAmountError,
     CalldataUnsupportedError,
@@ -260,6 +261,35 @@ def test_source_chain_id_metadata_override_is_sent() -> None:
             "sourceChainId": 42161,
         }
     ]
+
+
+def test_legacy_legs_are_sourced_against_what_earlier_legs_left() -> None:
+    @dataclass
+    class FundedClient(MockOneTxClient):
+        def balances(self, _address: str) -> dict[str, Any]:
+            return {
+                "balances": [
+                    {"chainId": 8453, "usdcBalance": 150},
+                    {"chainId": 42161, "usdcBalance": 200},
+                ]
+            }
+
+    client = FundedClient(
+        [buy_response(tx(1, "0xbuy-a")), buy_response(tx(2, "0xbuy-b"))]
+    )
+
+    execute_allocation(
+        client,
+        MockSigner(),
+        allocation("vault-a", "vault-b"),
+        permissive_policy(),
+        known_instruments=[vault("vault-a"), vault("vault-b")],
+        config=Config(),
+    )
+
+    # Base covers the first leg; what it has left cannot cover the second,
+    # so the second sources from Arbitrum instead of Base's spent balance.
+    assert [body["sourceChainId"] for body in client.bodies] == [8453, 42161]
 
 
 def test_hex_numeric_transaction_fields_are_accepted() -> None:
@@ -877,6 +907,7 @@ class MockCalldataClient:
 class CalldataConfig(Config):
     transaction_api: str = "calldata"
     slippage_bps: int = 30
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
     referral_fee_bps: int = 0
     referral_wallet: str | None = None
     source_chain_id: int | None = None
@@ -1171,3 +1202,43 @@ def policy_without_new_instrument_gate() -> Policy:
             )
         }
     )
+
+
+def test_calldata_deposits_the_safe_cannot_fund_together_are_refused_unsent() -> None:
+    signer = BatchingCalldataSigner()
+    # Each bundle requires 100.25 USDC; 150 funds either leg, not both.
+    config = CalldataConfig(
+        token_balance_reader=lambda _chain, _rpc, _token, _account: 150_000_000
+    )
+
+    with pytest.raises(UnderfundedPlanError) as raised:
+        execute_allocation(
+            MockCalldataClient(),
+            signer,
+            allocation("vault-a", "vault-b"),
+            permissive_policy(),
+            confirm=True,
+            known_instruments=[calldata_vault("vault-a"), calldata_vault("vault-b")],
+            config=config,
+        )
+
+    assert signer.batches == []
+    [usdc] = raised.value.requirements
+    assert usdc.required_raw == "200500000"
+    assert usdc.shortfall_raw == "50500000"
+
+
+def test_calldata_deposit_report_carries_the_funding_it_was_checked_against() -> None:
+    report = execute_allocation(
+        MockCalldataClient(),
+        BatchingCalldataSigner(),
+        allocation("vault-a"),
+        permissive_policy(),
+        confirm=True,
+        known_instruments=[calldata_vault("vault-a")],
+        config=CalldataConfig(),
+    )
+
+    [usdc] = report.funding
+    assert usdc.token == BASE_USDC
+    assert usdc.ok

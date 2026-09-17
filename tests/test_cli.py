@@ -1595,6 +1595,7 @@ def _calldata_dry_run(
     from open_allocator.core.types import Allocation, TxPlan
     from open_allocator.exec.bundle_execution import PlanPreparation
     from open_allocator.exec.execute import WalletPreparation
+    from open_allocator.exec.funding import FundingRequirement
 
     preparation = PlanPreparation(
         preparations=(
@@ -1604,6 +1605,18 @@ def _calldata_dry_run(
                 sender="0x0000000000000000000000000000000000000001",
                 includes_deployment=True,
                 call_gas_limit=900_000,
+            ),
+        ),
+        funding=(
+            FundingRequirement(
+                chain_id=8453,
+                account="0x0000000000000000000000000000000000000001",
+                token="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                required_raw="100250000",
+                available_raw="100000000",
+                shortfall_raw="250000",
+                bundle_ids=("leg:0:base-aave-usdc:deposit",),
+                ok=False,
             ),
         ),
         messages=("wallet note",),
@@ -1646,6 +1659,8 @@ def test_execute_dry_run_reports_the_wallet_preparation(
     [preparation] = payload["preparations"]
     assert preparation["includes_deployment"] is True
     assert preparation["call_gas_limit"] == 900_000
+    [usdc] = payload["funding"]
+    assert (usdc["required_raw"], usdc["available_raw"]) == ("100250000", "100000000")
     assert payload["messages"] == [
         "dry-run only; no transactions broadcast",
         "wallet note",

@@ -281,6 +281,7 @@ def _execution_report(
     policy_result: object,
     plan: TxPlan,
     preparations: tuple[object, ...] = (),
+    funding: tuple[object, ...] = (),
     messages: tuple[str, ...] = (),
 ) -> object:
     from open_allocator.exec.execute import ExecutionReport
@@ -290,6 +291,7 @@ def _execution_report(
         policy_result=policy_result,
         plan=plan,
         preparations=preparations,
+        funding=funding,
         messages=messages,
     )
 
@@ -439,6 +441,7 @@ def _execute_allocation_from_cli(
             policy_result=policy_result,
             plan=plan,
             preparations=() if preparation is None else preparation.preparations,
+            funding=() if preparation is None else preparation.funding,
             messages=(
                 "dry-run only; no transactions broadcast",
                 *(() if preparation is None else preparation.messages),

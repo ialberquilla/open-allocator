@@ -387,9 +387,57 @@ def test_prepare_estimates_the_operation_without_signing_or_sending() -> None:
     assert prepared.paymaster.post_op_gas == 0x1388
 
 
-def test_prepare_does_not_invent_a_gas_token_charge() -> None:
-    """No bound until the rate arithmetic has been checked against a real charge."""
-    prepared = _adapter(FakeEndpoint()).prepare_user_operation(_request())
+def _erc20_stub(token: str = USDC, *, post_op_gas: int = 0x1388) -> dict[str, Any]:
+    body = bytes([0x03, 0x00]) + bytes(12) + bytes.fromhex(token[2:])
+    body += post_op_gas.to_bytes(16, "big") + (10**18).to_bytes(32, "big")
+    body += (1).to_bytes(16, "big") + bytes(20) + b"\x01" * 65
+    return {
+        "paymaster": PAYMASTER,
+        "paymasterPostOpGasLimit": "0x4e20",
+        "paymasterData": "0x" + body.hex(),
+    }
+
+
+_ESTIMATE_WITH_PAYMASTER_LIMITS = {
+    "callGasLimit": "0x186a0",
+    "verificationGasLimit": "0x30d40",
+    "preVerificationGas": "0xc350",
+    "paymasterVerificationGasLimit": "0x7530",
+    "paymasterPostOpGasLimit": "0x3a98",
+}
+
+
+def test_prepare_bounds_the_gas_token_charge_from_the_stub_config() -> None:
+    endpoint = FakeEndpoint(
+        pm_getPaymasterStubData=_erc20_stub(),
+        eth_estimateUserOperationGas=_ESTIMATE_WITH_PAYMASTER_LIMITS,
+    )
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+
+    # Where the stub and the estimate or quote disagree, the larger value is
+    # bounded: the stub's postOp limit (0x4e20) over the estimate's (0x3a98),
+    # and the quote's rate (2e18) over the stub's (1e18).
+    limits = 0x30D40 + 0x186A0 + 0xC350 + 0x7530 + 0x4E20
+    penalty = (0x186A0 + 0x4E20) // 10
+    expected = (limits + penalty + 0x1388) * 0x3B9ACA00 * 2 * 10**18 // 10**18
+    assert prepared.max_gas_token_charge_raw == str(expected)
+
+
+def test_prepare_does_not_invent_a_charge_from_an_unparseable_stub() -> None:
+    """A stub without the ERC-20 config could be hiding a constant fee."""
+    endpoint = FakeEndpoint(
+        eth_estimateUserOperationGas=_ESTIMATE_WITH_PAYMASTER_LIMITS
+    )
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+    assert prepared.max_gas_token_charge_raw is None
+
+
+def test_prepare_does_not_bound_a_charge_in_another_token() -> None:
+    endpoint = FakeEndpoint(
+        pm_getPaymasterStubData=_erc20_stub("0x" + "99" * 20),
+        eth_estimateUserOperationGas=_ESTIMATE_WITH_PAYMASTER_LIMITS,
+    )
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
     assert prepared.max_gas_token_charge_raw is None
 
 
@@ -525,7 +573,7 @@ def test_a_calldata_plan_is_prepared_without_sending_then_submitted_afresh(
     signer = Erc4337PaymasterSigner(adapter=adapter, usdc_address=USDC)
     tx_plan = _deposit_plan(adapter.address())
 
-    preparation = bundle_execution.prepare_plan(signer, tx_plan)
+    preparation = bundle_execution.prepare_plan(signer, tx_plan, _PlanConfig())
 
     assert not any(method in endpoint.methods() for method in _SUBMISSION_METHODS)
     [prepared] = preparation.preparations
@@ -568,6 +616,7 @@ class _PlanConfig:
     _rpc_overrides: dict[int, str] = dataclass_field(
         default_factory=lambda: {BASE: "https://base.invalid"}
     )
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
 
 
 def test_the_sender_is_derived_from_the_seed_not_the_configured_address() -> None:

@@ -49,12 +49,11 @@ class TokenQuote:
     table — is the only honest source for what gas will cost in USDC.
 
     🔑 **This carries the quote's fields and deliberately does no arithmetic on
-    them.** It used to offer a ``token_cost(gas_limit, max_fee_per_gas)`` helper
-    that scaled ``exchange_rate`` by 1e18. Nothing ever called it, so the
-    scaling was never checked against a real charge — and a plausible-looking
-    cost function that no receipt has ever agreed with is worse than none at
-    all, because the first caller has no reason to doubt it. Anything added
-    back here should be derived against a real charge first.
+    them.** A cost function that no receipt has agreed with is worse than none,
+    because the first caller has no reason to doubt it. The one bound this repo
+    does derive — the most an operation can be charged — lives in
+    ``paymaster_charge``, taken from the deployed paymaster's ``postOp`` and
+    checked against real mainnet charges.
     """
 
     paymaster: str

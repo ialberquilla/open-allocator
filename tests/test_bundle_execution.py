@@ -15,6 +15,7 @@ from open_allocator.exec.bundle_execution import (
     BundleLog,
     PlannedBundle,
     SubmissionModeError,
+    UnderfundedPlanError,
     assemble_plan,
     execute_plan,
     operations,
@@ -102,6 +103,7 @@ class Config:
     )
     min_calldata_ttl_seconds: int = 20
     slippage_bps: int = 30
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
     checkpoint_dir: Path | None = None
     allocation_log_path: Path | None = None
 
@@ -158,6 +160,7 @@ class PreparingSigner(BatchingSigner):
     sender: str = ACCOUNT
     prepared: list[tuple[TxStep, ...]] = field(default_factory=list)
     unavailable: bool = False
+    charge: str | None = None
 
     def prepare_batch(
         self, steps: tuple[TxStep, ...], rpc_url: str
@@ -191,6 +194,7 @@ class PreparingSigner(BatchingSigner):
                 post_op_gas=5_000,
                 approval_included=True,
             ),
+            max_gas_token_charge_raw=self.charge,
         )
 
 
@@ -543,3 +547,171 @@ def test_an_empty_plan_submits_nothing() -> None:
 
     assert signer.batches == []
     assert result.status == "success"
+
+
+# --- funding: what the Safe actually holds ------------------------------------
+
+USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BUNDLE_USDC = 100_250_000  # what the deposit fixture requires
+
+
+@dataclass
+class Balances:
+    """A USDC reader whose answers per chain can change between reads."""
+
+    usdc: dict[int, list[int]]
+    reads: dict[int, int] = field(default_factory=dict)
+
+    def __call__(self, chain_id: int, rpc_url: str, token: str, account: str) -> int:
+        if token.casefold() != USDC.casefold():
+            return 0
+        answers = self.usdc[chain_id]
+        count = self.reads.get(chain_id, 0)
+        self.reads[chain_id] = count + 1
+        return answers[min(count, len(answers) - 1)]
+
+
+def funded(usdc: int) -> Config:
+    return Config(token_balance_reader=Balances({BASE: [usdc], ARBITRUM: [usdc]}))
+
+
+def test_a_dry_run_reports_what_the_plan_spends_and_what_is_held() -> None:
+    signer = BatchingSigner()
+
+    preparation = prepare_plan(
+        signer, plan(response("a"), response("b")), funded(150_000_000)
+    )
+
+    [usdc] = preparation.funding
+    assert usdc.required_raw == str(2 * BUNDLE_USDC)
+    assert usdc.available_raw == "150000000"
+    assert not usdc.ok
+    assert not preparation.funded
+    [blocker] = preparation.blockers
+    assert "short by 50500000" in blocker
+    assert signer.batches == []
+
+
+def test_an_underfunded_plan_is_refused_before_anything_is_sent() -> None:
+    signer = BatchingSigner()
+
+    with pytest.raises(UnderfundedPlanError) as raised:
+        run(signer, plan(response("a"), response("b")), config=funded(150_000_000))
+
+    assert signer.batches == []
+    assert [item.ok for item in raised.value.requirements] == [False]
+
+
+def test_a_funded_plan_executes_and_reports_its_funding() -> None:
+    signer = BatchingSigner()
+
+    result = run(
+        signer, plan(response("a"), response("b")), config=funded(2 * BUNDLE_USDC)
+    )
+
+    assert len(signer.batches) == 1
+    [usdc] = result.funding
+    assert usdc.ok
+
+
+def test_the_paymasters_maximum_charge_is_reserved_out_of_the_same_usdc() -> None:
+    signer = PreparingSigner(charge="12345")
+
+    preparation = prepare_plan(signer, plan(response("a")), funded(BUNDLE_USDC))
+
+    [usdc] = preparation.funding
+    assert usdc.includes_gas_charge
+    assert usdc.required_raw == str(BUNDLE_USDC + 12_345)
+    assert usdc.shortfall_raw == "12345"
+    with pytest.raises(UnderfundedPlanError):
+        run(signer, plan(response("a")), config=funded(BUNDLE_USDC))
+    assert signer.batches == []
+
+
+def test_an_unbounded_paymaster_charge_is_said_not_silently_ignored() -> None:
+    preparation = prepare_plan(
+        PreparingSigner(charge=None), plan(response("a")), funded(10**12)
+    )
+
+    assert preparation.funded
+    assert any("could not be bounded" in message for message in preparation.messages)
+
+
+def test_a_signer_paying_native_gas_reserves_no_token_charge() -> None:
+    preparation = prepare_plan(BatchingSigner(), plan(response("a")), funded(10**12))
+
+    [usdc] = preparation.funding
+    assert not usdc.includes_gas_charge
+    assert not any("gas charge" in message for message in preparation.messages)
+
+
+def test_a_submission_mode_problem_is_not_reported_as_a_funding_one() -> None:
+    signer = ProposalSafeSigner()
+    expiring = plan(response("a", expires_at=NOW + 600))
+
+    with pytest.raises(SubmissionModeError):
+        run(signer, expiring, config=funded(0))
+
+
+def test_a_later_operation_is_rechecked_against_fresh_balances() -> None:
+    signer = BatchingSigner()
+    # Base, then Arbitrum, then Base again: three operations. Enough USDC at
+    # the start for both Base operations, then drained before the third.
+    tx_plan = plan(response("a"), response("c", chain_id=ARBITRUM), response("b"))
+    # Base is read for the plan, before the Arbitrum operation, and before the
+    # second Base operation — when it is found empty.
+    reader = Balances({BASE: [10**12, 10**12, 0], ARBITRUM: [10**12]})
+
+    with pytest.raises(UnderfundedPlanError):
+        run(
+            signer,
+            tx_plan,
+            config=Config(token_balance_reader=reader),
+        )
+
+    assert len(signer.batches) == 2, "sent operations stay sent; the third is not"
+
+
+def test_a_pending_operations_spend_is_applied_to_a_read_that_cannot_show_it() -> None:
+    signer = BatchingSigner(pending=True)
+    tx_plan = plan(response("a"), response("c", chain_id=ARBITRUM), response("b"))
+    # The first Base operation is still pending, so the read before the second
+    # one does not show its spend — but something else took 0.5 bundles' worth.
+    # What the second operation can count on is 1.5 - 1 = 0.5 bundles.
+    reader = Balances(
+        {
+            BASE: [2 * BUNDLE_USDC, 2 * BUNDLE_USDC, 3 * BUNDLE_USDC // 2],
+            ARBITRUM: [BUNDLE_USDC],
+        }
+    )
+
+    with pytest.raises(UnderfundedPlanError):
+        run(signer, tx_plan, config=Config(token_balance_reader=reader))
+
+    assert len(signer.batches) == 2
+
+
+def test_an_included_operation_is_already_in_the_fresh_read() -> None:
+    signer = BatchingSigner()
+    tx_plan = plan(response("a"), response("c", chain_id=ARBITRUM), response("b"))
+    # Included: the read before the second Base operation already shows the
+    # first one's spend, and it must not be subtracted a second time.
+    reader = Balances(
+        {BASE: [2 * BUNDLE_USDC, 2 * BUNDLE_USDC, BUNDLE_USDC], ARBITRUM: [BUNDLE_USDC]}
+    )
+
+    result = run(signer, tx_plan, config=Config(token_balance_reader=reader))
+
+    assert len(signer.batches) == 3
+    assert result.status == "success"
+
+
+def test_a_bundle_partly_sent_one_call_at_a_time_is_not_rechecked() -> None:
+    tx_plan = plan(response("a"))
+    [item] = planned_bundles(tx_plan)
+    store = {item.call_key(0): True, item.call_key(1): True}
+
+    preparation = prepare_plan(SequentialSigner(), tx_plan, funded(0), store)
+
+    assert preparation.funded
+    assert any("partly sent" in message for message in preparation.messages)

@@ -30,6 +30,7 @@ from open_allocator.exec.execute import (
     submission_groups,
     submit_steps,
 )
+from open_allocator.exec.funding import FundingRequirement
 from open_allocator.exec.signer import Receipt, Signer
 
 
@@ -53,6 +54,7 @@ class WithdrawExecutionReport(FrozenModel):
     receipts: tuple[Receipt, ...] = Field(default_factory=tuple)
     gas_checks: tuple[GasCheck, ...] = Field(default_factory=tuple)
     preparations: tuple[WalletPreparation, ...] = Field(default_factory=tuple)
+    funding: tuple[FundingRequirement, ...] = Field(default_factory=tuple)
     in_progress: bool = False
     messages: tuple[str, ...] = Field(default_factory=tuple)
 
@@ -94,13 +96,16 @@ def withdraw(
             idempotency_store,
         )
         if not confirm:
-            preparation = bundle_execution.prepare_plan(signer, tx_plan, config)
+            preparation = bundle_execution.prepare_plan(
+                signer, tx_plan, config, idempotency_store
+            )
             return WithdrawExecutionReport(
                 status="planned",
                 withdraw_plan=withdraw_plan,
                 sell=sell,
                 plan=tx_plan,
                 preparations=preparation.preparations,
+                funding=preparation.funding,
                 messages=(
                     "dry-run only; no transactions broadcast",
                     *preparation.messages,
@@ -370,6 +375,7 @@ def _execute_calldata_withdraw(
         receipts=result.receipts,
         gas_checks=result.gas_checks,
         preparations=result.preparations,
+        funding=result.funding,
         in_progress=result.in_progress,
         messages=result.messages,
     )

@@ -81,6 +81,19 @@ and an unreadable RPC (no answer) both fall through to sending the approval. A
 redundant approval wastes a few thousand gas; a missing one reverts the
 operation after paying for everything up to `postOp`.
 
+📍 **The most an operation can be charged is bounded, not guessed.** Before a
+calldata plan is sent, each operation's maximum USDC charge is reserved out of
+the Safe's balance alongside what its bundles require (`exec/funding.py`). The
+bound (`exec/paymaster_charge.py`) is read off Pimlico's `SingletonPaymasterV7`
+`postOp`: every gas limit, plus the contract's 10% unused-execution penalty,
+plus `postOpGas`, at `maxFeePerGas`, times `exchangeRate / 1e18`, plus any
+constant fee. The rate, `postOpGas`, and fee flags come from the stub
+`paymasterData`, which carries the same ERC-20 config the sponsorship does; a
+stub that does not parse gives no bound, and the plan says so rather than
+reserving a made-up amount. Checked 2026-09-17 against 26 ERC-20 charges on
+Base: every one inside the bound (the largest at 52% of it), and every one
+within 0.96–1.01x of `actualGasCost × exchangeRate / 1e18`.
+
 📍 **Modelled cost is a different number from charged cost, and the model prices
 gas in the chain's own token.** `core.costs` estimates what a leg will cost
 before it is sent; `exec.gas` reads the prices it needs. A chain whose gas token

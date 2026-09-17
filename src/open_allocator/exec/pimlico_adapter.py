@@ -10,6 +10,7 @@ from web3 import Web3
 from open_allocator.exec import (
     chains,
     erc20,
+    paymaster_charge,
     paymaster_registry,
     safe_4337_signature,
     safe_deployment,
@@ -33,6 +34,7 @@ from open_allocator.exec.pimlico import (
     FeeTier,
     PimlicoClient,
     PimlicoPaymasterAdapter,
+    TokenQuote,
 )
 from open_allocator.exec.safe_deployment import SafeSeed
 from open_allocator.exec.user_operation import (
@@ -270,8 +272,20 @@ class PimlicoUserOperationAdapter:
         # but the limits come from an estimate that needs the stub first. Seed
         # zeros to break the cycle — the estimate below overwrites all three.
         user_op.update(_GAS_LIMIT_PLACEHOLDERS)
-        estimate = pimlico.estimate_gas(pimlico.stub_data(user_op, token=token))
+        stubbed = pimlico.stub_data(user_op, token=token)
+        estimate = pimlico.estimate_gas(stubbed)
         user_op.update(_hex_values(estimate))
+        gas = UserOperationGas(
+            call_gas_limit=_estimate_field(estimate, "callGasLimit"),
+            verification_gas_limit=_estimate_field(estimate, "verificationGasLimit"),
+            pre_verification_gas=_estimate_field(estimate, "preVerificationGas"),
+            paymaster_verification_gas_limit=estimate.get(
+                "paymasterVerificationGasLimit"
+            ),
+            paymaster_post_op_gas_limit=estimate.get("paymasterPostOpGasLimit"),
+            max_fee_per_gas=fees["maxFeePerGas"],
+            max_priority_fee_per_gas=fees["maxPriorityFeePerGas"],
+        )
 
         prepared = PreparedUserOperation(
             sender=sender,
@@ -281,19 +295,7 @@ class PimlicoUserOperationAdapter:
             deployed=deployed,
             factory=user_op.get("factory"),
             factory_data=user_op.get("factoryData"),
-            gas=UserOperationGas(
-                call_gas_limit=_estimate_field(estimate, "callGasLimit"),
-                verification_gas_limit=_estimate_field(
-                    estimate, "verificationGasLimit"
-                ),
-                pre_verification_gas=_estimate_field(estimate, "preVerificationGas"),
-                paymaster_verification_gas_limit=estimate.get(
-                    "paymasterVerificationGasLimit"
-                ),
-                paymaster_post_op_gas_limit=estimate.get("paymasterPostOpGasLimit"),
-                max_fee_per_gas=fees["maxFeePerGas"],
-                max_priority_fee_per_gas=fees["maxPriorityFeePerGas"],
-            ),
+            gas=gas,
             paymaster=PaymasterTokenQuote(
                 paymaster=quote.paymaster,
                 token=token,
@@ -301,10 +303,12 @@ class PimlicoUserOperationAdapter:
                 post_op_gas=quote.post_op_gas,
                 approval_included=not approved,
             ),
-            # Not derived yet: bounding the USDC charge means scaling the
-            # quote's exchangeRate, and TokenQuote deliberately does no such
-            # arithmetic until it has been checked against a real charge.
-            max_gas_token_charge_raw=None,
+            max_gas_token_charge_raw=_max_gas_token_charge(
+                gas,
+                quote=quote,
+                stub=stubbed,
+                token=token,
+            ),
         )
         return prepared, pimlico
 
@@ -450,6 +454,50 @@ def _submission_from_receipt(
         ),
         message=message,
     )
+
+
+def _max_gas_token_charge(
+    gas: UserOperationGas,
+    *,
+    quote: TokenQuote,
+    stub: Mapping[str, Any],
+    token: str,
+) -> str | None:
+    """The bounded USDC charge, from the stub's paymaster config and the quote.
+
+    The stub carries the fee flags the quote does not, so an unparseable stub,
+    or one for another token, yields no bound rather than one that assumes no
+    constant fee. Where the stub and the estimate or quote both give a value —
+    paymaster gas limits, rate, postOpGas — the larger one is used: the
+    sponsorship at submission sets its own, and observed stubs carry a larger
+    postOp limit than the estimate.
+    """
+    config = paymaster_charge.parse_erc20_paymaster_data(stub.get("paymasterData"))
+    if config is None or config.token.casefold() != token.casefold():
+        return None
+    bounded = gas.model_copy(
+        update={
+            field: _larger(getattr(gas, field), stub.get(key))
+            for field, key in (
+                ("paymaster_verification_gas_limit", "paymasterVerificationGasLimit"),
+                ("paymaster_post_op_gas_limit", "paymasterPostOpGasLimit"),
+            )
+        }
+    )
+    charge = paymaster_charge.max_token_charge(
+        bounded,
+        post_op_gas=max(config.post_op_gas, quote.post_op_gas),
+        exchange_rate=max(config.exchange_rate, quote.exchange_rate),
+        constant_fee=config.constant_fee,
+    )
+    return None if charge is None else str(charge)
+
+
+def _larger(estimated: int | None, stubbed: object) -> int | None:
+    if stubbed is None:
+        return estimated
+    value = _optional_hex_int(stubbed)
+    return value if estimated is None else max(estimated, value)
 
 
 def _estimate_field(estimate: Mapping[str, int], key: str) -> int:
