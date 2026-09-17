@@ -33,11 +33,13 @@ from open_allocator.exec.execute import (
     TransactionPlanError,
 )
 from open_allocator.exec.paymaster_types import (
+    AssumedBalance,
     PaymasterPreparationUnavailable,
     PaymasterRejected,
     PaymasterTokenQuote,
     PreparedUserOperation,
     UserOperationGas,
+    UserOperationSimulationReverted,
 )
 from open_allocator.exec.signer import Receipt
 
@@ -161,12 +163,24 @@ class PreparingSigner(BatchingSigner):
     prepared: list[tuple[TxStep, ...]] = field(default_factory=list)
     unavailable: bool = False
     charge: str | None = None
+    # "unfunded": reverts unless balances are assumed; "broken": reverts always.
+    reverts: str | None = None
+    assumed: list[dict[str, int] | None] = field(default_factory=list)
 
     def prepare_batch(
-        self, steps: tuple[TxStep, ...], rpc_url: str
+        self,
+        steps: tuple[TxStep, ...],
+        rpc_url: str,
+        *,
+        assumed_balances: dict[str, int] | None = None,
     ) -> PreparedUserOperation:
         if self.unavailable:
             raise PaymasterPreparationUnavailable("GenericHttp cannot estimate")
+        self.assumed.append(assumed_balances)
+        if self.reverts == "broken" or (
+            self.reverts == "unfunded" and assumed_balances is None
+        ):
+            raise UserOperationSimulationReverted("reverted during simulation")
         self.prepared.append(tuple(steps))
         return PreparedUserOperation(
             sender=self.sender,
@@ -195,6 +209,10 @@ class PreparingSigner(BatchingSigner):
                 approval_included=True,
             ),
             max_gas_token_charge_raw=self.charge,
+            assumed_balances=tuple(
+                AssumedBalance(token=token, balance_raw=str(amount))
+                for token, amount in (assumed_balances or {}).items()
+            ),
         )
 
 
@@ -715,3 +733,63 @@ def test_a_bundle_partly_sent_one_call_at_a_time_is_not_rechecked() -> None:
 
     assert preparation.funded
     assert any("partly sent" in message for message in preparation.messages)
+
+
+# --- estimating an operation the account cannot fund yet ----------------------
+
+
+def test_an_unfunded_operation_is_estimated_with_its_requirements_assumed() -> None:
+    signer = PreparingSigner(deployed=False, reverts="unfunded", charge="30000")
+
+    preparation = prepare_plan(signer, plan(response("a"), response("b")), funded(0))
+
+    # First against the chain as it is, then once with what both bundles need.
+    assert signer.assumed == [None, {USDC: 2 * BUNDLE_USDC}]
+    [prepared] = preparation.preparations
+    assert prepared.includes_deployment is True
+    assert prepared.simulation_revert == "reverted during simulation"
+    assert [item.balance_raw for item in prepared.assumed_balances] == [
+        str(2 * BUNDLE_USDC)
+    ]
+    assert any("estimated with" in message for message in preparation.messages)
+    # The estimate validated the envelope; funding still says what is missing.
+    [usdc] = preparation.funding
+    assert usdc.required_raw == str(2 * BUNDLE_USDC + 30_000)
+    assert usdc.shortfall_raw == usdc.required_raw
+    assert not preparation.funded
+    assert signer.batches == []
+
+
+def test_a_funded_operation_is_estimated_against_the_chain_only() -> None:
+    signer = PreparingSigner()
+
+    [prepared] = prepare_plan(signer, plan(response("a")), funded(10**12)).preparations
+
+    assert signer.assumed == [None]
+    assert prepared.assumed_balances == ()
+    assert prepared.simulation_revert is None
+
+
+def test_an_operation_that_reverts_even_when_funded_is_an_error() -> None:
+    signer = PreparingSigner(reverts="broken")
+
+    with pytest.raises(UserOperationSimulationReverted, match="even with the balances"):
+        prepare_plan(signer, plan(response("a")), funded(0))
+    assert signer.batches == []
+
+
+def test_an_unfunded_operation_is_refused_as_underfunded_not_as_a_revert() -> None:
+    signer = PreparingSigner(reverts="unfunded", charge="30000")
+
+    with pytest.raises(UnderfundedPlanError):
+        run(signer, plan(response("a")), config=funded(0))
+    assert signer.batches == []
+
+
+def test_execution_never_proceeds_on_an_assumed_balance_estimate() -> None:
+    """Funded by the ledger yet reverting on chain: the revert is not explained."""
+    signer = PreparingSigner(reverts="unfunded", charge="30000")
+
+    with pytest.raises(TransactionPlanError, match="although the funding check"):
+        run(signer, plan(response("a")), config=funded(10**12))
+    assert signer.batches == []

@@ -19,6 +19,7 @@ from open_allocator.exec import (
     entry_point as entry_point_reads,
 )
 from open_allocator.exec.paymaster_types import (
+    AssumedBalance,
     PaymasterConfigurationError,
     PaymasterError,
     PaymasterTokenQuote,
@@ -27,6 +28,7 @@ from open_allocator.exec.paymaster_types import (
     PaymasterUserOperationSubmission,
     PreparedUserOperation,
     UserOperationGas,
+    UserOperationSimulationReverted,
 )
 from open_allocator.exec.pimlico import (
     DEFAULT_FEE_TIER,
@@ -34,6 +36,7 @@ from open_allocator.exec.pimlico import (
     FeeTier,
     PimlicoClient,
     PimlicoPaymasterAdapter,
+    PimlicoRpcError,
     TokenQuote,
 )
 from open_allocator.exec.safe_deployment import SafeSeed
@@ -50,6 +53,17 @@ from open_allocator.exec.user_operation import (
 # This is the piece that makes PAYMASTER_PROVIDER=pimlico reachable from the CLI.
 # The lower-level modules (pimlico, user_operation, safe_4337_signature) were each
 # usable on their own; nothing connected them to signer_from_config.
+
+# JSON-RPC codes the bundler answers with when its simulation of the operation
+# reverts: -32500 in validation (including a paymaster postOp, AA50), -32521 in
+# execution.
+_SIMULATION_REVERT_CODES = frozenset({-32500, -32521})
+
+# What an estimate with assumed balances gives the gas token on top of what the
+# calls require, so the paymaster's postOp pull succeeds. 2**64 raw units is at
+# least 18 whole tokens even at 18 decimals, more than any one operation's gas,
+# and far below the high bits some tokens pack flags into beside a balance.
+_ASSUMED_GAS_TOKEN_HEADROOM_RAW = 2**64
 
 _GAS_LIMIT_PLACEHOLDERS = {
     "callGasLimit": "0x0",
@@ -162,6 +176,8 @@ class PimlicoUserOperationAdapter:
     def prepare_user_operation(
         self,
         request: PaymasterUserOperationRequest,
+        *,
+        assumed_balances: Mapping[str, int] | None = None,
     ) -> PreparedUserOperation:
         """Build and estimate the complete operation; sign and send nothing.
 
@@ -169,8 +185,22 @@ class PimlicoUserOperationAdapter:
         the Safe's deployment when it is counterfactual, the paymaster approval
         when none is standing, and every call in order. It is a report, not a
         reservation — submission prepares again rather than reusing it.
+
+        ``assumed_balances`` (token -> raw amount) estimates as if the Safe held
+        at least those amounts, plus gas headroom in the gas token, wherever it
+        holds less. That validates the envelope for an account not funded yet;
+        it says nothing about whether the account is funded, and submission
+        never assumes anything.
         """
-        prepared, _pimlico = self._prepare(request)
+        try:
+            prepared, _pimlico = self._prepare(
+                request,
+                assumed_balances=assumed_balances,
+            )
+        except PimlicoRpcError as error:
+            if error.code in _SIMULATION_REVERT_CODES:
+                raise UserOperationSimulationReverted(str(error)) from error
+            raise
         return prepared
 
     def submit_user_operation(
@@ -221,6 +251,8 @@ class PimlicoUserOperationAdapter:
     def _prepare(
         self,
         request: PaymasterUserOperationRequest,
+        *,
+        assumed_balances: Mapping[str, int] | None = None,
     ) -> tuple[PreparedUserOperation, PimlicoPaymasterAdapter]:
         chain_id = request.chain_id
         if not paymaster_registry.is_gas_payable(chain_id, provider="pimlico"):
@@ -273,7 +305,27 @@ class PimlicoUserOperationAdapter:
         # zeros to break the cycle — the estimate below overwrites all three.
         user_op.update(_GAS_LIMIT_PLACEHOLDERS)
         stubbed = pimlico.stub_data(user_op, token=token)
-        estimate = pimlico.estimate_gas(stubbed)
+        state_override: dict[str, Any] = {}
+        assumed: tuple[AssumedBalance, ...] = ()
+        unassumed: tuple[str, ...] = ()
+        if assumed_balances is not None:
+            state_override, assumed, unassumed = _balance_overrides(
+                w3,
+                sender,
+                {
+                    **assumed_balances,
+                    token: _amount_for(assumed_balances, token)
+                    + _ASSUMED_GAS_TOKEN_HEADROOM_RAW,
+                },
+            )
+        try:
+            estimate = pimlico.estimate_gas(stubbed, state_override or None)
+        except PimlicoRpcError as error:
+            if unassumed and error.code in _SIMULATION_REVERT_CODES:
+                raise UserOperationSimulationReverted(
+                    f"{error}; not assumed: {'; '.join(unassumed)}"
+                ) from error
+            raise
         user_op.update(_hex_values(estimate))
         gas = UserOperationGas(
             call_gas_limit=_estimate_field(estimate, "callGasLimit"),
@@ -309,6 +361,7 @@ class PimlicoUserOperationAdapter:
                 stub=stubbed,
                 token=token,
             ),
+            assumed_balances=assumed,
         )
         return prepared, pimlico
 
@@ -491,6 +544,49 @@ def _max_gas_token_charge(
         constant_fee=config.constant_fee,
     )
     return None if charge is None else str(charge)
+
+
+def _balance_overrides(
+    w3: Web3,
+    owner: str,
+    wanted: Mapping[str, int],
+) -> tuple[dict[str, Any], tuple[AssumedBalance, ...], tuple[str, ...]]:
+    """State overrides raising ``owner``'s balances to ``wanted`` where short.
+
+    A balance already at least as large is left as the chain has it. A token
+    whose balance slot cannot be found is left too, and why is returned: the
+    estimate may still revert, and that revert is the honest answer.
+    """
+    override: dict[str, Any] = {}
+    assumed: list[AssumedBalance] = []
+    unassumed: list[str] = []
+    merged: dict[str, tuple[str, int]] = {}
+    for token, amount in wanted.items():
+        _name, total = merged.get(token.casefold(), (token, 0))
+        merged[token.casefold()] = (token, max(total, int(amount)))
+    for token, amount in merged.values():
+        try:
+            if erc20.balance_of(w3, token, owner=owner) >= amount:
+                continue
+        except erc20.BalanceReadError:
+            pass
+        try:
+            override.update(
+                erc20.balance_state_override(w3, token, owner=owner, balance=amount)
+            )
+        except erc20.BalanceOverrideUnavailable as error:
+            unassumed.append(str(error))
+            continue
+        assumed.append(AssumedBalance(token=token, balance_raw=str(amount)))
+    return override, tuple(assumed), tuple(unassumed)
+
+
+def _amount_for(amounts: Mapping[str, int], token: str) -> int:
+    wanted = token.casefold()
+    return max(
+        (int(amount) for key, amount in amounts.items() if key.casefold() == wanted),
+        default=0,
+    )
 
 
 def _larger(estimated: int | None, stubbed: object) -> int | None:

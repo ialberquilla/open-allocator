@@ -188,12 +188,16 @@ class PimlicoPaymasterAdapter:
     def estimate_gas(
         self,
         user_operation: Mapping[str, Any],
+        state_override: Mapping[str, Any] | None = None,
     ) -> dict[str, int]:
-        """eth_estimateUserOperationGas."""
-        result = self._client.call(
-            "eth_estimateUserOperationGas",
-            [dict(user_operation), self._entry_point],
-        )
+        """eth_estimateUserOperationGas, optionally against overridden state.
+
+        The override is the third parameter, in eth_call's state-override shape.
+        """
+        params: list[Any] = [dict(user_operation), self._entry_point]
+        if state_override:
+            params.append(dict(state_override))
+        result = self._client.call("eth_estimateUserOperationGas", params)
         if not isinstance(result, Mapping):
             raise PimlicoError("malformed gas estimate")
         return {

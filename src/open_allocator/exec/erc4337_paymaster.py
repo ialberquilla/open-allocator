@@ -103,11 +103,14 @@ class Erc4337PaymasterSigner:
         self,
         steps: Sequence[TxStep],
         rpc_url: str,
+        *,
+        assumed_balances: Mapping[str, int] | None = None,
     ) -> PreparedUserOperation:
         """The operation send_batch would submit, estimated but never signed.
 
         Stale by construction — send_batch prepares again right before signing —
         so this is what a dry run reports, not something to submit later.
+        ``assumed_balances`` estimates it as if the Safe held those amounts.
         """
         _ = rpc_url
         request = self._request(steps)
@@ -117,7 +120,12 @@ class Erc4337PaymasterSigner:
                 f"{type(adapter).__name__} cannot estimate a user operation "
                 "without submitting it"
             )
-        return adapter.prepare_user_operation(request)
+        if assumed_balances is None:
+            return adapter.prepare_user_operation(request)
+        return adapter.prepare_user_operation(
+            request,
+            assumed_balances=assumed_balances,
+        )
 
     def _request(self, steps: Sequence[TxStep]) -> PaymasterUserOperationRequest:
         if not steps:

@@ -16,6 +16,13 @@ Two measurements must not be confused. A bundle's ``protocol_gas`` is 1Tx's
 wallet-neutral simulation of the bare calls. A ``WalletPreparation`` is this
 repo's estimate of the real envelope — deployment, paymaster approval, Safe
 batching — and is the one that says whether the operation can run.
+
+An account that does not hold what an operation spends — a counterfactual Safe
+not funded yet, usually — reverts in the bundler's simulation. Preparation then
+estimates once more with the bundles' requirements assumed, the way 1Tx assumes
+balances, and marks the result: the envelope is validated, and the funding
+check reports the shortfall rather than the plan dying on a bundler revert.
+Execution never proceeds on such an estimate.
 """
 
 from __future__ import annotations
@@ -49,6 +56,7 @@ from open_allocator.exec.paymaster_types import (
     PaymasterError,
     PaymasterPreparationUnavailable,
     PreparedUserOperation,
+    UserOperationSimulationReverted,
 )
 from open_allocator.exec.signer import Receipt
 
@@ -220,6 +228,10 @@ def prepare_plan(
     Then the whole plan is walked against the account's real balances: every
     bundle's ``requires``, aggregated per chain and token in execution order,
     plus each operation's bounded paymaster charge. A shortfall is a blocker.
+
+    An operation that reverts against real balances is estimated again with
+    its bundles' requirements assumed (see the module docstring); one that
+    reverts even then raises ``UserOperationSimulationReverted``.
     """
     preparation, _checked = _prepare(signer, plan, config, idempotency_store)
     return preparation
@@ -246,17 +258,49 @@ def _prepare(
     prepare = getattr(signer, "prepare_batch", None)
     if callable(prepare):
         for operation in grouped:
+            rpc_url = chains.rpc_url(operation.chain_id, config) or ""
+            revert: UserOperationSimulationReverted | None = None
             try:
-                prepared = prepare(
-                    operation.steps,
-                    chains.rpc_url(operation.chain_id, config) or "",
-                )
+                try:
+                    prepared = prepare(operation.steps, rpc_url)
+                except UserOperationSimulationReverted as error:
+                    revert = error
+                    prepared = prepare(
+                        operation.steps,
+                        rpc_url,
+                        assumed_balances=_required_balances(operation),
+                    )
             except PaymasterPreparationUnavailable as error:
                 messages.append(
                     f"wallet gas is not estimated before submission: {error}"
                 )
                 break
-            preparations.append(_wallet_preparation(operation, prepared))
+            except UserOperationSimulationReverted as error:
+                raise UserOperationSimulationReverted(
+                    f"operation for {', '.join(operation.bundle_ids)} reverts in "
+                    f"the bundler's simulation even with the balances its "
+                    f"bundles require assumed: {error}"
+                ) from revert
+            if revert is not None and not prepared.assumed_balances:
+                # Nothing needed assuming, so the retry ran against the chain as
+                # it is and its estimate stands on its own.
+                revert = None
+            preparation_item = _wallet_preparation(operation, prepared)
+            if revert is not None:
+                preparation_item = preparation_item.model_copy(
+                    update={"simulation_revert": str(revert)}
+                )
+                messages.append(
+                    f"operation for {', '.join(operation.bundle_ids)} reverts "
+                    f"against the account's current balances ({revert}); its "
+                    "wallet gas was estimated with "
+                    + ", ".join(
+                        f"{item.balance_raw} raw units of {item.token}"
+                        for item in prepared.assumed_balances
+                    )
+                    + " assumed"
+                )
+            preparations.append(preparation_item)
 
     ledger, ledger_messages = _ledger_operations(
         grouped, preparations, signer, idempotency_store
@@ -316,6 +360,15 @@ def execute_plan(
         raise SubmissionModeError("; ".join(preparation.blockers))
     if not preparation.funded:
         raise UnderfundedPlanError("; ".join(preparation.blockers), preparation.funding)
+    for item in preparation.preparations:
+        if item.simulation_revert is not None:
+            # Funded by the ledger, yet it reverted against the real balances:
+            # the assumed-balance estimate cannot vouch for submitting it.
+            raise TransactionPlanError(
+                f"operation for {', '.join(item.bundle_ids)} reverts in the "
+                f"bundler's simulation against the account's current balances, "
+                f"although the funding check passes: {item.simulation_revert}"
+            )
 
     address = str(signer.address())  # type: ignore[attr-defined]
     rpc_urls, gas_checks = _preflight(
@@ -594,6 +647,22 @@ def _ledger_operations(
     return tuple(ledger), tuple(messages)
 
 
+def _required_balances(operation: Operation) -> dict[str, int]:
+    """Per token, everything the operation's bundles require, summed.
+
+    An upper bound — it credits nothing an earlier bundle in the operation
+    produces — which is what an estimate assuming funding wants.
+    """
+    totals: dict[str, int] = {}
+    names: dict[str, str] = {}
+    for item in operation.bundles:
+        for requirement in item.bundle.requires:
+            key = requirement.token.casefold()
+            names.setdefault(key, requirement.token)
+            totals[key] = totals.get(key, 0) + int(requirement.amount)
+    return {names[key]: amount for key, amount in totals.items()}
+
+
 def _wallet_preparation(
     operation: Operation,
     prepared: PreparedUserOperation,
@@ -629,6 +698,7 @@ def _wallet_preparation(
         paymaster_token=prepared.paymaster.token,
         paymaster_approval_included=prepared.paymaster.approval_included,
         max_gas_token_charge_raw=prepared.max_gas_token_charge_raw,
+        assumed_balances=prepared.assumed_balances,
     )
 
 

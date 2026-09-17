@@ -245,6 +245,10 @@ class TxBundle(FrozenModel):
     expected_out: str | None = Field(default=None, pattern=r"^\d+$")
     min_out: str | None = Field(default=None, pattern=r"^\d+$")
     protocol_gas: str = Field(pattern=r"^\d+$")
+    # Raw ``token_out`` the account gained in that simulation, at the quote
+    # block and with the simulation's assumed balances; None in plans stored
+    # before it was recorded. Not settled value.
+    simulated_out: str | None = Field(default=None, pattern=r"^\d+$")
     simulation_scope: Literal["protocol_bundle"] = "protocol_bundle"
     simulation_engine: Literal["wallet_neutral_atomic"] = "wallet_neutral_atomic"
 

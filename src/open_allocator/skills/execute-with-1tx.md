@@ -8,7 +8,7 @@ Before announcing, understand the funding model: read [docs/funding-and-bridging
 
 1. Verify `check-policy` is `ok: true` for the exact allocation artifact.
 2. Build the dry transaction plan: `open-allocator build-tx --allocation <allocation.json> --policy <policy.yaml>`.
-3. Announce wallet, chains, instruments, amounts, transaction step count/types, gas assets, policy result, calldata source, and failure modes. For a calldata plan, include the dry run's `funding` rows (required vs. held per token, with any shortfall); a shortfall is a blocker, not a warning.
+3. Announce wallet, chains, instruments, amounts, transaction step count/types, gas assets, policy result, calldata source, and failure modes. For a calldata plan, include the dry run's `funding` rows (required vs. held per token, with any shortfall); a shortfall is a blocker, not a warning. Report wallet gas from `preparations` (and whether it `includes_deployment`), never a bundle's `protocol_gas` in its place; a preparation with `assumed_balances` was estimated as if funded and cannot be executed as it stands.
 4. Wait for explicit human approval for that exact action.
 5. Execute only after approval: `open-allocator execute --allocation <allocation.json> --policy <policy.yaml> --confirm`.
 6. Run `open-allocator positions --address <wallet>` and reconcile expected holdings.

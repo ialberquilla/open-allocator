@@ -240,6 +240,7 @@ def plan_bundle(
         expected_out=response.expected_out,
         min_out=response.min_out,
         protocol_gas=response.simulation.gas_used,
+        simulated_out=response.simulation.token_out_delta,
         simulation_scope=response.simulation.scope,
         simulation_engine=response.simulation.engine,
     )

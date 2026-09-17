@@ -186,6 +186,9 @@
         "protocol_gas": {
           "$ref": "#/$defs/RawUint"
         },
+        "simulated_out": {
+          "anyOf": [{ "$ref": "#/$defs/RawUint" }, { "type": "null" }]
+        },
         "simulation_scope": {
           "enum": ["protocol_bundle"]
         },

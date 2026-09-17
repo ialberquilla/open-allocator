@@ -28,6 +28,7 @@ from open_allocator.exec.erc4337_paymaster import (
     validate_paymaster_preflight,
 )
 from open_allocator.exec.funding import FundingRequirement
+from open_allocator.exec.paymaster_types import AssumedBalance
 from open_allocator.exec.signer import Receipt, Signer
 
 
@@ -78,6 +79,12 @@ class WalletPreparation(FrozenModel):
     paymaster_approval_included: bool | None = None
     # None when the adapter cannot bound the charge defensibly.
     max_gas_token_charge_raw: str | None = Field(default=None, pattern=r"^\d+$")
+    # Balances the estimate assumed because, against the account's real
+    # balances, the operation reverted with ``simulation_revert``. Such an
+    # estimate validates the envelope — deployment, module, paymaster, calls —
+    # not the funding; ``funding`` says what is missing.
+    assumed_balances: tuple[AssumedBalance, ...] = ()
+    simulation_revert: str | None = None
 
 
 class ExecutionReport(FrozenModel):

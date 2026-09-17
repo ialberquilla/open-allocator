@@ -99,6 +99,38 @@ would leave less USDC than the operation's maximum charge, they are rebuilt
 smaller by the shortfall and the operation is prepared again, at most three
 times. A shortfall still standing after that is reported, not guessed around.
 
+📍 **A calldata plan carries two gas numbers, and they are different
+measurements.** Each bundle's `protocol_gas` is 1Tx's simulation of the bare
+calls under its ephemeral, wallet-neutral executor (`simulation.scope =
+protocol_bundle`, `engine = wallet_neutral_atomic`). Each entry in a dry run's
+`preparations` is this repo's bundler estimate of the real operation — Safe
+deployment when counterfactual, the Safe4337Module batch, the paymaster approval
+and stub, current nonce and fees — and it is the one that says the operation can
+run. Neither is signed or sent; submission estimates again.
+
+📍 **An unfunded Safe is still estimated, against assumed balances.** A Safe that
+does not yet hold what its bundles spend — typically a counterfactual Safe before
+its first deposit — reverts in the bundler's simulation (`AA50 postOp reverted`
+when the gas USDC is missing, the module's `ExecutionFailed` when the calls'
+tokens are). Preparation then estimates once more with each bundle's `requires`
+(plus gas headroom in USDC) written into the Safe's balance through an
+`eth_estimateUserOperationGas` state override, and the entry reports
+`assumed_balances` and the original `simulation_revert`. That estimate validates
+the envelope; the `funding` rows still report the shortfall, which blocks
+execution, and `execute --confirm` never proceeds on an assumed-balance estimate.
+The balance slot is found per token by checking candidate storage layouts
+against the token's own `balanceOf` in an `eth_call`, so it needs an RPC that
+accepts state overrides (the public `mainnet.base.org` does not) and fails, with
+the reason in the error, for tokens whose balance is not a plain stored value.
+
+The live gate for all of this is opt-in:
+`OPEN_ALLOCATOR_LIVE_CALLDATA_PROBE=1 uv run pytest -m integration
+tests/test_calldata_probe.py`. It probes every active instrument for an account
+with no code and for the configured Safe (`exec/calldata_probe.py`: request
+answered without `executor`, strict contract, bound to the request), then
+prepares a deposit for the configured Safe and a counterfactual one on each
+paymaster chain.
+
 📍 **Modelled cost is a different number from charged cost, and the model prices
 gas in the chain's own token.** `core.costs` estimates what a leg will cost
 before it is sent; `exec.gas` reads the prices it needs. A chain whose gas token

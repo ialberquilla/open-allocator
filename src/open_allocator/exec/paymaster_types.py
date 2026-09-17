@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
@@ -24,6 +25,15 @@ class PaymasterRejected(PaymasterError):
 
 class PaymasterPreparationUnavailable(PaymasterError):
     """The adapter can submit an operation but cannot prepare one unsent."""
+
+
+class UserOperationSimulationReverted(PaymasterError):
+    """The bundler simulated the prepared operation and it reverted.
+
+    Raised by preparation only. An account that does not yet hold what the
+    calls spend or the paymaster charges reverts this way, so a caller may
+    prepare again with those balances assumed.
+    """
 
 
 class PaymasterUnsupportedChain(PaymasterError):
@@ -90,6 +100,13 @@ class PaymasterTokenQuote(FrozenModel):
     approval_included: bool
 
 
+class AssumedBalance(FrozenModel):
+    """A token balance the estimate assumed in place of the one on chain."""
+
+    token: str
+    balance_raw: str = Field(pattern=r"^\d+$")
+
+
 class PreparedUserOperation(FrozenModel):
     """A complete operation built and estimated, but neither signed nor sent.
 
@@ -112,6 +129,9 @@ class PreparedUserOperation(FrozenModel):
     # cannot bound it defensibly: such an operation may still spend a funded
     # balance, but must not be the one a bridged mint has to pay for.
     max_gas_token_charge_raw: str | None = Field(default=None, pattern=r"^\d+$")
+    # Balances the estimate overrode because the account does not hold them.
+    # Empty means it ran against the chain as it is.
+    assumed_balances: tuple[AssumedBalance, ...] = ()
 
     @property
     def includes_deployment(self) -> bool:
@@ -135,4 +155,6 @@ class PreparingPaymasterUserOperationAdapter(PaymasterUserOperationAdapter, Prot
     def prepare_user_operation(
         self,
         request: PaymasterUserOperationRequest,
+        *,
+        assumed_balances: Mapping[str, int] | None = None,
     ) -> PreparedUserOperation: ...

@@ -363,6 +363,7 @@ def test_plan_bundle_records_the_quote_it_was_built_from() -> None:
     assert bundle.expected_out == "98765432100000000000"
     assert bundle.min_out is None
     assert bundle.protocol_gas == "412345"
+    assert bundle.simulated_out == "98765432100000000000"
     assert bundle.simulation_scope == "protocol_bundle"
     assert bundle.simulation_engine == "wallet_neutral_atomic"
     assert len(steps) == 5
