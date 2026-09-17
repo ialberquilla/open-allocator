@@ -35,10 +35,8 @@ class RebalanceTrade(FrozenModel):
     current_weight: float = Field(ge=0)
     target_weight: float = Field(ge=0)
     yield_token_amount: str | None = None
-    # Sells only. Calldata API amount: ``max`` for a full exit, raw
-    # underlying-asset units for a partial one — never the share estimate above.
-    # None when the positions lack ``balance_raw``/``decimals``, so a calldata
-    # request for this trade must fail closed.
+    # Sells only: ``max`` for a full exit, raw underlying units for a partial
+    # one. None when positions lack ``balance_raw``/``decimals``.
     calldata_amount: str | None = None
 
 

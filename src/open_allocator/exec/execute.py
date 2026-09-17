@@ -53,10 +53,8 @@ class ExecutionStepReport(FrozenModel):
 class WalletPreparation(FrozenModel):
     """The wallet-aware estimate of one Safe operation, prepared but not sent.
 
-    Keyed by the plan bundles the operation carries. Holds only what the
-    announcement needs; the provider's UserOperation itself stays out of plans
-    and reports, because its nonce, fees, and sponsorship expire and are
-    refreshed before submission.
+    Keyed by the plan bundles it carries. The UserOperation itself is left out:
+    its nonce, fees, and sponsorship expire before submission.
     """
 
     bundle_ids: tuple[str, ...] = Field(min_length=1)
@@ -79,10 +77,8 @@ class WalletPreparation(FrozenModel):
     paymaster_approval_included: bool | None = None
     # None when the adapter cannot bound the charge defensibly.
     max_gas_token_charge_raw: str | None = Field(default=None, pattern=r"^\d+$")
-    # Balances the estimate assumed because, against the account's real
-    # balances, the operation reverted with ``simulation_revert``. Such an
-    # estimate validates the envelope — deployment, module, paymaster, calls —
-    # not the funding; ``funding`` says what is missing.
+    # Balances assumed because the operation reverted against the real ones;
+    # ``funding`` says what is missing.
     assumed_balances: tuple[AssumedBalance, ...] = ()
     simulation_revert: str | None = None
 
@@ -222,9 +218,8 @@ def execute_allocation(
             idempotency_store,
         )
 
-    # Each leg is sourced against what earlier legs left, not against the
-    # starting balances: otherwise several legs can each pick the same chain
-    # for money it only holds once.
+    # Source each leg from what earlier legs left, so two legs never spend the
+    # same balance.
     ledger = FundingLedger(_idle_usdc_by_chain(client, address))
     plan_steps: list[TxStep] = []
     step_refs: list[_StepRef] = []
@@ -379,11 +374,8 @@ def _calldata_deposit_plan(
 ) -> TxPlan:
     """A deposit plan built from calldata bundles, one per unfinished leg.
 
-    Same-chain only: the instrument endpoint never bridges, so a leg pinned to
-    another source chain is rejected rather than quietly deposited from the
-    vault's chain. Funding is not checked here: the plan's bundles say what
-    they require, and ``bundle_execution.prepare_plan`` checks all of them
-    together against real balances before anything can execute.
+    Same-chain only: a leg pinned to another source chain is rejected. Funding
+    is checked later by ``bundle_execution.prepare_plan``.
     """
     calldata.ensure_calldata_supported(config)
     steps: list[TxStep] = []

@@ -8,14 +8,25 @@ from typing import Any
 
 import httpx
 import pytest
+from web3 import HTTPProvider, Web3
 
+from open_allocator.core import universe
+from open_allocator.exec import calldata, chains, paymaster_registry
+from open_allocator.exec.bundle_execution import (
+    PlannedBundle,
+    assemble_plan,
+    prepare_plan,
+)
 from open_allocator.exec.calldata_probe import PROBE_ACCOUNT, probe_instrument
 from open_allocator.exec.client import (
     InstrumentCalldataQuery,
     InstrumentCalldataResponse,
+    OneTxClient,
     OneTxDecodeError,
     OneTxHTTPError,
 )
+from open_allocator.exec.config import AllocatorConfig
+from open_allocator.exec.signer import signer_from_config
 
 FIXTURES = Path(__file__).parent / "fixtures"
 INSTRUMENT_ID = "0x" + "ab" * 32
@@ -161,14 +172,7 @@ def test_the_same_probe_verifies_a_deployed_account() -> None:
 
 @pytest.mark.integration
 def test_live_calldata_compatibility_across_the_active_catalog() -> None:
-    """Rollout gate: every active instrument, both account states, wallet gas.
-
-    Per instrument: a deposit and an exact withdrawal probed for an account with
-    no code, and a deposit probed for the configured Safe where it is deployed.
-    Per paymaster chain: one deposit prepared — estimated, never signed or sent —
-    for the configured Safe and for a counterfactual Safe of the same owners,
-    with protocol gas and wallet gas reported as separate measurements.
-    """
+    """Every active instrument, both account states, and wallet gas per chain."""
     if os.environ.get("OPEN_ALLOCATOR_LIVE_CALLDATA_PROBE") != "1":
         pytest.skip("set OPEN_ALLOCATOR_LIVE_CALLDATA_PROBE=1 to opt in")
     missing = [
@@ -178,19 +182,6 @@ def test_live_calldata_compatibility_across_the_active_catalog() -> None:
     ]
     if missing:
         pytest.skip(f"live calldata probe requires: {', '.join(missing)}")
-
-    from web3 import HTTPProvider, Web3
-
-    from open_allocator.core import universe
-    from open_allocator.exec import calldata, chains, paymaster_registry
-    from open_allocator.exec.bundle_execution import (
-        PlannedBundle,
-        assemble_plan,
-        prepare_plan,
-    )
-    from open_allocator.exec.client import OneTxClient
-    from open_allocator.exec.config import AllocatorConfig
-    from open_allocator.exec.signer import signer_from_config
 
     config = AllocatorConfig(transaction_api="calldata")
 

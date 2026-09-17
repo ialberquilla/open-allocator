@@ -1,22 +1,15 @@
 """Whether the account actually holds what a calldata plan spends.
 
-1Tx simulates a bundle with balance state overrides (``assumedBalances``), so
-a successful simulation proves the calls compose, not that the Safe owns the
-tokens. This module closes that gap with a ledger in raw token units, per
-(chain, account, token), walked in the exact order the plan will execute:
+1Tx simulates bundles with assumed balances, so this module walks a raw-unit
+ledger per (chain, account, token) in execution order:
 
-- before a bundle runs, its ``requires`` must be present, and are then spent;
-- after it runs, its output is credited conservatively — ``min_out`` when
-  quoted, otherwise ``expected_out`` less the configured slippage — so a
-  withdrawal can fund what follows it in the same operation;
-- ``leftovers`` are never credited: they are what a bundle *may* leave behind;
-- after an ERC-4337 operation's calls, the paymaster's bounded maximum USDC
-  charge must be present, because it is pulled in ``postOp``.
+- a bundle's ``requires`` must be present, and are then spent;
+- its output is credited as ``min_out``, else ``expected_out`` less slippage;
+- ``leftovers`` are never credited;
+- an ERC-4337 operation's maximum paymaster charge must be present after its calls.
 
-Each requirement is reported as the smallest starting balance the whole plan
-needs, next to the balance actually read, so an announcement can say exactly
-how short a plan is. A balance that cannot be read is a shortfall, never zero
-and never enough.
+Each requirement is the smallest starting balance the plan needs. An unreadable
+balance is a shortfall.
 """
 
 from __future__ import annotations
@@ -341,9 +334,8 @@ def _chain(chain_id: int) -> str:
 
 
 def _error_text(error: Exception) -> str:
-    # A balance-read error from this module already names what failed without
-    # quoting a URL; anything else is reduced to its type, because provider
-    # errors quote RPC URLs and those carry API keys.
+    # Other errors are reduced to their type: provider errors quote RPC URLs,
+    # which carry API keys.
     if isinstance(error, erc20.BalanceReadError):
         return str(error)
     return type(error).__name__

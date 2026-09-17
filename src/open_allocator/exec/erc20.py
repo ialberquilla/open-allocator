@@ -4,9 +4,7 @@ from eth_abi import encode as abi_encode
 from eth_utils import keccak
 from web3 import Web3
 
-# The ERC-20 reads execution needs. Deliberately not a web3 Contract: one
-# eth_call with a hand-encoded selector avoids vendoring an ABI file for two
-# methods, matching entry_point.py and safe_deployment.py.
+# Hand-encoded eth_calls, so no ABI file is needed for two methods.
 
 _ALLOWANCE_SELECTOR = keccak(text="allowance(address,address)")[:4]
 _BALANCE_OF_SELECTOR = keccak(text="balanceOf(address)")[:4]
@@ -20,11 +18,8 @@ class BalanceOverrideUnavailable(RuntimeError):
     """No storage slot was found that ``balanceOf`` reads for this holder."""
 
 
-# Where a token's balances mapping can live: plain declaration slots, under both
-# Solidity's keccak(key . slot) and Vyper's keccak(slot . key) layouts, and the
-# ERC-7201 namespace OpenZeppelin v5's upgradeable ERC20 keeps its storage in.
-# These are storage layouts, not a token list: every candidate is verified
-# against the token's own balanceOf before it is used.
+# Candidate balance-mapping slots (Solidity, Vyper, and OpenZeppelin v5's
+# ERC-7201 layouts), each verified against balanceOf before use.
 _DECLARATION_SLOTS = 32
 _OZ_ERC20_NAMESPACE = int(
     "52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00", 16
@@ -67,10 +62,8 @@ def allowance(w3: Web3, token: str, *, owner: str, spender: str) -> int:
 def balance_of(w3: Web3, token: str, *, owner: str) -> int:
     """ERC-20 balanceOf(owner). Raises BalanceReadError when it cannot be read.
 
-    The opposite asymmetry to :func:`allowance`. A funding check that read an
-    unanswerable balance as zero would refuse a funded plan, and one that read
-    it as anything else would pass an unfunded one — so there is no default,
-    and the caller decides what an unreadable balance means.
+    No default, unlike :func:`allowance`: the caller decides what an unreadable
+    balance means.
     """
     data = _BALANCE_OF_SELECTOR + abi_encode(
         ["address"], [Web3.to_checksum_address(owner)]
@@ -102,11 +95,8 @@ def balance_state_override(
 ) -> dict[str, dict[str, dict[str, str]]]:
     """An ``eth_call``-style state override that gives ``owner`` ``balance``.
 
-    For estimating an operation the account cannot fund yet — a counterfactual
-    Safe, say — never for anything submitted. The slot is found by writing a
-    sentinel to each candidate in an ``eth_call`` and keeping the one
-    ``balanceOf`` then returns, so a token whose balance is not a plain stored
-    value (rebasing, scaled) raises rather than being overridden wrongly.
+    For estimates only, never for anything submitted. Raises when no candidate
+    slot holds the balance, e.g. for rebasing or scaled tokens.
     """
     slot = balance_slot(w3, token, owner=owner)
     return {

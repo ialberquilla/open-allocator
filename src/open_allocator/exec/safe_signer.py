@@ -8,7 +8,14 @@ from pydantic import Field
 from web3 import HTTPProvider, Web3
 
 from open_allocator.core.types import FrozenModel, Policy, TxStep
+from open_allocator.exec import safe_deployment
 from open_allocator.exec.signer import Receipt, SignerError
+from open_allocator.exec.user_operation import (
+    DELEGATECALL,
+    MULTISEND_CALL_ONLY,
+    Call,
+    multisend_calldata,
+)
 
 
 class SafeSignerError(SignerError):
@@ -179,16 +186,8 @@ class SafeSigner:
         return _pending_receipt(proposal)
 
     def is_deployed(self, chain_id: int, rpc_url: str) -> bool:
-        """Whether the Safe exists on this chain.
-
-        A proposal needs a live Safe: the Transaction Service reads its nonce and
-        owners, and nothing on this path can deploy one. Only the ERC-4337 path
-        deploys a counterfactual Safe, inside its first operation.
-        """
-        from open_allocator.exec import safe_deployment
-
-        # Not through the chain's service adapter: a chain with no Transaction
-        # Service is reported by preflight, and must not fail this read first.
+        """Whether the Safe exists on this chain; proposals cannot deploy one."""
+        # Not through the service adapter: chains without one fail in preflight.
         address = (
             self._pinned.address() if self._pinned is not None else self._safe_address()
         )
@@ -200,11 +199,8 @@ class SafeSigner:
     def send_batch(self, steps: Sequence[TxStep], rpc_url: str) -> Receipt:
         """Every step as one Safe transaction, proposed once.
 
-        Several steps become a single delegatecall to MultiSendCallOnly, so the
-        owners sign and execute them together or not at all. Proposed one by
-        one they would not even be sequential: each proposal reads the Safe's
-        current on-chain nonce, so they would all claim the same one and at most
-        one could ever execute.
+        Several steps become one delegatecall to MultiSendCallOnly. Separate
+        proposals would all claim the same on-chain nonce.
         """
         if not steps:
             raise SafeSignerError("a Safe transaction needs a step")
@@ -215,13 +211,6 @@ class SafeSigner:
             )
         if len(steps) == 1:
             return self.send(steps[0], rpc_url)
-
-        from open_allocator.exec.user_operation import (
-            DELEGATECALL,
-            MULTISEND_CALL_ONLY,
-            Call,
-            multisend_calldata,
-        )
 
         chain_id = steps[0].chain_id
         adapter = self._adapter_for(chain_id)

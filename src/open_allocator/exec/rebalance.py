@@ -282,9 +282,8 @@ def execute_rebalance(
 
 # --- calldata API (ONE_TX_TRANSACTION_API=calldata) --------------------------
 
-# Preparations spent fitting a chain's deposits around the paymaster's maximum
-# gas charge. A shortfall still standing after the last one is reported as a
-# blocker, not guessed around.
+# Attempts to fit a chain's deposits around the paymaster charge before the
+# shortfall is reported as a blocker.
 _MAX_CALLDATA_PREPARATIONS = 3
 
 
@@ -320,11 +319,8 @@ def _calldata_rebalance(
 ) -> RebalanceExecutionReport:
     """A same-chain rebalance: each chain's withdrawals, then its deposits.
 
-    No staging is needed. The Safe submits one chain's calls as one atomic
-    operation, so a deposit funded by a withdrawal in the same operation runs
-    after it or not at all. Execution then reads positions to record the shares
-    each confirmed deposit actually received; what 1Tx simulated is never
-    logged as settled.
+    Each chain's calls go in one atomic operation. Deposits are logged with the
+    shares read from positions afterwards, not the simulated amounts.
     """
     address = signer.address()
     built = _calldata_rebalance_plan(
@@ -443,17 +439,10 @@ def _calldata_rebalance_plan(
 ) -> _CalldataRebalancePlan:
     """Withdrawals first, then deposits sized to what each chain will hold.
 
-    A deposit spends USDC on its vault's chain, funded by the Safe's balance
-    there plus the conservative proceeds (``min_out``, else ``expected_out``
-    less slippage) of the withdrawals on that chain. Proceeds are counted in
-    raw units, so a withdrawal that pays out slightly less than its position's
-    dollar value sizes the deposit down rather than leaving it underfunded.
-
-    Sizing absorbs only that gap and the paymaster's gas charge. A chain whose
-    buys need more than it holds plus its own sells' dollar value is either
-    cross-chain — another chain's sells free the money, which the calldata
-    path cannot bridge yet, so it is refused — or plainly underfunded, which is
-    left at full size for the funding check to report.
+    A chain's deposits are funded by its USDC balance plus the conservative
+    proceeds of its withdrawals, and are sized down only for proceeds rounding
+    and the paymaster charge. Buys that need another chain's sells are refused;
+    otherwise an underfunded chain is left at full size for the funding check.
     """
     calldata.ensure_calldata_supported(config)
     vaults_by_id = _vaults_by_id(known)
@@ -629,8 +618,8 @@ def _calldata_rebalance_plan(
         sizes, notes = sized(reserve)
         ordered: list[bundle_execution.PlannedBundle] = []
         for chain_id in chain_order:
-            # 🔑 Sells before buys on each chain, and each chain contiguous: the
-            # signer merges consecutive same-chain bundles into one operation.
+            # Sells before buys, chains contiguous: the signer merges consecutive
+            # same-chain bundles into one operation.
             ordered.extend(sells.get(chain_id, ()))
             ordered.extend(
                 deposit(buy, sizes[buy.index])

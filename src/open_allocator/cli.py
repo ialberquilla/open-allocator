@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, ParamSpec, TypeVar
+from typing import Annotated, Any, ParamSpec, TypeVar
 
 import typer
 
@@ -41,11 +41,12 @@ from open_allocator.core.types import (
 )
 from open_allocator.exec import chains, safe_deployment
 from open_allocator.exec import gas as gas_module
+from open_allocator.exec.bundle_execution import PlanPreparation
+from open_allocator.exec.bundle_execution import prepare_plan as prepare
+from open_allocator.exec.calldata import uses_calldata_api
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
-
-if TYPE_CHECKING:
-    from open_allocator.exec.bundle_execution import PlanPreparation
+from open_allocator.exec.execute import TransactionPlanError
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonObject = dict[str, Any]
@@ -411,8 +412,6 @@ def _build_execution_plan(
 
     if not isinstance(plan, TxPlan):
         raise TypeError("execute_allocation(confirm=False) did not return a TxPlan")
-    from open_allocator.exec.calldata import uses_calldata_api
-
     preparation = (
         prepare_plan(signer, plan, config) if uses_calldata_api(config) else None
     )
@@ -420,8 +419,6 @@ def _build_execution_plan(
 
 
 def prepare_plan(signer: object, plan: TxPlan, config: object) -> PlanPreparation:
-    from open_allocator.exec.bundle_execution import prepare_plan as prepare
-
     return prepare(signer, plan, config)
 
 
@@ -1551,12 +1548,8 @@ def build_tx(
     _allocation, _policy, plan, _known_instruments, preparation = _build_execution_plan(
         allocation_path, policy_path
     )
-    # The plan is the output, so a calldata plan this signer cannot submit is an
-    # error here rather than a note nobody sees; `execute` without --confirm
-    # reports the same preparation, with its gas estimates, instead.
+    # The plan is the output, so blockers are an error rather than a note.
     if preparation is not None and preparation.blockers:
-        from open_allocator.exec.execute import TransactionPlanError
-
         raise TransactionPlanError("; ".join(preparation.blockers))
     payload = plan.model_dump(mode="json")
     validate(payload, "tx-plan")

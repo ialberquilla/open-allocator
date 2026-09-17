@@ -88,9 +88,8 @@ class AllocatorConfig(BaseSettings):
 
     onetx_api_url: str = Field(..., validation_alias="ONE_TX_API_URL")
     onetx_api_key: SecretStr = Field(..., validation_alias="ONE_TX_API_KEY", repr=False)
-    # Temporary rollout flag for the 1Tx calldata bundle API. `legacy` keeps the
-    # /transactions/buy and /sell builders; `calldata` plans from
-    # GET /instruments/:id/calldata. Removed once the migration ships.
+    # `legacy` builds with /transactions/buy and /sell; `calldata` with
+    # GET /instruments/:id/calldata.
     transaction_api: Literal["legacy", "calldata"] = Field(
         "legacy",
         validation_alias="ONE_TX_TRANSACTION_API",

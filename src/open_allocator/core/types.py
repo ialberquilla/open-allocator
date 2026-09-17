@@ -65,10 +65,8 @@ class Vault(FrozenModel):
     protocol: str
     chain_id: int
     asset: str
-    # Underlying (deposit/withdraw) token and yield token, as discovered from
-    # 1Tx. Execution converts amounts to raw units with these decimals, so they
-    # are never defaulted: None = upstream did not say, and a raw-amount request
-    # that needs one must fail closed.
+    # Never defaulted: None means 1Tx did not report it, and raw-amount requests
+    # that need it fail closed.
     token_address: str | None = None
     token_decimals: int | None = Field(default=None, ge=0)
     yield_token_address: str | None = None
@@ -165,10 +163,8 @@ class Allocation(FrozenModel):
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 
-# The backend's calldata call types are kept as returned, never collapsed:
-# `approve`, `swap`, `deposit`, `withdraw`, `bridge_burn`, `fee`, plus the
-# client-composed `cctp_receive`. `buy`/`sell` exist only for plans built through
-# the legacy /transactions endpoints while ONE_TX_TRANSACTION_API allows them.
+# Calldata call types are kept as the backend returns them, plus the
+# client-composed `cctp_receive`. `buy`/`sell` are legacy /transactions steps.
 TxStepKind: TypeAlias = Literal[
     "approve",
     "swap",
@@ -220,8 +216,7 @@ class TxBundle(FrozenModel):
     and never reported as the same measurement.
     """
 
-    # Stable across rebuilds of the same logical leg; ``digest`` changes with
-    # the calls, so completion recorded for one digest never carries over.
+    # Stable across rebuilds of a leg; ``digest`` changes with the calls.
     bundle_id: str = Field(min_length=1)
     digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     leg_index: int = Field(ge=0)
@@ -245,9 +240,8 @@ class TxBundle(FrozenModel):
     expected_out: str | None = Field(default=None, pattern=r"^\d+$")
     min_out: str | None = Field(default=None, pattern=r"^\d+$")
     protocol_gas: str = Field(pattern=r"^\d+$")
-    # Raw ``token_out`` the account gained in that simulation, at the quote
-    # block and with the simulation's assumed balances; None in plans stored
-    # before it was recorded. Not settled value.
+    # Raw ``token_out`` gained in the simulation, not settled value. None when
+    # the stored plan lacks it.
     simulated_out: str | None = Field(default=None, pattern=r"^\d+$")
     simulation_scope: Literal["protocol_bundle"] = "protocol_bundle"
     simulation_engine: Literal["wallet_neutral_atomic"] = "wallet_neutral_atomic"

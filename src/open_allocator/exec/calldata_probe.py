@@ -1,20 +1,9 @@
-"""The API compatibility probe that gates the calldata path on a 1Tx deployment.
+"""Checks that a 1Tx deployment serves the calldata API contract.
 
-1Tx's wallet-neutral simulator is what lets a counterfactual Safe be quoted at
-all: it installs an ephemeral executor at the account instead of taking an
-``executor`` from the caller. Before ``ONE_TX_TRANSACTION_API=calldata`` is
-relied on against a base URL, that deployment has to show it is this contract:
-
-- a request for an account with no code, without ``executor``, is answered;
-- the answer parses under the strict execution contract, so it carries no
-  ``executor`` or other unknown field and its simulation is
-  ``protocol_bundle``/``wallet_neutral_atomic``;
-- the answer is bound to the request — instrument, account, action, chain,
-  amount — and outlives the minimum TTL.
-
-The strict parse and the binding also run on every bundle a plan uses; the
-probe adds the undeployed account, checked on chain rather than assumed, and
-reports each property separately so a failing deployment says which one broke.
+For an account with no code and no ``executor``, a request must be answered,
+parse strictly as a ``protocol_bundle``/``wallet_neutral_atomic`` simulation,
+match the request, and outlive the minimum TTL. Each check is reported
+separately.
 """
 
 from __future__ import annotations
@@ -34,8 +23,7 @@ from open_allocator.exec.client import (
     OneTxHTTPError,
 )
 
-# An address nobody holds a key for, so it never has code on any chain. The
-# probe still reads its code rather than trusting that.
+# An address nobody holds a key for; its code is still read, not assumed.
 PROBE_ACCOUNT = to_checksum_address(
     keccak(text="open-allocator:calldata-compatibility-probe")[12:]
 )

@@ -25,11 +25,8 @@ class WithdrawPlan(FrozenModel):
     yield_token_amount: str
     yield_token_symbol: str | None = None
     yield_token_address: str | None = None
-    # Calldata API amount: ``max`` for a full exit, raw underlying-asset units
-    # for a partial one. ``yield_token_amount`` stays the share estimate for
-    # cost basis and the legacy sell endpoint; it is never a calldata amount.
-    # None only for a partial exit whose position lacks ``balance_raw`` or
-    # ``decimals`` — see :func:`calldata_withdraw_amount`.
+    # ``max`` for a full exit, raw underlying units for a partial one; None when
+    # the position lacks ``balance_raw`` or ``decimals``.
     calldata_amount: str | None = None
     underlying_decimals: int | None = Field(default=None, ge=0)
 

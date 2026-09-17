@@ -59,10 +59,8 @@ from open_allocator.exec.user_operation import (
 # execution.
 _SIMULATION_REVERT_CODES = frozenset({-32500, -32521})
 
-# What an estimate with assumed balances gives the gas token on top of what the
-# calls require, so the paymaster's postOp pull succeeds. 2**64 raw units is at
-# least 18 whole tokens even at 18 decimals, more than any one operation's gas,
-# and far below the high bits some tokens pack flags into beside a balance.
+# Gas-token headroom added to assumed balances so the paymaster's postOp pull
+# succeeds; below the high bits some tokens use for flags.
 _ASSUMED_GAS_TOKEN_HEADROOM_RAW = 2**64
 
 _GAS_LIMIT_PLACEHOLDERS = {
@@ -181,16 +179,9 @@ class PimlicoUserOperationAdapter:
     ) -> PreparedUserOperation:
         """Build and estimate the complete operation; sign and send nothing.
 
-        The estimate covers everything that will ride in the real operation:
-        the Safe's deployment when it is counterfactual, the paymaster approval
-        when none is standing, and every call in order. It is a report, not a
-        reservation — submission prepares again rather than reusing it.
-
+        Covers Safe deployment, paymaster approval, and every call in order.
         ``assumed_balances`` (token -> raw amount) estimates as if the Safe held
-        at least those amounts, plus gas headroom in the gas token, wherever it
-        holds less. That validates the envelope for an account not funded yet;
-        it says nothing about whether the account is funded, and submission
-        never assumes anything.
+        at least those amounts, plus gas headroom in the gas token.
         """
         try:
             prepared, _pimlico = self._prepare(
@@ -233,11 +224,8 @@ class PimlicoUserOperationAdapter:
             + ("" if prepared.deployed else "; deploys the Safe in this operation")
         )
 
-        # Wait for it: the next operation from this Safe reads the nonce and the
-        # deployment status from the chain, and both are wrong until this one is
-        # mined — the second op re-sends the factory and the EntryPoint rejects
-        # it with AA10. Ops from one sender are sequential whether we like it or
-        # not.
+        # The next operation reads nonce and deployment from the chain, which are
+        # stale until this one is mined (AA10 otherwise).
         included = self._await_inclusion(pimlico, user_op_hash)
         if included is None:
             return PaymasterUserOperationSubmission(
@@ -518,12 +506,8 @@ def _max_gas_token_charge(
 ) -> str | None:
     """The bounded USDC charge, from the stub's paymaster config and the quote.
 
-    The stub carries the fee flags the quote does not, so an unparseable stub,
-    or one for another token, yields no bound rather than one that assumes no
-    constant fee. Where the stub and the estimate or quote both give a value —
-    paymaster gas limits, rate, postOpGas — the larger one is used: the
-    sponsorship at submission sets its own, and observed stubs carry a larger
-    postOp limit than the estimate.
+    None when the stub does not parse or is for another token. Where the stub
+    and the estimate or quote both give a value, the larger one is used.
     """
     config = paymaster_charge.parse_erc20_paymaster_data(stub.get("paymasterData"))
     if config is None or config.token.casefold() != token.casefold():

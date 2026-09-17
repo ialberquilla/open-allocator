@@ -347,10 +347,7 @@ def recipe_holding(
     )
 
 
-# Position shapes as the positions API reports them. Shares and underlying
-# diverge in price (ERC-4626) and in decimals (18-decimal shares over a
-# 6-decimal asset), which is exactly what a share amount sent as an asset
-# amount would get wrong.
+# Positions whose shares and underlying differ in price and decimals.
 RECIPES = {
     "erc4626-18-decimal-shares": recipe_holding(
         balance="16.8213",

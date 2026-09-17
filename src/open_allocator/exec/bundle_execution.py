@@ -1,28 +1,14 @@
 """Wallet-aware preparation and submission of calldata bundle plans.
 
-A calldata plan is a sequence of bundles, each an ordered run of calls 1Tx
-simulated together. What gets estimated, submitted, deduplicated, and reported
-here is the wallet operation that carries them: consecutive bundles on one chain
-ride in one Safe operation when the signer can batch. Inner calls stay visible in
-reports but are never marked complete on their own inside a batch — they share
-one receipt and cannot partially settle.
+The unit estimated, submitted, and deduplicated here is the wallet operation:
+consecutive same-chain bundles share one Safe operation when the signer can
+batch. Before each operation the plan is checked against real balances
+(``funding``), because 1Tx simulates with assumed ones.
 
-Before anything is sent, and again before each later operation, the plan is
-checked against what the account actually holds (``funding``): 1Tx simulated
-the calls with assumed balances, so a passing simulation says nothing about
-whether this Safe can pay for them.
-
-Two measurements must not be confused. A bundle's ``protocol_gas`` is 1Tx's
-wallet-neutral simulation of the bare calls. A ``WalletPreparation`` is this
-repo's estimate of the real envelope — deployment, paymaster approval, Safe
-batching — and is the one that says whether the operation can run.
-
-An account that does not hold what an operation spends — a counterfactual Safe
-not funded yet, usually — reverts in the bundler's simulation. Preparation then
-estimates once more with the bundles' requirements assumed, the way 1Tx assumes
-balances, and marks the result: the envelope is validated, and the funding
-check reports the shortfall rather than the plan dying on a bundler revert.
-Execution never proceeds on such an estimate.
+A bundle's ``protocol_gas`` is 1Tx's simulation of the bare calls; a
+``WalletPreparation`` is the real Safe operation's estimate. An operation that
+reverts for lack of funds is estimated again with its requirements assumed, so
+the dry run reports the shortfall; execution never proceeds on such an estimate.
 """
 
 from __future__ import annotations
@@ -219,19 +205,11 @@ def prepare_plan(
 ) -> PlanPreparation:
     """Estimate every operation the plan would submit; sign and send nothing.
 
-    For an ERC-4337 signer each operation is built exactly as submission would
-    build it — factory data for a counterfactual Safe, the paymaster approval,
-    the calls in order — and estimated by the bundler. A proposal-only Safe is
-    checked for what it cannot do: propose to a Safe that does not exist yet, or
-    park an expiring quote in a queue with no execution deadline.
-
-    Then the whole plan is walked against the account's real balances: every
-    bundle's ``requires``, aggregated per chain and token in execution order,
-    plus each operation's bounded paymaster charge. A shortfall is a blocker.
-
-    An operation that reverts against real balances is estimated again with
-    its bundles' requirements assumed (see the module docstring); one that
-    reverts even then raises ``UserOperationSimulationReverted``.
+    ERC-4337 operations are built as submission would build them and estimated
+    by the bundler; a proposal-only Safe is checked for an undeployed Safe or an
+    expiring quote. Any funding shortfall, including the paymaster charge, is a
+    blocker. Raises ``UserOperationSimulationReverted`` when an operation reverts
+    even with its requirements assumed.
     """
     preparation, _checked = _prepare(signer, plan, config, idempotency_store)
     return preparation
@@ -330,16 +308,11 @@ def execute_plan(
 ) -> BundleExecution:
     """Submit a calldata plan, one wallet operation at a time.
 
-    Refuses up front — before any operation is sent — when the signer cannot
-    submit the plan as built. Immediately before each operation is signed, any
-    bundle within ``ONE_TX_MIN_CALLDATA_TTL_SECONDS`` of expiry is rebuilt from
-    fresh calldata for the same leg. The ERC-4337 signer then prepares the
-    operation again itself, so nonce, fees, and paymaster data are current.
-
-    ``completion_key`` names the leg a bundle serves; it is marked when the
-    operation is submitted, so a rerun never builds that leg again. ``log`` is
-    called once per bundle with the receipt of the operation that carried it,
-    so a caller can reconcile what actually settled before it is recorded.
+    Refuses before sending anything when the signer cannot submit the plan.
+    Bundles within ``ONE_TX_MIN_CALLDATA_TTL_SECONDS`` of expiry are rebuilt
+    right before signing. ``completion_key`` names the leg a bundle serves and
+    is marked on submission; ``log`` is called once per bundle with the receipt
+    of the operation that carried it.
     """
     bundles = planned_bundles(plan)
     if not bundles:
@@ -431,9 +404,7 @@ def execute_plan(
             for bundle_id in rebuilt
         )
         if settled or rebuilt:
-            # Balances moved since the plan was checked — earlier operations
-            # spent and produced — and a rebuilt bundle may require other
-            # amounts. Recheck everything still to be sent.
+            # Balances moved and rebuilt bundles may require other amounts.
             ledger, _notes = _ledger_operations(
                 (operation, *pending[1:]),
                 preparation.preparations,
@@ -600,9 +571,7 @@ def _ledger_operations(
     ledger: list[funding.LedgerOperation] = []
     messages: list[str] = []
     for operation in grouped:
-        # A bundle whose calls were partly sent one at a time by an earlier run
-        # has already spent some of what it requires; checking it again would
-        # refuse the rerun that finishes it.
+        # A partly sent bundle already spent some of what it requires.
         bundles = tuple(
             item.bundle
             for item in operation.bundles
@@ -673,9 +642,7 @@ def _wallet_preparation(
             f"chain {operation.chain_id}"
         )
     for item in operation.bundles:
-        # 1Tx built and simulated the calls for this account: approvals,
-        # receivers, and swap recipients all name it. Sent from any other
-        # sender they do something else.
+        # The calls name this account as receiver; any other sender breaks them.
         if item.bundle.account.casefold() != prepared.sender.casefold():
             raise TransactionPlanError(
                 f"bundle {item.bundle.bundle_id} was built for {item.bundle.account} "

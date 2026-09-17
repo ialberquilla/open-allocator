@@ -52,8 +52,8 @@ class CalldataAmountError(ValueError):
 class CalldataUnsupportedError(ValueError):
     """A configured or requested feature the calldata API path cannot honor.
 
-    Raised instead of ignoring the setting, so a migration never silently drops
-    referral fees or turns a cross-chain leg into a same-chain one.
+    Raised instead of ignoring the setting, so referral fees are never dropped
+    and a cross-chain leg never becomes a same-chain one.
     """
 
 
@@ -70,11 +70,8 @@ def deposit_token(
 ) -> DepositToken:
     """The token a deposit request's raw ``amount`` is denominated in.
 
-    Requests omit ``tokenIn``, so 1Tx spends the chain's USDC whatever the
-    vault's underlying is. The address comes from the chain registry the
-    paymaster and balances already use; its decimals come from discovery — an
-    instrument on that chain whose underlying is that token — and are never
-    assumed, because USDC is not 6 decimals on every chain.
+    Requests omit ``tokenIn``, so 1Tx spends the chain's USDC. Decimals come
+    from discovery, never assumed: USDC is not 6 decimals on every chain.
     """
     address = chains.usdc_address(chain_id, config)
     if address is None:
@@ -304,11 +301,8 @@ def refresh_bundle(
 ) -> tuple[tuple[TxStep, ...], TxBundle]:
     """Fresh calldata for the same logical leg, validated like the original.
 
-    Same instrument, action, account, chain, and raw amount; a deposit must
-    still spend the token the amount was computed in. The result keeps the
-    bundle ID but carries a new digest, so nothing recorded against the old
-    calls can be read as completion of these. Step indexes start at zero and
-    are placed by whoever assembles the plan.
+    Keeps the bundle ID with a new digest, so completion recorded for the old
+    calls never applies. Step indexes start at zero.
     """
     token = (
         DepositToken(

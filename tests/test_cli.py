@@ -13,8 +13,13 @@ from typer.testing import CliRunner
 
 from open_allocator import cli
 from open_allocator.cli import JsonObject, json_command
+from open_allocator.core.policy import PolicyResult
 from open_allocator.core.schema import validate
+from open_allocator.core.types import Allocation, TxPlan
+from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.client import RewardsResponse
+from open_allocator.exec.execute import WalletPreparation
+from open_allocator.exec.funding import FundingRequirement
 
 runner = CliRunner()
 
@@ -1591,12 +1596,6 @@ def _calldata_dry_run(
     *,
     blockers: tuple[str, ...] = (),
 ) -> None:
-    from open_allocator.core.policy import PolicyResult
-    from open_allocator.core.types import Allocation, TxPlan
-    from open_allocator.exec.bundle_execution import PlanPreparation
-    from open_allocator.exec.execute import WalletPreparation
-    from open_allocator.exec.funding import FundingRequirement
-
     preparation = PlanPreparation(
         preparations=(
             WalletPreparation(

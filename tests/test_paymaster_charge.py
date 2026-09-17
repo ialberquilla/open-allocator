@@ -53,7 +53,7 @@ def gas(**overrides: int | None) -> UserOperationGas:
 
 
 def test_a_stub_shaped_like_pimlicos_parses_as_erc20_mode() -> None:
-    # Byte for byte the layout a Base stub returned on 2026-09-17: 183 bytes,
+    # The layout of a Base stub: 183 bytes,
     # mode byte 0x03 (ERC-20, any bundler), no optional fields.
     data = paymaster_data()
     assert len(bytes.fromhex(data[2:])) == 183
