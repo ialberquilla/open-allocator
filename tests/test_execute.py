@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from open_allocator.core.checkpoint import read_allocation_log
 from open_allocator.core.schema import validate
 from open_allocator.core.types import (
     Allocation,
@@ -44,7 +45,13 @@ from open_allocator.exec.execute import (
     PolicyCheckFailed,
     TransactionPlanError,
     execute_allocation,
+    plan_calldata_allocation,
     submission_groups,
+)
+from open_allocator.exec.paymaster_types import (
+    PaymasterTokenQuote,
+    PreparedUserOperation,
+    UserOperationGas,
 )
 from open_allocator.exec.signer import Receipt
 
@@ -876,6 +883,10 @@ def calldata_vault(instrument_id: str, chain_id: int = 8453) -> Vault:
 @dataclass
 class MockCalldataClient:
     requests: list[tuple[str, InstrumentCalldataQuery]] = field(default_factory=list)
+    # Require exactly the requested amount instead of the fixture's 100.25 USDC.
+    echo_requires: bool = False
+    # Instruments on a chain other than Base, with that chain's USDC.
+    usdc_by_chain: dict[str, tuple[int, str]] = field(default_factory=dict)
 
     def instrument_calldata(
         self,
@@ -894,7 +905,18 @@ class MockCalldataClient:
             amountIn=query.amount,
             expiresAt=None,
         )
+        chain_id, usdc = self.usdc_by_chain.get(instrument_id, (8453, BASE_USDC))
+        payload["chainId"] = chain_id
+        payload["tokenIn"]["address"] = usdc
+        for call in payload["calls"]:
+            call["chainId"] = chain_id
+        if self.echo_requires:
+            payload["requires"] = [{"token": usdc, "amount": query.amount}]
+            payload["leftovers"] = []
         return InstrumentCalldataResponse.model_validate(payload)
+
+    def deposits(self) -> list[tuple[str, str]]:
+        return [(instrument, query.amount) for instrument, query in self.requests]
 
     def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
         raise AssertionError("the calldata path must not call the legacy builder")
@@ -1242,3 +1264,189 @@ def test_calldata_deposit_report_carries_the_funding_it_was_checked_against() ->
     [usdc] = report.funding
     assert usdc.token == BASE_USDC
     assert usdc.ok
+
+
+@dataclass
+class PaymasterCalldataSigner(BatchingCalldataSigner):
+    """Prepares every operation with a fixed maximum USDC gas charge."""
+
+    charge: int = 12_345
+    prepared: list[tuple[TxStep, ...]] = field(default_factory=list)
+
+    def prepare_batch(
+        self, steps: tuple[TxStep, ...], rpc_url: str
+    ) -> PreparedUserOperation:
+        self.prepared.append(tuple(steps))
+        return PreparedUserOperation(
+            sender=self.address(),
+            chain_id=steps[0].chain_id,
+            entry_point="0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+            user_operation={"sender": self.address(), "signature": "0xstub"},
+            deployed=True,
+            gas=UserOperationGas(
+                call_gas_limit=900_000,
+                verification_gas_limit=450_000,
+                pre_verification_gas=60_000,
+                max_fee_per_gas=1_000_000,
+                max_priority_fee_per_gas=1_000,
+            ),
+            paymaster=PaymasterTokenQuote(
+                paymaster="0x777777777777AeC03fd955926DbF81597e66834C",
+                token=BASE_USDC,
+                exchange_rate=10**18,
+                post_op_gas=5_000,
+                approval_included=False,
+            ),
+            max_gas_token_charge_raw=str(self.charge),
+        )
+
+
+def holding_usdc(raw: int) -> CalldataConfig:
+    return CalldataConfig(token_balance_reader=lambda _chain, _rpc, _token, _acct: raw)
+
+
+def test_calldata_deposit_leaves_the_paymasters_charge_in_the_safe() -> None:
+    # The Safe holds exactly the $100 leg, so the deposit alone would leave
+    # nothing for the gas the paymaster pulls in postOp.
+    client = MockCalldataClient(echo_requires=True)
+
+    fitted = plan_calldata_allocation(
+        client,
+        PaymasterCalldataSigner(charge=12_345),
+        allocation("vault-a"),
+        permissive_policy(),
+        known_instruments=[calldata_vault("vault-a")],
+        config=holding_usdc(100_000_000),
+    )
+
+    assert client.deposits() == [("vault-a", "100000000"), ("vault-a", "99987655")]
+    assert [bundle.amount for bundle in fitted.plan.bundles] == ["99987655"]
+    [usdc] = fitted.preparation.funding
+    assert usdc.ok
+    assert usdc.includes_gas_charge
+    assert usdc.required_raw == "100000000"
+    assert fitted.preparation.blockers == ()
+    [note] = fitted.messages
+    assert "sized to 99.987655 of 100 USDC" in note
+    assert "maximum gas charge" in note
+    assert "sells" not in note
+    assert fitted.deposit_usd == {0: 99.987655}
+
+
+def test_calldata_deposit_with_room_for_gas_is_not_resized() -> None:
+    client = MockCalldataClient(echo_requires=True)
+
+    fitted = plan_calldata_allocation(
+        client,
+        PaymasterCalldataSigner(),
+        allocation("vault-a"),
+        permissive_policy(),
+        known_instruments=[calldata_vault("vault-a")],
+        config=holding_usdc(101_000_000),
+    )
+
+    assert client.deposits() == [("vault-a", "100000000")]
+    assert fitted.messages == ()
+
+
+def test_calldata_deposit_short_of_more_than_gas_keeps_full_size_as_a_blocker() -> None:
+    client = MockCalldataClient(echo_requires=True)
+    signer = PaymasterCalldataSigner()
+    config = holding_usdc(60_000_000)
+
+    fitted = plan_calldata_allocation(
+        client,
+        signer,
+        allocation("vault-a"),
+        permissive_policy(),
+        known_instruments=[calldata_vault("vault-a")],
+        config=config,
+    )
+
+    assert client.deposits() == [("vault-a", "100000000")], "not quietly shrunk"
+    [usdc] = fitted.preparation.funding
+    assert usdc.shortfall_raw == str(40_000_000 + 12_345)
+    assert any("short by" in blocker for blocker in fitted.preparation.blockers)
+
+    with pytest.raises(UnderfundedPlanError):
+        execute_allocation(
+            client,
+            signer,
+            allocation("vault-a"),
+            permissive_policy(),
+            confirm=True,
+            known_instruments=[calldata_vault("vault-a")],
+            config=config,
+        )
+    assert signer.batches == []
+
+
+@dataclass(frozen=True)
+class CalldataLogConfig(CalldataConfig):
+    allocation_log_path: object = None
+
+
+def test_calldata_deposit_sized_for_gas_executes_and_logs_what_it_spent(
+    tmp_path: Path,
+) -> None:
+    client = MockCalldataClient(echo_requires=True)
+    signer = PaymasterCalldataSigner(charge=12_345)
+    log_path = tmp_path / "allocation-log.jsonl"
+    config = CalldataLogConfig(
+        token_balance_reader=lambda _chain, _rpc, _token, _acct: 100_000_000,
+        allocation_log_path=log_path,
+    )
+
+    report = execute_allocation(
+        client,
+        signer,
+        allocation("vault-a"),
+        permissive_policy(),
+        confirm=True,
+        known_instruments=[calldata_vault("vault-a")],
+        config=config,
+    )
+
+    assert report.status == "success"
+    assert [bundle.amount for bundle in report.plan.bundles] == ["99987655"]
+    assert any("sized to 99.987655" in message for message in report.messages)
+    [batch] = signer.batches
+    assert batch == report.plan.steps
+    [entry] = read_allocation_log(log_path=log_path)
+    assert entry.usd == pytest.approx(99.987655)
+
+
+def test_calldata_deposits_are_grouped_into_one_operation_per_chain() -> None:
+    legs = Allocation(
+        legs=(
+            AllocationLeg(instrument_id="vault-a", weight=0.4, usd=40),
+            AllocationLeg(instrument_id="vault-c", weight=0.2, usd=20),
+            AllocationLeg(instrument_id="vault-b", weight=0.4, usd=40),
+        ),
+        total_usd=100,
+        metadata={},
+    )
+    arbitrum_usdc = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+    vaults = [
+        calldata_vault("vault-a"),
+        calldata_vault("vault-b"),
+        calldata_vault("vault-c", 42161).model_copy(
+            update={"token_address": arbitrum_usdc}
+        ),
+    ]
+
+    plan = execute_allocation(
+        MockCalldataClient(usdc_by_chain={"vault-c": (42161, arbitrum_usdc)}),
+        BatchingCalldataSigner(),
+        legs,
+        permissive_policy(),
+        known_instruments=vaults,
+        config=CalldataConfig(),
+    )
+
+    assert isinstance(plan, TxPlan)
+    assert [bundle.bundle_id for bundle in plan.bundles] == [
+        "leg:0:vault-a:deposit",
+        "leg:2:vault-b:deposit",
+        "leg:1:vault-c:deposit",
+    ]

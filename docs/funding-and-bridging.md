@@ -57,8 +57,13 @@ wallet is funded on, in this precedence (`exec/execute.py:_source_chain_id` →
 The calldata path does not bridge yet: every bundle executes on its
 instrument's own chain, from the Safe's USDC there.
 
-- **Deposits** are built on the vault's chain; a leg pinned to another source
-  chain is refused.
+- **Deposits** are built on the vault's chain, from the Safe's USDC there; a
+  leg pinned to another source chain is refused, and USDC held only on another
+  chain is not bridged in. Each chain's deposits go out as one Safe operation.
+  A deposit is sized down only to leave the paymaster's maximum gas charge in
+  the Safe, and the dry run names every deposit it sized down. A chain that
+  holds less than its deposits by more than that is left at full size and
+  reported as a funding shortfall, which blocks execution.
 - **Rebalances** fund each chain's buys from that chain alone: the Safe's USDC
   there plus the conservative proceeds (`minOut`, else `expectedOut` less
   `slippage_bps`) of the sells on the same chain. Each chain's sells and buys go

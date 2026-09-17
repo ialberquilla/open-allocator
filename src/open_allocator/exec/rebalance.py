@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Literal, NamedTuple
 
@@ -22,7 +21,7 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
-from open_allocator.exec import bundle_execution, calldata, chains, funding
+from open_allocator.exec import bundle_execution, calldata, deposit_sizing
 from open_allocator.exec.execute import (
     ExecutionBroadcastError,
     ExecutionReport,
@@ -282,29 +281,6 @@ def execute_rebalance(
 
 # --- calldata API (ONE_TX_TRANSACTION_API=calldata) --------------------------
 
-# Attempts to fit a chain's deposits around the paymaster charge before the
-# shortfall is reported as a blocker.
-_MAX_CALLDATA_PREPARATIONS = 3
-
-
-@dataclass(frozen=True)
-class _CalldataBuy:
-    index: int
-    trade: rebalance_core.RebalanceTrade
-    chain_id: int
-    token: calldata.DepositToken
-    wanted_raw: int
-
-
-@dataclass(frozen=True)
-class _CalldataRebalancePlan:
-    plan: TxPlan
-    preparation: bundle_execution.PlanPreparation
-    messages: tuple[str, ...]
-    # What each planned deposit actually spends, by trade index — the target's
-    # size less whatever the chain could not fund.
-    deposit_usd: dict[int, float]
-
 
 def _calldata_rebalance(
     client: object,
@@ -436,7 +412,7 @@ def _calldata_rebalance_plan(
     known: Sequence[Vault | Mapping[str, object]],
     config: object | None,
     idempotency_store: object | None,
-) -> _CalldataRebalancePlan:
+) -> deposit_sizing.FittedPlan:
     """Withdrawals first, then deposits sized to what each chain will hold.
 
     A chain's deposits are funded by its USDC balance plus the conservative
@@ -451,8 +427,6 @@ def _calldata_rebalance_plan(
         for index, trade in enumerate(plan.trades)
         if not _store_completed(idempotency_store, _leg_key(index, trade.instrument_id))
     ]
-    chain_order: dict[int, None] = {}
-
     sells: dict[int, list[bundle_execution.PlannedBundle]] = {}
     for index, trade in open_trades:
         if trade.action != "sell":
@@ -479,12 +453,11 @@ def _calldata_rebalance_plan(
             first_step_index=0,
             config=config,
         )
-        chain_order[chain_id] = None
         sells.setdefault(chain_id, []).append(
             bundle_execution.PlannedBundle(bundle=bundle, steps=steps)
         )
 
-    buys: dict[int, list[_CalldataBuy]] = {}
+    deposits: list[deposit_sizing.DepositRequest] = []
     for index, trade in open_trades:
         if trade.action != "buy":
             continue
@@ -495,11 +468,10 @@ def _calldata_rebalance_plan(
                 "its chain and deposit token are unknown"
             )
         token = calldata.deposit_token(vault.chain_id, vaults_by_id.values(), config)
-        chain_order[vault.chain_id] = None
-        buys.setdefault(vault.chain_id, []).append(
-            _CalldataBuy(
+        deposits.append(
+            deposit_sizing.DepositRequest(
                 index=index,
-                trade=trade,
+                instrument_id=trade.instrument_id,
                 chain_id=vault.chain_id,
                 token=token,
                 wanted_raw=amounts.to_raw_units(
@@ -508,188 +480,25 @@ def _calldata_rebalance_plan(
             )
         )
 
-    idle_keys = {
-        chain_id: funding.key_for(chain_id, address, chain_buys[0].token.address)
-        for chain_id, chain_buys in buys.items()
-    }
-    read, _unread = funding.read_balances(idle_keys.values(), config)
-    # None when unreadable: such a chain is not sized, and the funding check
-    # reports the balance it could not read.
-    idle = {chain_id: read.get(key) for chain_id, key in idle_keys.items()}
-    slippage = funding.slippage_bps(config)
-    planned_proceeds: dict[int, int] = {}
-    safe_proceeds: dict[int, int] = {}
-    for chain_id, chain_sells in sells.items():
-        usdc = chains.usdc_address(chain_id, config)
-        for item in chain_sells:
-            bundle = item.bundle
-            if usdc is None or bundle.token_out.address.casefold() != usdc.casefold():
-                # Pays out in something a deposit cannot spend.
-                continue
-            planned_proceeds[chain_id] = planned_proceeds.get(
-                chain_id, 0
-            ) + amounts.to_raw_units(
-                plan.trades[bundle.leg_index].usd,
-                bundle.token_out.decimals,
-                name="sell amount",
-            )
-            safe_proceeds[chain_id] = safe_proceeds.get(
-                chain_id, 0
-            ) + funding.conservative_output(bundle, slippage)
-
-    def slack(chain_id: int) -> int:
-        # Each dollar-to-raw conversion rounds down by at most one unit.
-        return len(sells.get(chain_id, ())) + len(buys.get(chain_id, ()))
-
-    short: dict[int, int] = {}
-    surplus: dict[int, int] = {}
-    for chain_id in chain_order:
-        proceeds = planned_proceeds.get(chain_id, 0)
-        if chain_id not in buys:
-            surplus[chain_id] = proceeds
-            continue
-        held = idle[chain_id]
-        if held is None:
-            continue
-        wanted = sum(buy.wanted_raw for buy in buys[chain_id])
-        gap = wanted - held - proceeds
-        if gap > slack(chain_id):
-            short[chain_id] = gap
-        else:
-            surplus[chain_id] = min(proceeds, proceeds - gap)
-    for chain_id, gap in short.items():
-        elsewhere = [
-            other
-            for other, amount in surplus.items()
-            if other != chain_id and amount > slack(other)
-        ]
-        if elsewhere:
-            raise calldata.CalldataUnsupportedError(
-                f"cross-chain rebalance: buys on {_chain_label(chain_id)} need "
-                f"{gap} raw units of USDC more than the Safe holds there plus "
-                "the proceeds of its sells there, while sells on "
-                f"{', '.join(_chain_label(other) for other in elsewhere)} pay "
-                "out on another chain; bridging is not supported by the calldata "
-                "API path yet"
-            )
-
-    def sized(reserve: Mapping[int, int]) -> tuple[dict[int, int], list[str]]:
-        sizes: dict[int, int] = {}
-        notes: list[str] = []
-        for chain_id, chain_buys in buys.items():
-            held = idle[chain_id]
-            if held is None or chain_id in short:
-                sizes.update((buy.index, buy.wanted_raw) for buy in chain_buys)
-                continue
-            budget = held + safe_proceeds.get(chain_id, 0) - reserve.get(chain_id, 0)
-            for buy in chain_buys:
-                size = max(0, min(buy.wanted_raw, budget))
-                budget -= size
-                sizes[buy.index] = size
-                if size < buy.wanted_raw:
-                    notes.append(_sized_note(buy, size, reserved=chain_id in reserve))
-        return sizes, notes
-
-    deposits: dict[tuple[int, int], bundle_execution.PlannedBundle] = {}
-
-    def deposit(buy: _CalldataBuy, size: int) -> bundle_execution.PlannedBundle:
-        # A size seen before reuses its bundle, so fitting the paymaster charge
-        # re-requests only the deposits it actually changed.
-        if (buy.index, size) not in deposits:
-            steps, bundle = calldata.request_bundle(
-                client,
-                instrument_id=buy.trade.instrument_id,
-                action="deposit",
-                account=address,
-                chain_id=buy.chain_id,
-                amount=str(size),
-                leg_index=buy.index,
-                first_step_index=0,
-                config=config,
-                token=buy.token,
-            )
-            deposits[(buy.index, size)] = bundle_execution.PlannedBundle(
-                bundle=bundle, steps=steps
-            )
-        return deposits[(buy.index, size)]
-
-    reserve: dict[int, int] = {}
-    for _attempt in range(_MAX_CALLDATA_PREPARATIONS):
-        sizes, notes = sized(reserve)
-        ordered: list[bundle_execution.PlannedBundle] = []
-        for chain_id in chain_order:
-            # Sells before buys, chains contiguous: the signer merges consecutive
-            # same-chain bundles into one operation.
-            ordered.extend(sells.get(chain_id, ()))
-            ordered.extend(
-                deposit(buy, sizes[buy.index])
-                for buy in buys.get(chain_id, ())
-                if sizes[buy.index] > 0
-            )
+    def summary(ordered: Sequence[bundle_execution.PlannedBundle]) -> str:
         withdrawals = sum(len(items) for items in sells.values())
-        tx_plan = bundle_execution.assemble_plan(
-            ordered,
+        return (
             f"Same-chain rebalance from calldata bundles: {withdrawals} withdrawals "
             f"before {len(ordered) - withdrawals} deposits across "
-            f"{sum(len(item.steps) for item in ordered)} transaction steps",
+            f"{sum(len(item.steps) for item in ordered)} transaction steps"
         )
-        preparation = bundle_execution.prepare_plan(
-            signer, tx_plan, config, idempotency_store
-        )
-        grown = dict(reserve)
-        for item in preparation.funding:
-            chain_buys = buys.get(item.chain_id, ())
-            if (
-                item.ok
-                or not item.includes_gas_charge
-                or item.available_raw is None
-                or not chain_buys
-                or item.chain_id in short
-                or idle[item.chain_id] is None
-                or item.token.casefold() != chain_buys[0].token.address.casefold()
-                or not any(sizes[buy.index] > 0 for buy in chain_buys)
-            ):
-                continue
-            grown[item.chain_id] = grown.get(item.chain_id, 0) + int(item.shortfall_raw)
-        if grown == reserve:
-            break
-        reserve = grown
 
-    return _CalldataRebalancePlan(
-        plan=tx_plan,
-        preparation=preparation,
-        messages=tuple(notes),
-        deposit_usd={
-            buy.index: float(
-                amounts.from_raw_units(sizes[buy.index], buy.token.decimals)
-            )
-            for chain_buys in buys.values()
-            for buy in chain_buys
-            if sizes[buy.index] > 0
-        },
+    return deposit_sizing.fit(
+        client,
+        signer,
+        address,
+        deposits=deposits,
+        withdrawals=sells,
+        withdrawal_usd={index: float(trade.usd) for index, trade in open_trades},
+        summary=summary,
+        config=config,
+        idempotency_store=idempotency_store,
     )
-
-
-def _sized_note(buy: _CalldataBuy, size: int, *, reserved: bool) -> str:
-    wanted = amounts.from_raw_units(buy.wanted_raw, buy.token.decimals)
-    fits = (
-        f"the USDC {_chain_label(buy.chain_id)} will hold — its balance plus its "
-        "sells' minimum proceeds"
-        + (", less the paymaster's maximum gas charge" if reserved else "")
-    )
-    if size == 0:
-        return (
-            f"buy {buy.trade.instrument_id} of {wanted} USDC skipped: none fits {fits}"
-        )
-    return (
-        f"buy {buy.trade.instrument_id} sized to "
-        f"{amounts.from_raw_units(size, buy.token.decimals)} of {wanted} USDC to fit "
-        f"{fits}"
-    )
-
-
-def _chain_label(chain_id: int) -> str:
-    return f"{chains.chain_name(chain_id)} (chain {chain_id})"
 
 
 # 1Tx holds back roughly this much USDC per chain to sponsor gas. Measured on

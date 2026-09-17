@@ -111,8 +111,9 @@ Full surface and the known limits of every metric: [docs/capabilities.md](docs/c
 2. Check liquidity, withdrawal constraints, gas, and any cross-chain timing. A gasless
    exit funds itself from the redeem and needs nothing pre-positioned on the chain,
    but its proceeds must exceed its gas.
-3. Announce the share amount, expected destination asset, chain, risks, and transactions.
-4. Wait for approval, then run `withdraw --confirm`.
+3. Dry-run it: `withdraw --position <id> [--amount <usd>]` without `--confirm` builds the plan and sends nothing.
+4. Announce the share amount, expected destination asset, chain, risks, and transactions.
+5. Wait for approval, then run `withdraw --confirm`.
 
 ## Confirmation Discipline
 

@@ -94,8 +94,9 @@ reserving a made-up amount. Checked 2026-09-17 against 26 ERC-20 charges on
 Base: every one inside the bound (the largest at 52% of it), and every one
 within 0.96–1.01x of `actualGasCost × exchangeRate / 1e18`.
 
-A calldata rebalance fits its deposits around that bound: when a chain's buys
-would leave less USDC than the operation's maximum charge, they are rebuilt
+Calldata deposits and rebalances fit their deposits around that bound
+(`exec/deposit_sizing.py`): when a chain's deposits would leave less USDC than
+the operation's maximum charge, they are rebuilt
 smaller by the shortfall and the operation is prepared again, at most three
 times. A shortfall still standing after that is reported, not guessed around.
 

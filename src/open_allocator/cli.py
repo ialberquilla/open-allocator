@@ -42,11 +42,10 @@ from open_allocator.core.types import (
 from open_allocator.exec import chains, safe_deployment
 from open_allocator.exec import gas as gas_module
 from open_allocator.exec.bundle_execution import PlanPreparation
-from open_allocator.exec.bundle_execution import prepare_plan as prepare
 from open_allocator.exec.calldata import uses_calldata_api
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
-from open_allocator.exec.execute import TransactionPlanError
+from open_allocator.exec.execute import TransactionPlanError, plan_calldata_allocation
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonObject = dict[str, Any]
@@ -84,33 +83,14 @@ def _write_json(payload: JsonValue, *, err: bool = False) -> None:
     typer.echo(json.dumps(payload, separators=(",", ":")), err=err)
 
 
-def _execution_plan(command_name: str) -> JsonObject:
-    return {
-        "status": "plan_required",
-        "command": command_name,
-        "requires": "--confirm or explicit --unsafe/--autonomous",
-    }
-
-
 def json_command(
     func: Callable[P, R] | None = None,
-    *,
-    execution_command: bool = False,
-    command_name: str | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, None]] | Callable[P, None]:
     def decorator(inner: Callable[P, R]) -> Callable[P, None]:
         @wraps(inner)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
             try:
-                if execution_command and not (
-                    kwargs.get("confirm")
-                    or kwargs.get("unsafe")
-                    or kwargs.get("autonomous")
-                ):
-                    name = command_name or inner.__name__.replace("_", "-")
-                    result = _execution_plan(name)
-                else:
-                    result = inner(*args, **kwargs)
+                result = inner(*args, **kwargs)
                 _write_json(result)
             except Exception as error:
                 _write_json({"error": str(error)}, err=True)
@@ -400,6 +380,21 @@ def _build_execution_plan(
 
     with OneTxClient(config) as client:
         known_instruments = _discover_vaults_from_client(client, enrich=True)
+        if uses_calldata_api(config):
+            # Planned and prepared in one pass: deposits are sized against the
+            # same preparation the dry run reports.
+            fitted = plan_calldata_allocation(
+                client,
+                signer,
+                allocation,
+                policy,
+                known_instruments=known_instruments,
+                config=config,
+            )
+            preparation = fitted.preparation.model_copy(
+                update={"messages": (*fitted.messages, *fitted.preparation.messages)}
+            )
+            return allocation, policy, fitted.plan, known_instruments, preparation
         plan = execute_allocation(
             client,
             signer,
@@ -412,14 +407,7 @@ def _build_execution_plan(
 
     if not isinstance(plan, TxPlan):
         raise TypeError("execute_allocation(confirm=False) did not return a TxPlan")
-    preparation = (
-        prepare_plan(signer, plan, config) if uses_calldata_api(config) else None
-    )
-    return allocation, policy, plan, known_instruments, preparation
-
-
-def prepare_plan(signer: object, plan: TxPlan, config: object) -> PlanPreparation:
-    return prepare(signer, plan, config)
+    return allocation, policy, plan, known_instruments, None
 
 
 def _execute_allocation_from_cli(
@@ -519,10 +507,8 @@ def _withdraw_from_cli(
     amount: float | None,
     confirm: bool,
 ) -> JsonObject:
-    if not confirm:
-        return _execution_plan("withdraw")
     if position is None:
-        raise ValueError("--position is required with --confirm")
+        raise ValueError("--position is required")
 
     policy = load_policy(policy_path)
     config = AllocatorConfig()
@@ -541,12 +527,13 @@ def _withdraw_from_cli(
             holding,
             policy,
             amount=amount,
-            confirm=True,
+            confirm=confirm,
             config=config,
-            idempotency_store=_withdraw_idempotency_store(
-                config,
-                holding,
-                amount=amount,
+            # A dry run reads no completion state, as for rebalance.
+            idempotency_store=(
+                _withdraw_idempotency_store(config, holding, amount=amount)
+                if confirm
+                else None
             ),
         )
 
@@ -1641,7 +1628,7 @@ def rebalance(
 
 
 @app.command("withdraw")
-@json_command(execution_command=True, command_name="withdraw")
+@json_command
 def withdraw(
     position: Annotated[str | None, typer.Option("--position")] = None,
     amount: Annotated[float | None, typer.Option("--amount", min=0)] = None,
@@ -1663,8 +1650,6 @@ def withdraw(
     ] = DEFAULT_POLICY_PATH,
 ) -> JsonObject:
     _ = (unsafe, autonomous)
-    if not confirm:
-        return _execution_plan("withdraw")
     return _withdraw_executor(
         position,
         positions_path,

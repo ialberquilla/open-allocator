@@ -1867,11 +1867,11 @@ def test_withdraw_with_confirm_uses_positions_output_and_sells_shares(
     assert [getattr(sent[0], "data") for sent in signer.sent] == ["0xsell"]
 
 
-@pytest.mark.parametrize("flag", ["--unsafe", "--autonomous"])
-def test_withdraw_unsafe_and_autonomous_do_not_bypass_confirm(
+@pytest.mark.parametrize("flag", [None, "--unsafe", "--autonomous"])
+def test_withdraw_without_confirm_is_a_dry_run_that_sends_nothing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    flag: str,
+    flag: str | None,
 ) -> None:
     signer = install_withdraw_surface_mocks(monkeypatch)
     current_path, _target_path, policy_path = write_rebalance_files(tmp_path)
@@ -1886,16 +1886,26 @@ def test_withdraw_unsafe_and_autonomous_do_not_bypass_confirm(
             str(current_path),
             "--policy",
             str(policy_path),
-            flag,
+            *([flag] if flag else []),
         ],
     )
 
     assert result.exit_code == 0
-    assert parse_single_stdout_object(result.stdout) == {
-        "status": "plan_required",
-        "command": "withdraw",
-        "requires": "--confirm or explicit --unsafe/--autonomous",
-    }
+    payload = parse_single_stdout_object(result.stdout)
+    assert payload["status"] == "planned"
+    assert payload["messages"][0] == "dry-run only; no transactions broadcast"
+    assert payload["withdraw_plan"]["yield_token_amount"] == "80.000000"
+    assert [step["data"] for step in payload["plan"]["steps"]] == ["0xsell"]
+    assert signer.sent == []
+
+
+def test_withdraw_requires_a_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    signer = install_withdraw_surface_mocks(monkeypatch)
+
+    result = runner.invoke(cli.app, ["withdraw"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stderr) == {"error": "--position is required"}
     assert signer.sent == []
     assert WithdrawOneTxClient.calls == []
 
@@ -1926,36 +1936,6 @@ def test_json_command_routes_errors_to_stderr() -> None:
     assert result.exit_code == 1
     assert result.stdout == ""
     assert json.loads(result.stderr) == {"error": "boom"}
-
-
-@pytest.mark.parametrize(
-    ("command", "executor_name"),
-    [
-        ("withdraw", "_withdraw_executor"),
-    ],
-)
-def test_execution_commands_without_confirmation_do_not_call_executor(
-    monkeypatch: pytest.MonkeyPatch,
-    command: str,
-    executor_name: str,
-) -> None:
-    calls: list[str] = []
-
-    def spy() -> JsonObject:
-        calls.append(command)
-        return {"status": "spy_called"}
-
-    monkeypatch.setattr(cli, executor_name, spy)
-
-    result = runner.invoke(cli.app, [command])
-
-    assert result.exit_code == 0
-    assert calls == []
-    assert parse_single_stdout_object(result.stdout) == {
-        "status": "plan_required",
-        "command": command,
-        "requires": "--confirm or explicit --unsafe/--autonomous",
-    }
 
 
 def set_paymaster_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:

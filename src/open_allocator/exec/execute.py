@@ -3,7 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Protocol,
+    overload,
+    runtime_checkable,
+)
 
 from pydantic import Field
 from web3 import HTTPProvider, Web3
@@ -15,7 +22,6 @@ from open_allocator.core.types import (
     Allocation,
     FrozenModel,
     Policy,
-    TxBundle,
     TxPlan,
     TxStep,
     Vault,
@@ -30,6 +36,11 @@ from open_allocator.exec.erc4337_paymaster import (
 from open_allocator.exec.funding import FundingRequirement
 from open_allocator.exec.paymaster_types import AssumedBalance
 from open_allocator.exec.signer import Receipt, Signer
+
+if TYPE_CHECKING:
+    # Imported for annotations only: both modules import this one.
+    from open_allocator.exec.bundle_execution import PlannedBundle
+    from open_allocator.exec.deposit_sizing import FittedPlan as DepositFit
 
 
 class GasCheck(FrozenModel):
@@ -198,8 +209,9 @@ def execute_allocation(
     address = signer.address()
     vaults_by_id = _vaults_by_id(known)
     if calldata.uses_calldata_api(config):
-        calldata_plan = _calldata_deposit_plan(
+        fitted = _calldata_deposit_plan(
             client,
+            signer,
             address,
             allocation_model,
             vaults_by_id,
@@ -207,11 +219,11 @@ def execute_allocation(
             idempotency_store,
         )
         if not confirm:
-            return calldata_plan
+            return fitted.plan
         return _execute_calldata_deposits(
             client,
             signer,
-            calldata_plan,
+            fitted,
             allocation_model,
             policy_result,
             config,
@@ -364,22 +376,56 @@ def execute_allocation(
     return report
 
 
+def plan_calldata_allocation(
+    client: object,
+    signer: Signer,
+    allocation: Allocation | Mapping[str, object],
+    policy: Policy | Mapping[str, object],
+    *,
+    known_instruments: Iterable[Vault | Mapping[str, object]] | None = None,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> DepositFit:
+    """The calldata deposit plan a dry run reports, prepared and sized.
+
+    What ``execute_allocation(confirm=False)`` plans, plus the preparation and
+    sizing notes it leaves out, so a dry run need not prepare a second time.
+    """
+    allocation_model = _allocation(allocation)
+    known = tuple(known_instruments or ())
+    policy_result = policy_core.check(allocation_model, _policy(policy), known)
+    if not policy_result.ok:
+        raise PolicyCheckFailed(policy_result)
+    return _calldata_deposit_plan(
+        client,
+        signer,
+        signer.address(),
+        allocation_model,
+        _vaults_by_id(known),
+        config,
+        idempotency_store,
+    )
+
+
 def _calldata_deposit_plan(
     client: object,
+    signer: Signer,
     address: str,
     allocation: Allocation,
     vaults_by_id: Mapping[str, Vault],
     config: object | None,
     idempotency_store: object | None,
-) -> TxPlan:
+) -> DepositFit:
     """A deposit plan built from calldata bundles, one per unfinished leg.
 
-    Same-chain only: a leg pinned to another source chain is rejected. Funding
-    is checked later by ``bundle_execution.prepare_plan``.
+    Same-chain only: a leg pinned to another source chain is rejected. Each
+    chain's deposits are sized to leave the paymaster's maximum charge in the
+    Safe; a chain short by more than that keeps full size and is a blocker.
     """
+    from open_allocator.exec import deposit_sizing
+
     calldata.ensure_calldata_supported(config)
-    steps: list[TxStep] = []
-    bundles: list[TxBundle] = []
+    deposits: list[deposit_sizing.DepositRequest] = []
     for leg_index, leg in enumerate(allocation.legs):
         if _store_completed(idempotency_store, _leg_key(leg_index, leg.instrument_id)):
             continue
@@ -397,35 +443,37 @@ def _calldata_deposit_plan(
                 "are not supported by the calldata API path yet"
             )
         token = calldata.deposit_token(vault.chain_id, vaults_by_id.values(), config)
-        leg_steps, bundle = calldata.request_bundle(
-            client,
-            instrument_id=leg.instrument_id,
-            action="deposit",
-            account=address,
-            chain_id=vault.chain_id,
-            amount=calldata.deposit_amount_raw(leg.usd, token),
-            leg_index=leg_index,
-            first_step_index=len(steps),
-            config=config,
-            token=token,
+        deposits.append(
+            deposit_sizing.DepositRequest(
+                index=leg_index,
+                instrument_id=leg.instrument_id,
+                chain_id=vault.chain_id,
+                token=token,
+                wanted_raw=int(calldata.deposit_amount_raw(leg.usd, token)),
+            )
         )
-        steps.extend(leg_steps)
-        bundles.append(bundle)
 
-    return TxPlan(
-        steps=tuple(steps),
-        summary=(
-            f"Build calldata deposit bundles for {len(bundles)} allocation legs "
-            f"across {len(steps)} transaction steps"
-        ),
-        bundles=tuple(bundles),
+    def summary(ordered: Sequence[PlannedBundle]) -> str:
+        return (
+            f"Build calldata deposit bundles for {len(ordered)} allocation legs "
+            f"across {sum(len(item.steps) for item in ordered)} transaction steps"
+        )
+
+    return deposit_sizing.fit(
+        client,
+        signer,
+        address,
+        deposits=deposits,
+        summary=summary,
+        config=config,
+        idempotency_store=idempotency_store,
     )
 
 
 def _execute_calldata_deposits(
     client: object,
     signer: Signer,
-    plan: TxPlan,
+    fitted: DepositFit,
     allocation: Allocation,
     policy_result: policy_core.PolicyResult,
     config: object | None,
@@ -438,17 +486,16 @@ def _execute_calldata_deposits(
     """
     from open_allocator.exec import bundle_execution
 
-    usd_by_leg = {index: leg.usd for index, leg in enumerate(allocation.legs)}
     result = bundle_execution.execute_plan(
         client,
         signer,
-        plan,
+        fitted.plan,
         stage="execute",
         policy_result=policy_result,
         completion_key=lambda bundle: _leg_key(bundle.leg_index, bundle.instrument_id),
         log=lambda bundle, _receipt: bundle_execution.BundleLog(
             action_type="buy",
-            usd=usd_by_leg.get(bundle.leg_index),
+            usd=fitted.deposit_usd.get(bundle.leg_index),
         ),
         config=config,
         idempotency_store=idempotency_store,
@@ -471,7 +518,7 @@ def _execute_calldata_deposits(
         preparations=result.preparations,
         funding=result.funding,
         in_progress=result.in_progress,
-        messages=result.messages,
+        messages=(*fitted.messages, *result.messages),
     )
     _write_checkpoint(
         config,
@@ -1326,4 +1373,5 @@ __all__ = [
     "WalletPreparation",
     "execute_allocation",
     "pending_receipt_messages",
+    "plan_calldata_allocation",
 ]
