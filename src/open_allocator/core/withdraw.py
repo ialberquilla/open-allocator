@@ -6,6 +6,7 @@ from math import isfinite
 
 from pydantic import Field
 
+from open_allocator.core import amounts
 from open_allocator.core.positions import PositionHolding
 from open_allocator.core.types import FrozenModel, Policy
 
@@ -24,6 +25,13 @@ class WithdrawPlan(FrozenModel):
     yield_token_amount: str
     yield_token_symbol: str | None = None
     yield_token_address: str | None = None
+    # Calldata API amount: ``max`` for a full exit, raw underlying-asset units
+    # for a partial one. ``yield_token_amount`` stays the share estimate for
+    # cost basis and the legacy sell endpoint; it is never a calldata amount.
+    # None only for a partial exit whose position lacks ``balance_raw`` or
+    # ``decimals`` — see :func:`calldata_withdraw_amount`.
+    calldata_amount: str | None = None
+    underlying_decimals: int | None = Field(default=None, ge=0)
 
 
 def plan_withdraw(
@@ -44,6 +52,7 @@ def plan_withdraw(
 
     share_price = current_usd / total_shares
     requested_usd: Decimal | None = None
+    calldata_amount: str | None = amounts.WITHDRAW_ALL
     if amount is None:
         full_exit = True
         shares_to_sell = holding.share_balance
@@ -64,6 +73,11 @@ def plan_withdraw(
             if rounded_shares <= 0:
                 raise ValueError("amount rounds down to zero yield-token shares")
             shares_to_sell = _format_decimal(rounded_shares)
+            calldata_amount = amounts.underlying_withdraw_amount(
+                (holding,),
+                requested_usd=requested_usd,
+                current_usd=current_usd,
+            )
 
     return WithdrawPlan(
         instrument_id=holding.instrument_id,
@@ -79,7 +93,22 @@ def plan_withdraw(
         yield_token_amount=shares_to_sell,
         yield_token_symbol=holding.yield_token_symbol,
         yield_token_address=holding.yield_token_address,
+        calldata_amount=calldata_amount,
+        underlying_decimals=holding.decimals,
     )
+
+
+def calldata_withdraw_amount(plan: WithdrawPlan) -> str:
+    """The calldata ``amount`` for this exit, failing closed when underivable."""
+    if plan.full_exit:
+        return amounts.WITHDRAW_ALL
+    if plan.calldata_amount is None:
+        raise ValueError(
+            f"cannot build a partial withdrawal of {plan.instrument_id}: the "
+            "position has no raw underlying balance or decimals, and a share "
+            "amount must never be sent as the calldata amount"
+        )
+    return plan.calldata_amount
 
 
 def withdraw(*args: object, **kwargs: object) -> object:
@@ -126,4 +155,4 @@ def _format_decimal(value: Decimal) -> str:
     return text or "0"
 
 
-__all__ = ["WithdrawPlan", "plan_withdraw", "withdraw"]
+__all__ = ["WithdrawPlan", "calldata_withdraw_amount", "plan_withdraw", "withdraw"]

@@ -62,6 +62,14 @@ class Vault(FrozenModel):
     protocol: str
     chain_id: int
     asset: str
+    # Underlying (deposit/withdraw) token and yield token, as discovered from
+    # 1Tx. Execution converts amounts to raw units with these decimals, so they
+    # are never defaulted: None = upstream did not say, and a raw-amount request
+    # that needs one must fail closed.
+    token_address: str | None = None
+    token_decimals: int | None = Field(default=None, ge=0)
+    yield_token_address: str | None = None
+    yield_token_decimals: int | None = Field(default=None, ge=0)
     asset_category: str | None = None
     # Yield source ("how this pays"), sourced from 1Tx discovery — never
     # hardcoded here, per the Dynamic Universe Rule. None = upstream has not

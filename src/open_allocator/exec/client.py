@@ -36,8 +36,16 @@ class Instrument(OneTxModel):
     instrument_id: str = Field(alias="instrumentId")
     protocol: str
     chain_id: int = Field(alias="chainId")
+    token_address: str | None = Field(default=None, alias="tokenAddress")
     token_symbol: str | None = Field(default=None, alias="tokenSymbol")
+    token_decimals: int | None = Field(default=None, alias="tokenDecimals", ge=0)
+    yield_token_address: str | None = Field(default=None, alias="yieldTokenAddress")
     yield_token_symbol: str | None = Field(default=None, alias="yieldTokenSymbol")
+    yield_token_decimals: int | None = Field(
+        default=None,
+        alias="yieldTokenDecimals",
+        ge=0,
+    )
     description: str | None = None
     current_apy: float | None = Field(default=None, alias="currentApy")
     apy_base: float | None = Field(default=None, alias="apyBase")

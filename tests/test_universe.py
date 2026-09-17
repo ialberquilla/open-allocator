@@ -204,6 +204,65 @@ def test_discovery_preserves_advertised_and_split_apy_fields() -> None:
     assert vault.accruing_apy == 3.7
 
 
+def test_discovery_retains_both_token_address_and_decimal_pairs() -> None:
+    client = StubClient(
+        [
+            instrument(
+                tokenAddress="0x00000000000000000000000000000000000000aa",
+                tokenDecimals=18,
+                yieldTokenAddress="0x00000000000000000000000000000000000000bb",
+                yieldTokenDecimals=6,
+            )
+        ]
+    )
+
+    vault = universe.discover(client)[0]
+
+    assert vault.token_address == "0x00000000000000000000000000000000000000aa"
+    assert vault.token_decimals == 18
+    assert vault.yield_token_address == "0x00000000000000000000000000000000000000bb"
+    assert vault.yield_token_decimals == 6
+
+
+def test_discovery_retains_token_metadata_from_the_typed_client_model() -> None:
+    payload = instrument(
+        tokenAddress="0x00000000000000000000000000000000000000aa",
+        tokenDecimals=8,
+        yieldTokenAddress="0x00000000000000000000000000000000000000bb",
+        yieldTokenDecimals=8,
+        isActive=True,
+        isStablecoin=False,
+    )
+
+    vault = universe.discover(StubClient([Instrument.model_validate(payload)]))[0]
+
+    assert (vault.token_address, vault.token_decimals) == (
+        "0x00000000000000000000000000000000000000aa",
+        8,
+    )
+    assert (vault.yield_token_address, vault.yield_token_decimals) == (
+        "0x00000000000000000000000000000000000000bb",
+        8,
+    )
+
+
+def test_missing_token_metadata_is_unknown_not_defaulted() -> None:
+    vault = universe.discover(StubClient([instrument()]))[0]
+
+    assert vault.token_address is None
+    assert vault.token_decimals is None
+    assert vault.yield_token_address is None
+    assert vault.yield_token_decimals is None
+
+
+def test_malformed_token_decimals_skip_the_instrument() -> None:
+    _, skipped = universe.discover_instruments(
+        StubClient([instrument(instrumentId="bad-decimals", tokenDecimals=-1)])
+    )
+
+    assert [item.instrument_id for item in skipped] == ["bad-decimals"]
+
+
 def test_discovery_preserves_unknown_and_zero_reward_apy() -> None:
     unknown, zero = universe.discover(
         StubClient(

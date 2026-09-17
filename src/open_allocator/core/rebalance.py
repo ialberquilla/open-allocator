@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from open_allocator.core import amounts
 from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
 from open_allocator.core.types import Allocation, FrozenModel, Policy, Vault
@@ -34,6 +35,11 @@ class RebalanceTrade(FrozenModel):
     current_weight: float = Field(ge=0)
     target_weight: float = Field(ge=0)
     yield_token_amount: str | None = None
+    # Sells only. Calldata API amount: ``max`` for a full exit, raw
+    # underlying-asset units for a partial one — never the share estimate above.
+    # None when the positions lack ``balance_raw``/``decimals``, so a calldata
+    # request for this trade must fail closed.
+    calldata_amount: str | None = None
 
 
 class RebalancePlan(FrozenModel):
@@ -161,6 +167,11 @@ def _trades(
                     if delta.action == "sell"
                     else None
                 ),
+                calldata_amount=(
+                    _sell_calldata_amount(positions, delta)
+                    if delta.action == "sell"
+                    else None
+                ),
             )
         )
     return trades
@@ -170,24 +181,8 @@ def _sell_share_amount(
     positions: positions_core.Positions,
     delta: positions_core.PositionDelta,
 ) -> str:
-    holdings = tuple(
-        holding
-        for holding in positions.holdings
-        if holding.instrument_id == delta.instrument_id
-    )
-    if not holdings:
-        raise ValueError(f"cannot sell missing position: {delta.instrument_id}")
-
-    current_usd = sum(
-        (
-            _money_decimal(holding.usd_value, "holding.usd_value")
-            for holding in holdings
-        ),
-        Decimal("0"),
-    )
-    if current_usd <= 0:
-        raise ValueError(f"cannot sell zero-value position: {delta.instrument_id}")
-
+    holdings = _instrument_holdings(positions, delta)
+    current_usd = _holdings_usd(holdings, delta)
     total_shares = sum(
         (
             _money_decimal(holding.share_balance, "holding.share_balance")
@@ -206,6 +201,54 @@ def _sell_share_amount(
         rounding=ROUND_DOWN,
     )
     return _format_decimal(shares)
+
+
+def _sell_calldata_amount(
+    positions: positions_core.Positions,
+    delta: positions_core.PositionDelta,
+) -> str | None:
+    holdings = _instrument_holdings(positions, delta)
+    current_usd = _holdings_usd(holdings, delta)
+    sell_usd = _money_decimal(delta.sell_usd, "delta.sell_usd")
+    # Same full-exit boundary as the share estimate, so the two never disagree
+    # about whether this sell closes the position.
+    if sell_usd + _EPSILON >= current_usd:
+        return amounts.WITHDRAW_ALL
+    return amounts.underlying_withdraw_amount(
+        holdings,
+        requested_usd=sell_usd,
+        current_usd=current_usd,
+    )
+
+
+def _instrument_holdings(
+    positions: positions_core.Positions,
+    delta: positions_core.PositionDelta,
+) -> tuple[positions_core.PositionHolding, ...]:
+    holdings = tuple(
+        holding
+        for holding in positions.holdings
+        if holding.instrument_id == delta.instrument_id
+    )
+    if not holdings:
+        raise ValueError(f"cannot sell missing position: {delta.instrument_id}")
+    return holdings
+
+
+def _holdings_usd(
+    holdings: Iterable[positions_core.PositionHolding],
+    delta: positions_core.PositionDelta,
+) -> Decimal:
+    current_usd = sum(
+        (
+            _money_decimal(holding.usd_value, "holding.usd_value")
+            for holding in holdings
+        ),
+        Decimal("0"),
+    )
+    if current_usd <= 0:
+        raise ValueError(f"cannot sell zero-value position: {delta.instrument_id}")
+    return current_usd
 
 
 def _sum_trade_usd(

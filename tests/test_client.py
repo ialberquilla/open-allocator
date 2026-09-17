@@ -55,8 +55,12 @@ def instrument_list_payload() -> dict[str, Any]:
                 "instrumentId": "morpho-base-usdc-1",
                 "protocol": "morpho",
                 "chainId": 8453,
+                "tokenAddress": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
                 "tokenSymbol": "USDC",
+                "tokenDecimals": 6,
+                "yieldTokenAddress": "0x944766f715b51967E56aFdE5f0Aa76cEaCc9E7f9",
                 "yieldTokenSymbol": "mUSDC",
+                "yieldTokenDecimals": 18,
                 "description": "Morpho USDC vault",
                 "currentApy": 4.2,
                 "apyBase": 3.7,
@@ -183,6 +187,42 @@ def test_list_instruments_gets_filters_auth_and_parses() -> None:
         "0x0000000000000000000000000000000000000001",
     )
     assert result.pagination.has_more is False
+
+
+def test_instrument_parses_token_address_and_decimal_pairs() -> None:
+    payload = instrument_list_payload()
+
+    result = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    ).list_instruments()
+
+    instrument = result.data[0]
+    assert instrument.token_address == "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    assert instrument.token_decimals == 6
+    assert instrument.yield_token_address == (
+        "0x944766f715b51967E56aFdE5f0Aa76cEaCc9E7f9"
+    )
+    assert instrument.yield_token_decimals == 18
+
+
+def test_instrument_token_metadata_is_optional_for_discovery() -> None:
+    payload = instrument_list_payload()
+    for key in (
+        "tokenAddress",
+        "tokenDecimals",
+        "yieldTokenAddress",
+        "yieldTokenDecimals",
+    ):
+        payload["data"][0].pop(key)
+
+    result = make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    ).list_instruments()
+
+    assert result.data[0].token_address is None
+    assert result.data[0].token_decimals is None
+    assert result.data[0].yield_token_address is None
+    assert result.data[0].yield_token_decimals is None
 
 
 def test_instrument_split_fields_are_optional_and_preserve_null_vs_zero() -> None:

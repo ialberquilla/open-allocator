@@ -16,7 +16,7 @@ from open_allocator.core.types import (
     PolicyWallet,
     TxStep,
 )
-from open_allocator.core.withdraw import plan_withdraw
+from open_allocator.core.withdraw import calldata_withdraw_amount, plan_withdraw
 from open_allocator.exec.execute import GasCheck
 from open_allocator.exec.signer import Receipt
 from open_allocator.exec.withdraw import withdraw
@@ -309,6 +309,176 @@ def test_zero_rounding_partial_withdraw_is_rejected() -> None:
             permissive_policy(),
             amount="0.99",
         )
+
+
+def recipe_holding(
+    *,
+    balance: str,
+    balance_raw: str | None,
+    decimals: int | None,
+    share_balance: str,
+    share_balance_raw: str,
+    share_decimals: int,
+    symbol: str = "USDC",
+) -> PositionHolding:
+    return PositionHolding(
+        instrument_id="recipe-vault",
+        protocol="protocol",
+        chain_id=8453,
+        symbol=symbol,
+        balance=balance,
+        balance_raw=balance_raw,
+        decimals=decimals,
+        usd_value=float(balance),
+        share_balance=share_balance,
+        share_balance_raw=share_balance_raw,
+        share_decimals=share_decimals,
+    )
+
+
+# Position shapes as the positions API reports them. Shares and underlying
+# diverge in price (ERC-4626) and in decimals (18-decimal shares over a
+# 6-decimal asset), which is exactly what a share amount sent as an asset
+# amount would get wrong.
+RECIPES = {
+    "erc4626-18-decimal-shares": recipe_holding(
+        balance="16.8213",
+        balance_raw="16821300",
+        decimals=6,
+        share_balance="16.356116850925590939",
+        share_balance_raw="16356116850925590939",
+        share_decimals=18,
+    ),
+    "erc4626-appreciated-shares": recipe_holding(
+        balance="13.391423",
+        balance_raw="13391423",
+        decimals=6,
+        share_balance="9.816138",
+        share_balance_raw="9816138",
+        share_decimals=6,
+    ),
+    "aave-atoken": recipe_holding(
+        balance="40.123456",
+        balance_raw="40123456",
+        decimals=6,
+        share_balance="40.123456",
+        share_balance_raw="40123456",
+        share_decimals=6,
+    ),
+    "comet": recipe_holding(
+        balance="25.000001",
+        balance_raw="25000001",
+        decimals=6,
+        share_balance="25.000001",
+        share_balance_raw="25000001",
+        share_decimals=6,
+    ),
+}
+
+
+@pytest.mark.parametrize("recipe", sorted(RECIPES))
+def test_full_exit_sends_max_for_every_recipe(recipe: str) -> None:
+    position = RECIPES[recipe]
+
+    for plan in (
+        plan_withdraw(position, permissive_policy()),
+        plan_withdraw(position, permissive_policy(), amount=position.balance),
+        plan_withdraw(position, permissive_policy(), amount="1000000"),
+    ):
+        assert plan.full_exit is True
+        assert plan.calldata_amount == "max"
+        assert calldata_withdraw_amount(plan) == "max"
+
+
+@pytest.mark.parametrize(
+    ("recipe", "amount", "raw_assets"),
+    [
+        # floor(16821300 * 5 / 16.8213)
+        ("erc4626-18-decimal-shares", "5", "5000000"),
+        # floor(13391423 * 10 / 13.391423)
+        ("erc4626-appreciated-shares", "10", "10000000"),
+        # floor(40123456 * 0.333333 / 40.123456)
+        ("aave-atoken", "0.333333", "333333"),
+        # floor(25000001 * 12.5 / 25.000001) — rounds down, never up
+        ("comet", "12.5", "12500000"),
+    ],
+)
+def test_partial_exit_sends_raw_underlying_units_not_shares(
+    recipe: str,
+    amount: str,
+    raw_assets: str,
+) -> None:
+    position = RECIPES[recipe]
+
+    plan = plan_withdraw(position, permissive_policy(), amount=amount)
+
+    assert plan.full_exit is False
+    assert plan.calldata_amount == raw_assets
+    assert calldata_withdraw_amount(plan) == raw_assets
+    assert plan.underlying_decimals == position.decimals
+    # The share estimate is kept for accounting, but is not the calldata amount.
+    assert plan.yield_token_amount != raw_assets
+    assert plan.calldata_amount != position.share_balance_raw
+
+
+def test_partial_exit_of_an_18_decimal_underlying_is_exact() -> None:
+    position = recipe_holding(
+        balance="1.5",
+        balance_raw="1500000000000000000",
+        decimals=18,
+        share_balance="1.4",
+        share_balance_raw="1400000000000000000",
+        share_decimals=18,
+        symbol="WETH",
+    )
+
+    plan = plan_withdraw(position, permissive_policy(), amount="0.1")
+
+    assert plan.calldata_amount == "100000000000000000"
+
+
+def test_partial_exit_rounds_underlying_units_down_without_overdraw() -> None:
+    position = recipe_holding(
+        balance="3",
+        balance_raw="3000001",
+        decimals=6,
+        share_balance="3",
+        share_balance_raw="3000000",
+        share_decimals=6,
+    )
+
+    plan = plan_withdraw(position, permissive_policy(), amount="1")
+
+    # 3000001 / 3 = 1000000.33…
+    assert plan.calldata_amount == "1000000"
+
+
+@pytest.mark.parametrize(
+    ("balance_raw", "decimals"),
+    [(None, 6), ("3000000", None)],
+)
+def test_partial_exit_without_raw_underlying_fails_closed(
+    balance_raw: str | None,
+    decimals: int | None,
+) -> None:
+    position = recipe_holding(
+        balance="3",
+        balance_raw=balance_raw,
+        decimals=decimals,
+        share_balance="3",
+        share_balance_raw="3000000",
+        share_decimals=6,
+    )
+
+    plan = plan_withdraw(position, permissive_policy(), amount="1")
+
+    assert plan.calldata_amount is None
+    with pytest.raises(ValueError, match="share amount must never be sent"):
+        calldata_withdraw_amount(plan)
+    # A full exit needs no raw balance: ``max`` withdraws whatever is held.
+    assert calldata_withdraw_amount(plan_withdraw(position, permissive_policy())) == (
+        "max"
+    )
 
 
 @dataclass

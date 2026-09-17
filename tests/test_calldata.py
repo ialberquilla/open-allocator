@@ -4,9 +4,14 @@ from typing import Any
 
 import pytest
 
+from open_allocator.core.types import Vault
 from open_allocator.exec.calldata import (
+    CalldataAmountError,
     CalldataExpiredError,
     CalldataValidationError,
+    DepositToken,
+    deposit_amount_raw,
+    deposit_token,
     ensure_calldata_lifetime,
     validate_bridge_calldata,
     validate_instrument_calldata,
@@ -158,3 +163,110 @@ def test_mismatched_bridge_bundle_is_rejected(
 
     with pytest.raises(CalldataValidationError, match=field):
         validate_bridge_calldata(bridge_response(), **expected)
+
+
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BSC_USDC = "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+
+
+def discovered(
+    instrument_id: str,
+    *,
+    chain_id: int = 8453,
+    token_address: str | None = BASE_USDC,
+    token_decimals: int | None = 6,
+    asset: str = "USDC",
+) -> Vault:
+    return Vault(
+        instrument_id=instrument_id,
+        protocol="protocol",
+        chain_id=chain_id,
+        asset=asset,
+        apy=1.0,
+        tvl_usd=1.0,
+        token_address=token_address,
+        token_decimals=token_decimals,
+    )
+
+
+@pytest.mark.parametrize(
+    ("amount", "raw"),
+    [(100.25, "100250000"), ("0.000001", "1"), ("1.0000019", "1000001")],
+)
+def test_deposit_amount_converts_usdc_to_raw_units(amount: object, raw: str) -> None:
+    token = DepositToken(chain_id=8453, address=BASE_USDC, decimals=6)
+
+    assert deposit_amount_raw(amount, token) == raw
+
+
+def test_deposit_amount_uses_the_discovered_decimals_not_six() -> None:
+    token = DepositToken(chain_id=56, address=BSC_USDC, decimals=18)
+
+    assert deposit_amount_raw("100.25", token) == "100250000000000000000"
+
+
+def test_deposit_amount_rejects_an_amount_that_rounds_to_zero() -> None:
+    token = DepositToken(chain_id=8453, address=BASE_USDC, decimals=6)
+
+    with pytest.raises(CalldataAmountError, match="zero raw units"):
+        deposit_amount_raw("0.0000009", token)
+
+
+def test_deposit_token_is_the_chain_usdc_even_for_a_non_usdc_vault() -> None:
+    vaults = (
+        discovered(
+            "gho-vault",
+            token_address="0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee",
+            token_decimals=18,
+            asset="GHO",
+        ),
+        discovered("usdc-vault"),
+        discovered("other-chain", chain_id=42161, token_decimals=18),
+    )
+
+    token = deposit_token(8453, vaults, config={})
+
+    assert token == DepositToken(chain_id=8453, address=BASE_USDC, decimals=6)
+
+
+def test_deposit_token_matches_the_address_case_insensitively() -> None:
+    vaults = (discovered("usdc-vault", token_address=BASE_USDC.lower()),)
+
+    assert deposit_token(8453, vaults, config={}).decimals == 6
+
+
+def test_deposit_token_honors_the_usdc_address_override() -> None:
+    override = "0x00000000000000000000000000000000000000cc"
+    vaults = (
+        discovered("canonical", chain_id=56, token_address=BSC_USDC, token_decimals=18),
+        discovered("override", chain_id=56, token_address=override, token_decimals=6),
+    )
+
+    token = deposit_token(56, vaults, config={"PAYMASTER_USDC_ADDRESS_56": override})
+
+    assert token == DepositToken(chain_id=56, address=override, decimals=6)
+
+
+def test_deposit_token_fails_closed_without_a_discovered_decimal() -> None:
+    vaults = (
+        discovered("no-decimals", token_decimals=None),
+        discovered("other-token", token_address="0x" + "11" * 20),
+    )
+
+    with pytest.raises(CalldataAmountError, match="reports decimals"):
+        deposit_token(8453, vaults, config={})
+
+
+def test_deposit_token_fails_closed_on_disagreeing_decimals() -> None:
+    vaults = (
+        discovered("six", token_decimals=6),
+        discovered("eighteen", token_decimals=18),
+    )
+
+    with pytest.raises(CalldataAmountError, match="disagree"):
+        deposit_token(8453, vaults, config={})
+
+
+def test_deposit_token_fails_closed_for_a_chain_without_known_usdc() -> None:
+    with pytest.raises(CalldataAmountError, match="no USDC address"):
+        deposit_token(999_999, (discovered("x", chain_id=999_999),), config={})

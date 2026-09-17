@@ -416,6 +416,59 @@ def test_plan_rebalance_executes_only_changed_legs_and_skips_dust() -> None:
     ]
 
 
+def test_plan_rebalance_partial_sell_carries_raw_underlying_calldata_amount() -> None:
+    current = positions_snapshot(holding("vault-a", "80"), holding("vault-b", "20"))
+
+    plan = plan_rebalance(
+        current,
+        allocation(("vault-a", 0.5), ("vault-b", 0.5)),
+        policy(),
+        known_instruments=known("vault-a", "vault-b"),
+    )
+
+    sell, buy = plan.trades
+    assert (sell.action, sell.instrument_id, sell.usd) == ("sell", "vault-a", 30)
+    # floor(80000000 * 30 / 80): raw underlying units, not the share estimate.
+    assert sell.calldata_amount == "30000000"
+    assert sell.yield_token_amount == "30"
+    assert buy.calldata_amount is None
+
+
+def test_plan_rebalance_full_exit_sends_max() -> None:
+    current = positions_snapshot(holding("vault-a", "60"), holding("vault-b", "40"))
+
+    plan = plan_rebalance(
+        current,
+        allocation(("vault-b", 1.0)),
+        policy(),
+        known_instruments=known("vault-a", "vault-b"),
+    )
+
+    sells = [trade for trade in plan.trades if trade.action == "sell"]
+    assert [(trade.instrument_id, trade.calldata_amount) for trade in sells] == [
+        ("vault-a", "max")
+    ]
+
+
+def test_plan_rebalance_partial_sell_without_raw_balance_has_no_calldata_amount() -> (
+    None
+):
+    unreadable = holding("vault-a", "80").model_copy(update={"balance_raw": None})
+    current = positions_snapshot(unreadable, holding("vault-b", "20"))
+
+    plan = plan_rebalance(
+        current,
+        allocation(("vault-a", 0.5), ("vault-b", 0.5)),
+        policy(),
+        known_instruments=known("vault-a", "vault-b"),
+    )
+
+    sell = plan.trades[0]
+    assert sell.action == "sell"
+    assert sell.yield_token_amount == "30"
+    assert sell.calldata_amount is None
+
+
 def test_plan_rebalance_orders_sells_before_buys() -> None:
     current = positions_snapshot(holding("vault-a", "80"), holding("vault-b", "20"))
 

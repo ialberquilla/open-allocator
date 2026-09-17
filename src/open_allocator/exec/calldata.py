@@ -9,7 +9,11 @@ bundle that fails any check must never reach a signer.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 
+from open_allocator.core import amounts
+from open_allocator.core.types import FrozenModel, Vault
+from open_allocator.exec import chains
 from open_allocator.exec.client import (
     BridgeCalldataResponse,
     CalldataAction,
@@ -24,6 +28,66 @@ class CalldataValidationError(OneTxDecodeError):
 
 class CalldataExpiredError(CalldataValidationError):
     pass
+
+
+class CalldataAmountError(ValueError):
+    """A calldata request amount could not be derived exactly; do not guess."""
+
+
+class DepositToken(FrozenModel):
+    chain_id: int
+    address: str
+    decimals: int
+
+
+def deposit_token(
+    chain_id: int,
+    vaults: Iterable[Vault],
+    config: object | None = None,
+) -> DepositToken:
+    """The token a deposit request's raw ``amount`` is denominated in.
+
+    Requests omit ``tokenIn``, so 1Tx spends the chain's USDC whatever the
+    vault's underlying is. The address comes from the chain registry the
+    paymaster and balances already use; its decimals come from discovery — an
+    instrument on that chain whose underlying is that token — and are never
+    assumed, because USDC is not 6 decimals on every chain.
+    """
+    address = chains.usdc_address(chain_id, config)
+    if address is None:
+        raise CalldataAmountError(f"no USDC address is known for chain {chain_id}")
+    decimals = {
+        vault.token_decimals
+        for vault in vaults
+        if vault.chain_id == chain_id
+        and vault.token_address is not None
+        and vault.token_address.casefold() == address.casefold()
+        and vault.token_decimals is not None
+    }
+    if not decimals:
+        raise CalldataAmountError(
+            f"no discovered instrument on chain {chain_id} reports decimals for "
+            f"USDC {address}"
+        )
+    if len(decimals) > 1:
+        raise CalldataAmountError(
+            f"discovered instruments disagree on decimals for USDC {address} on "
+            f"chain {chain_id}: {sorted(decimals)}"
+        )
+    return DepositToken(chain_id=chain_id, address=address, decimals=decimals.pop())
+
+
+def deposit_amount_raw(amount_usdc: object, token: DepositToken) -> str:
+    """A human USDC amount as the raw ``amount`` of a deposit request.
+
+    Rounds down, so the request never spends more than was selected.
+    """
+    raw = amounts.to_raw_units(amount_usdc, token.decimals, name="deposit amount")
+    if raw <= 0:
+        raise CalldataAmountError(
+            f"deposit amount {amount_usdc} rounds down to zero raw units"
+        )
+    return str(raw)
 
 
 def validate_instrument_calldata(
