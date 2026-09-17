@@ -638,6 +638,20 @@ def test_min_calldata_ttl_defaults_and_overrides(
         AllocatorConfig()
 
 
+def test_transaction_api_defaults_to_legacy_and_accepts_calldata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_env(monkeypatch)
+    assert AllocatorConfig().transaction_api == "legacy"
+
+    monkeypatch.setenv("ONE_TX_TRANSACTION_API", "calldata")
+    assert AllocatorConfig().transaction_api == "calldata"
+
+    monkeypatch.setenv("ONE_TX_TRANSACTION_API", "v2")
+    with pytest.raises(ValidationError, match="ONE_TX_TRANSACTION_API"):
+        AllocatorConfig()
+
+
 @pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "YeS"])
 def test_fast_transfer_boolean_true_values(
     monkeypatch: pytest.MonkeyPatch,

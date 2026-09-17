@@ -24,6 +24,7 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
+from open_allocator.exec.calldata import CalldataUnsupportedError
 from open_allocator.exec.execute import (
     ExecutionBroadcastError,
     FundingLedger,
@@ -978,3 +979,32 @@ def test_the_reserve_is_a_floor_on_the_wallet_not_a_toll_on_each_sell() -> None:
     assert ledger.available[8453] == pytest.approx(4.25)
     ledger.credit(8453, 10.0)
     assert ledger.available[8453] == pytest.approx(14.25), "charged once, not twice"
+
+
+@dataclass(frozen=True)
+class CalldataConfig(Config):
+    transaction_api: str = "calldata"
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+def test_rebalance_is_refused_on_the_calldata_api_rather_than_falling_back(
+    confirm: bool,
+) -> None:
+    client = MockRebalanceClient(sell_responses=[], buy_responses=[])
+    signer = MockSigner()
+
+    with pytest.raises(CalldataUnsupportedError, match="rebalance"):
+        execute_rebalance(
+            client,
+            signer,
+            positions_snapshot(holding("vault-a", "60"), holding("vault-b", "40")),
+            allocation(("vault-a", 0.5), ("vault-b", 0.5)),
+            policy(),
+            confirm=confirm,
+            known_instruments=known("vault-a", "vault-b"),
+            config=CalldataConfig(),
+        )
+
+    assert client.sell_bodies == []
+    assert client.buy_bodies == []
+    assert signer.sent == []

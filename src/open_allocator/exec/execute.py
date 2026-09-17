@@ -15,11 +15,12 @@ from open_allocator.core.types import (
     Allocation,
     FrozenModel,
     Policy,
+    TxBundle,
     TxPlan,
     TxStep,
     Vault,
 )
-from open_allocator.exec import chains
+from open_allocator.exec import calldata, chains
 from open_allocator.exec.erc4337_paymaster import (
     PaymasterError,
     paymaster_cost_notes,
@@ -47,6 +48,33 @@ class ExecutionStepReport(FrozenModel):
     idempotency_key: str | None = None
 
 
+class WalletPreparation(FrozenModel):
+    """The wallet-aware estimate of one Safe operation, prepared but not sent.
+
+    Keyed by the plan bundles the operation carries. Holds only what the
+    announcement needs; the provider's UserOperation itself stays out of plans
+    and reports, because its nonce, fees, and sponsorship expire and are
+    refreshed before submission.
+    """
+
+    bundle_ids: tuple[str, ...] = Field(min_length=1)
+    chain_id: int = Field(ge=1)
+    sender: str
+    # Whether the operation carries counterfactual Safe deployment.
+    includes_deployment: bool
+    # Final wallet gas for the whole operation — deployment, the bundles' calls,
+    # and the paymaster approval — never the protocol-bundle simulation gas.
+    call_gas_limit: int | None = Field(default=None, ge=0)
+    verification_gas_limit: int | None = Field(default=None, ge=0)
+    pre_verification_gas: int | None = Field(default=None, ge=0)
+    max_fee_per_gas: int | None = Field(default=None, ge=0)
+    max_priority_fee_per_gas: int | None = Field(default=None, ge=0)
+    paymaster_address: str | None = None
+    paymaster_token: str | None = None
+    # None when the adapter cannot bound the charge defensibly.
+    max_gas_token_charge_raw: str | None = Field(default=None, pattern=r"^\d+$")
+
+
 class ExecutionReport(FrozenModel):
     status: Literal["planned", "success", "in_progress", "failed"]
     policy_result: policy_core.PolicyResult
@@ -54,6 +82,7 @@ class ExecutionReport(FrozenModel):
     steps: tuple[ExecutionStepReport, ...] = Field(default_factory=tuple)
     receipts: tuple[Receipt, ...] = Field(default_factory=tuple)
     gas_checks: tuple[GasCheck, ...] = Field(default_factory=tuple)
+    preparations: tuple[WalletPreparation, ...] = Field(default_factory=tuple)
     in_progress: bool = False
     messages: tuple[str, ...] = Field(default_factory=tuple)
 
@@ -73,6 +102,14 @@ class PolicyCheckFailed(ExecutionError):
 
 class TransactionPlanError(ExecutionError):
     pass
+
+
+# Calldata bundles are planned but not yet executable: signing them needs the
+# wallet-aware preparation, expiry refresh, and requirement checks first.
+CALLDATA_EXECUTION_UNAVAILABLE = (
+    "ONE_TX_TRANSACTION_API=calldata can build plans but cannot execute them yet; "
+    "use ONE_TX_TRANSACTION_API=legacy to execute"
+)
 
 
 class GasPreflightError(ExecutionError):
@@ -158,6 +195,18 @@ def execute_allocation(
 
     address = signer.address()
     vaults_by_id = _vaults_by_id(known)
+    if calldata.uses_calldata_api(config):
+        if confirm:
+            raise TransactionPlanError(CALLDATA_EXECUTION_UNAVAILABLE)
+        return _calldata_deposit_plan(
+            client,
+            address,
+            allocation_model,
+            vaults_by_id,
+            config,
+            idempotency_store,
+        )
+
     balances_by_chain = _idle_usdc_by_chain(client, address)
     plan_steps: list[TxStep] = []
     step_refs: list[_StepRef] = []
@@ -299,6 +348,80 @@ def execute_allocation(
         completed_keys=_completed_keys(step_refs, execution_steps),
     )
     return report
+
+
+def _calldata_deposit_plan(
+    client: object,
+    address: str,
+    allocation: Allocation,
+    vaults_by_id: Mapping[str, Vault],
+    config: object | None,
+    idempotency_store: object | None,
+) -> TxPlan:
+    """A deposit plan built from calldata bundles, one per unfinished leg.
+
+    Same-chain only: the instrument endpoint never bridges, so a leg pinned to
+    another source chain is rejected rather than quietly deposited from the
+    vault's chain. Funding is not checked here; that is the funding ledger's job
+    before anything can execute.
+    """
+    calldata.ensure_calldata_supported(config)
+    steps: list[TxStep] = []
+    bundles: list[TxBundle] = []
+    for leg_index, leg in enumerate(allocation.legs):
+        if _store_completed(idempotency_store, _leg_key(leg_index, leg.instrument_id)):
+            continue
+        vault = vaults_by_id.get(leg.instrument_id)
+        if vault is None:
+            raise TransactionPlanError(
+                f"instrument {leg.instrument_id} is not in the discovered universe; "
+                "its chain and deposit token are unknown"
+            )
+        source_chain_id = _pinned_source_chain_id(allocation, config)
+        if source_chain_id is not None and source_chain_id != vault.chain_id:
+            raise calldata.CalldataUnsupportedError(
+                f"leg {leg_index} ({leg.instrument_id}) is on chain {vault.chain_id} "
+                f"but sources from chain {source_chain_id}; cross-chain deposits "
+                "are not supported by the calldata API path yet"
+            )
+        token = calldata.deposit_token(vault.chain_id, vaults_by_id.values(), config)
+        leg_steps, bundle = calldata.request_bundle(
+            client,
+            instrument_id=leg.instrument_id,
+            action="deposit",
+            account=address,
+            chain_id=vault.chain_id,
+            amount=calldata.deposit_amount_raw(leg.usd, token),
+            leg_index=leg_index,
+            first_step_index=len(steps),
+            config=config,
+            token=token,
+        )
+        steps.extend(leg_steps)
+        bundles.append(bundle)
+
+    return TxPlan(
+        steps=tuple(steps),
+        summary=(
+            f"Build calldata deposit bundles for {len(bundles)} allocation legs "
+            f"across {len(steps)} transaction steps"
+        ),
+        bundles=tuple(bundles),
+    )
+
+
+def _pinned_source_chain_id(
+    allocation: Allocation,
+    config: object | None,
+) -> int | None:
+    configured = _config_value(config, "source_chain_id")
+    if configured is not None:
+        return int(configured)  # type: ignore[call-overload]
+    for key in ("source_chain_id", "sourceChainId"):
+        value = allocation.metadata.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -511,14 +634,9 @@ def _source_chain_id(
     leg_usd: float | None,
     balances_by_chain: Mapping[int, float] | None,
 ) -> int | None:
-    configured = _config_value(config, "source_chain_id")
-    if configured is not None:
-        return int(configured)
-
-    for key in ("source_chain_id", "sourceChainId"):
-        value = allocation.metadata.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
+    pinned = _pinned_source_chain_id(allocation, config)
+    if pinned is not None:
+        return pinned
 
     # Balance-aware default: source USDC from the chain the wallet is actually
     # funded on. 1Tx (SwapDepositRouter + CCTP) bridges from that source chain
@@ -1127,6 +1245,7 @@ __all__ = [
     "IdempotencyStore",
     "PolicyCheckFailed",
     "TransactionPlanError",
+    "WalletPreparation",
     "execute_allocation",
     "pending_receipt_messages",
 ]

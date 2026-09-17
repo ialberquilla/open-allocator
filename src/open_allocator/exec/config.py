@@ -88,6 +88,13 @@ class AllocatorConfig(BaseSettings):
 
     onetx_api_url: str = Field(..., validation_alias="ONE_TX_API_URL")
     onetx_api_key: SecretStr = Field(..., validation_alias="ONE_TX_API_KEY", repr=False)
+    # Temporary rollout flag for the 1Tx calldata bundle API. `legacy` keeps the
+    # /transactions/buy and /sell builders; `calldata` plans from
+    # GET /instruments/:id/calldata. Removed once the migration ships.
+    transaction_api: Literal["legacy", "calldata"] = Field(
+        "legacy",
+        validation_alias="ONE_TX_TRANSACTION_API",
+    )
     slippage_bps: int = Field(50, validation_alias="ONE_TX_SLIPPAGE_BPS")
     fast_transfer: bool = Field(False, validation_alias="ONE_TX_FAST_TRANSFER")
     # Lifetime a calldata bundle's swap quote must still have, both when it is

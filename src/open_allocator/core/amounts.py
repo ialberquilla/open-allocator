@@ -38,6 +38,18 @@ def to_raw_units(amount: object, decimals: int, *, name: str = "amount") -> int:
     return int(value.scaleb(decimals).to_integral_value(rounding=ROUND_DOWN))
 
 
+def from_raw_units(raw: object, decimals: int, *, name: str = "amount") -> str:
+    """Raw token units as an exact human-readable amount: ``100250000`` at 6
+    decimals is ``100.25``. No exponent notation and no trailing zeros."""
+    if isinstance(decimals, bool) or not isinstance(decimals, int) or decimals < 0:
+        raise ValueError(f"{name} decimals must be a non-negative integer")
+    value = Decimal(parse_raw_units(raw, name=name)).scaleb(-decimals)
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
 def parse_raw_units(value: object, *, name: str) -> int:
     text = str(value)
     if not text.isascii() or not text.isdigit():
@@ -94,6 +106,7 @@ def underlying_withdraw_amount(
 
 __all__ = [
     "WITHDRAW_ALL",
+    "from_raw_units",
     "parse_raw_units",
     "proportional_raw_units",
     "to_raw_units",

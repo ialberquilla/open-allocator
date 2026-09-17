@@ -19,6 +19,7 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
+from open_allocator.exec import calldata
 from open_allocator.exec.execute import (
     ExecutionBroadcastError,
     ExecutionReport,
@@ -94,6 +95,13 @@ def execute_rebalance(
     idempotency_store: object | None = None,
     min_trade_usd: float = 1.0,
 ) -> RebalanceExecutionReport:
+    if calldata.uses_calldata_api(config):
+        # Sell proceeds funding buys needs the calldata funding ledger and
+        # sell-before-buy bundling; until then, refuse rather than fall back.
+        raise calldata.CalldataUnsupportedError(
+            "rebalance is not supported with ONE_TX_TRANSACTION_API=calldata yet; "
+            "use ONE_TX_TRANSACTION_API=legacy"
+        )
     known = tuple(known_instruments or ())
     rebalance_plan = rebalance_core.plan_rebalance(
         positions,

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from open_allocator.core.schema import validate
 from open_allocator.core.types import (
     Allocation,
     AllocationLeg,
@@ -18,6 +20,14 @@ from open_allocator.core.types import (
     TxPlan,
     TxStep,
     Vault,
+)
+from open_allocator.exec.calldata import (
+    CalldataAmountError,
+    CalldataUnsupportedError,
+)
+from open_allocator.exec.client import (
+    InstrumentCalldataQuery,
+    InstrumentCalldataResponse,
 )
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
@@ -31,6 +41,7 @@ from open_allocator.exec.execute import (
     GasCheck,
     GasPreflightError,
     PolicyCheckFailed,
+    TransactionPlanError,
     execute_allocation,
     submission_groups,
 )
@@ -818,3 +829,247 @@ def test_a_mined_receipt_still_reports_success() -> None:
 
     assert report.status == "success"
     assert report.in_progress is False
+
+
+# --- calldata API (ONE_TX_TRANSACTION_API=calldata) --------------------------
+
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+CALLDATA_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def calldata_vault(instrument_id: str, chain_id: int = 8453) -> Vault:
+    return vault(instrument_id, chain_id).model_copy(
+        update={"token_address": BASE_USDC, "token_decimals": 6}
+    )
+
+
+@dataclass
+class MockCalldataClient:
+    requests: list[tuple[str, InstrumentCalldataQuery]] = field(default_factory=list)
+
+    def instrument_calldata(
+        self,
+        instrument_id: str,
+        query: InstrumentCalldataQuery,
+    ) -> InstrumentCalldataResponse:
+        self.requests.append((instrument_id, query))
+        payload = json.loads(
+            (CALLDATA_FIXTURES / "calldata-instrument-deposit-swap.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        payload.update(
+            instrumentId=instrument_id,
+            account=query.account,
+            amountIn=query.amount,
+            expiresAt=None,
+        )
+        return InstrumentCalldataResponse.model_validate(payload)
+
+    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
+        raise AssertionError("the calldata path must not call the legacy builder")
+
+    def balances(self, address: str) -> dict[str, Any]:
+        raise AssertionError("calldata planning must not route by balances yet")
+
+
+@dataclass(frozen=True)
+class CalldataConfig(Config):
+    transaction_api: str = "calldata"
+    slippage_bps: int = 30
+    referral_fee_bps: int = 0
+    referral_wallet: str | None = None
+    source_chain_id: int | None = None
+
+
+def test_calldata_deposit_plan_keeps_each_bundle_ordered_and_bound() -> None:
+    client = MockCalldataClient()
+    legs = Allocation(
+        legs=(
+            AllocationLeg(instrument_id="vault-a", weight=0.5, usd=100.25),
+            AllocationLeg(instrument_id="vault-b", weight=0.5, usd=0.000001),
+        ),
+        total_usd=100.250001,
+        metadata={},
+    )
+
+    plan = execute_allocation(
+        client,
+        MockSigner(),
+        legs,
+        permissive_policy(),
+        known_instruments=[calldata_vault("vault-a"), calldata_vault("vault-b")],
+        config=CalldataConfig(),
+    )
+
+    assert isinstance(plan, TxPlan)
+    assert [
+        (instrument, query.model_dump(by_alias=True, exclude_none=True))
+        for instrument, query in client.requests
+    ] == [
+        (
+            "vault-a",
+            {
+                "action": "deposit",
+                "account": MockSigner().address(),
+                "amount": "100250000",
+                "slippageBps": 30,
+            },
+        ),
+        (
+            "vault-b",
+            {
+                "action": "deposit",
+                "account": MockSigner().address(),
+                "amount": "1",
+                "slippageBps": 30,
+            },
+        ),
+    ]
+    kinds = ["approve", "swap", "approve", "approve", "deposit"]
+    assert [step.kind for step in plan.steps] == kinds * 2
+    assert [bundle.step_indexes for bundle in plan.bundles] == [
+        (0, 1, 2, 3, 4),
+        (5, 6, 7, 8, 9),
+    ]
+    assert [bundle.bundle_id for bundle in plan.bundles] == [
+        "leg:0:vault-a:deposit",
+        "leg:1:vault-b:deposit",
+    ]
+    assert [bundle.amount for bundle in plan.bundles] == ["100250000", "1"]
+    assert plan.bundles[0].digest != plan.bundles[1].digest
+    payload = plan.model_dump(mode="json")
+    assert validate(payload, "tx-plan") == payload
+
+
+def test_calldata_deposit_skips_a_completed_leg() -> None:
+    client = MockCalldataClient()
+
+    plan = execute_allocation(
+        client,
+        MockSigner(),
+        allocation("vault-a", "vault-b"),
+        permissive_policy(),
+        known_instruments=[calldata_vault("vault-a"), calldata_vault("vault-b")],
+        config=CalldataConfig(),
+        idempotency_store={"leg:0:vault-a"},
+    )
+
+    assert [instrument for instrument, _ in client.requests] == ["vault-b"]
+    assert isinstance(plan, TxPlan)
+    assert [bundle.leg_index for bundle in plan.bundles] == [1]
+    assert plan.bundles[0].step_indexes == (0, 1, 2, 3, 4)
+
+
+def test_calldata_execution_is_refused_before_anything_is_built_or_sent() -> None:
+    client = MockCalldataClient()
+    signer = MockSigner()
+
+    with pytest.raises(TransactionPlanError, match="cannot execute them yet"):
+        execute_allocation(
+            client,
+            signer,
+            allocation("vault-a"),
+            permissive_policy(),
+            confirm=True,
+            known_instruments=[calldata_vault("vault-a")],
+            config=CalldataConfig(),
+        )
+
+    assert client.requests == []
+    assert signer.sent == []
+
+
+def test_calldata_deposit_rejects_referral_configuration() -> None:
+    client = MockCalldataClient()
+
+    with pytest.raises(CalldataUnsupportedError, match="referral"):
+        execute_allocation(
+            client,
+            MockSigner(),
+            allocation("vault-a"),
+            permissive_policy(),
+            known_instruments=[calldata_vault("vault-a")],
+            config=CalldataConfig(
+                referral_fee_bps=25,
+                referral_wallet="0x" + "99" * 20,
+            ),
+        )
+
+    assert client.requests == []
+
+
+@pytest.mark.parametrize(
+    ("config", "metadata"),
+    [
+        (CalldataConfig(source_chain_id=42161), {}),
+        (CalldataConfig(), {"source_chain_id": 42161}),
+    ],
+)
+def test_calldata_deposit_rejects_a_cross_chain_leg(
+    config: CalldataConfig,
+    metadata: dict[str, Any],
+) -> None:
+    client = MockCalldataClient()
+    legs = allocation("vault-a").model_copy(update={"metadata": metadata})
+
+    with pytest.raises(CalldataUnsupportedError, match="cross-chain"):
+        execute_allocation(
+            client,
+            MockSigner(),
+            legs,
+            permissive_policy(),
+            known_instruments=[calldata_vault("vault-a")],
+            config=config,
+        )
+
+    assert client.requests == []
+
+
+def test_calldata_deposit_allows_a_source_pinned_to_the_vault_chain() -> None:
+    plan = execute_allocation(
+        MockCalldataClient(),
+        MockSigner(),
+        allocation("vault-a"),
+        permissive_policy(),
+        known_instruments=[calldata_vault("vault-a")],
+        config=CalldataConfig(source_chain_id=8453),
+    )
+
+    assert isinstance(plan, TxPlan)
+    assert len(plan.bundles) == 1
+
+
+def test_calldata_deposit_fails_closed_for_an_undiscovered_instrument() -> None:
+    with pytest.raises(TransactionPlanError, match="not in the discovered universe"):
+        execute_allocation(
+            MockCalldataClient(),
+            MockSigner(),
+            allocation("vault-a"),
+            policy_without_new_instrument_gate(),
+            known_instruments=[],
+            config=CalldataConfig(),
+        )
+
+
+def test_calldata_deposit_fails_closed_without_discovered_usdc_decimals() -> None:
+    with pytest.raises(CalldataAmountError, match="reports decimals"):
+        execute_allocation(
+            MockCalldataClient(),
+            MockSigner(),
+            allocation("vault-a"),
+            permissive_policy(),
+            known_instruments=[vault("vault-a")],
+            config=CalldataConfig(),
+        )
+
+
+def policy_without_new_instrument_gate() -> Policy:
+    base = permissive_policy()
+    return base.model_copy(
+        update={
+            "gates": base.gates.model_copy(
+                update={"new_instrument_needs_approval": False}
+            )
+        }
+    )

@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 
 from open_allocator.core.amounts import (
+    from_raw_units,
     proportional_raw_units,
     to_raw_units,
     underlying_withdraw_amount,
@@ -140,3 +141,31 @@ def test_underlying_withdraw_amount_rejects_malformed_raw_balance() -> None:
             requested_usd=Decimal("1"),
             current_usd=Decimal("100"),
         )
+
+
+@pytest.mark.parametrize(
+    ("raw", "decimals", "human"),
+    [
+        ("100250000", 6, "100.25"),
+        ("50001234", 6, "50.001234"),
+        ("100000000", 6, "100"),
+        ("0", 6, "0"),
+        ("1", 18, "0.000000000000000001"),
+        ("123456789123456789123456789", 18, "123456789.123456789123456789"),
+        ("500", 0, "500"),
+        (7, 2, "0.07"),
+    ],
+)
+def test_from_raw_units_is_exact_without_exponent_notation(
+    raw: object,
+    decimals: int,
+    human: str,
+) -> None:
+    assert from_raw_units(raw, decimals) == human
+    assert to_raw_units(human, decimals) == int(raw)  # type: ignore[call-overload]
+
+
+@pytest.mark.parametrize("raw", ["-1", "1.5", "", "0x10"])
+def test_from_raw_units_rejects_non_integer_strings(raw: str) -> None:
+    with pytest.raises(ValueError):
+        from_raw_units(raw, 6)

@@ -9,17 +9,32 @@ bundle that fails any check must never reach a signer.
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from open_allocator.core import amounts
-from open_allocator.core.types import FrozenModel, Vault
+from open_allocator.core.types import (
+    BundleLeftover,
+    BundleRequirement,
+    BundleToken,
+    FrozenModel,
+    TxBundle,
+    TxStep,
+    Vault,
+    bundle_digest,
+)
 from open_allocator.exec import chains
 from open_allocator.exec.client import (
     BridgeCalldataResponse,
     CalldataAction,
+    CalldataTokenInfo,
+    InstrumentCalldataQuery,
     InstrumentCalldataResponse,
     OneTxDecodeError,
 )
+
+INSTRUMENT_CALLDATA_ENDPOINT = "GET /instruments/:instrumentId/calldata"
+# Mirrors AllocatorConfig's default for callers that pass a partial config.
+DEFAULT_MIN_CALLDATA_TTL_SECONDS = 20
 
 
 class CalldataValidationError(OneTxDecodeError):
@@ -32,6 +47,14 @@ class CalldataExpiredError(CalldataValidationError):
 
 class CalldataAmountError(ValueError):
     """A calldata request amount could not be derived exactly; do not guess."""
+
+
+class CalldataUnsupportedError(ValueError):
+    """A configured or requested feature the calldata API path cannot honor.
+
+    Raised instead of ignoring the setting, so a migration never silently drops
+    referral fees or turns a cross-chain leg into a same-chain one.
+    """
 
 
 class DepositToken(FrozenModel):
@@ -136,6 +159,167 @@ def ensure_calldata_lifetime(
         )
 
 
+def ensure_deposit_token(
+    response: InstrumentCalldataResponse,
+    token: DepositToken,
+) -> None:
+    """Require the bundle to spend the token its raw amount was computed in.
+
+    A ``tokenIn`` with other decimals would make the raw amount a different sum
+    of money than the one selected.
+    """
+    _require_equal(
+        "tokenIn.address", response.token_in.address, token.address, fold=True
+    )
+    _require_equal("tokenIn.decimals", response.token_in.decimals, token.decimals)
+
+
+def bundle_steps(response: InstrumentCalldataResponse) -> tuple[TxStep, ...]:
+    """The bundle's calls as plan steps, in exactly the order returned.
+
+    Each call keeps its backend type. Approvals, swaps, fees, and the protocol
+    call are one atomic sequence; nothing here may reorder, drop, or relabel one.
+    """
+    return tuple(
+        TxStep(
+            to=call.to,
+            data=call.data,
+            value=int(call.value),
+            chain_id=call.chain_id,
+            kind=call.type,
+        )
+        for call in response.calls
+    )
+
+
+def plan_bundle(
+    response: InstrumentCalldataResponse,
+    *,
+    leg_index: int,
+    first_step_index: int,
+) -> tuple[tuple[TxStep, ...], TxBundle]:
+    """Plan steps for a validated bundle, plus the metadata that binds them.
+
+    ``first_step_index`` is where the steps will sit in the plan. Callers must
+    have run :func:`validate_instrument_calldata` on ``response`` first.
+    """
+    steps = bundle_steps(response)
+    digest = bundle_digest(
+        instrument_id=response.instrument_id,
+        action=response.action,
+        account=response.account,
+        chain_id=response.chain_id,
+        amount=response.amount_in,
+        steps=steps,
+        quote_block=response.quote_block,
+        expires_at=response.expires_at,
+    )
+    bundle = TxBundle(
+        bundle_id=bundle_id(leg_index, response.instrument_id, response.action),
+        digest=digest,
+        leg_index=leg_index,
+        instrument_id=response.instrument_id,
+        action=response.action,
+        account=response.account,
+        chain_id=response.chain_id,
+        step_indexes=tuple(range(first_step_index, first_step_index + len(steps))),
+        endpoint=INSTRUMENT_CALLDATA_ENDPOINT,
+        amount=response.amount_in,
+        token_in=_bundle_token(response.token_in),
+        token_out=_bundle_token(response.token_out),
+        quote_block=response.quote_block,
+        expires_at=response.expires_at,
+        requires=tuple(
+            BundleRequirement(token=item.token, amount=item.amount)
+            for item in response.requires
+        ),
+        leftovers=tuple(
+            BundleLeftover(token=item.token, max_amount=item.max_amount)
+            for item in response.leftovers
+        ),
+        expected_out=response.expected_out,
+        min_out=response.min_out,
+        protocol_gas=response.simulation.gas_used,
+        simulation_scope=response.simulation.scope,
+        simulation_engine=response.simulation.engine,
+    )
+    return steps, bundle
+
+
+def request_bundle(
+    client: object,
+    *,
+    instrument_id: str,
+    action: CalldataAction,
+    account: str,
+    chain_id: int,
+    amount: str,
+    leg_index: int,
+    first_step_index: int,
+    config: object | None = None,
+    token: DepositToken | None = None,
+    now: float | None = None,
+) -> tuple[tuple[TxStep, ...], TxBundle]:
+    """Fetch, validate, and plan one instrument bundle; nothing unvalidated escapes.
+
+    ``token`` is the deposit token the raw ``amount`` was computed in, and is
+    checked against the response's ``tokenIn``.
+    """
+    fetch = getattr(client, "instrument_calldata", None)
+    if not callable(fetch):
+        raise TypeError("client does not implement instrument_calldata")
+    query = InstrumentCalldataQuery(
+        action=action,
+        account=account,
+        amount=amount,
+        slippage_bps=_int_config(config, "slippage_bps"),
+    )
+    response = fetch(instrument_id, query)
+    validate_instrument_calldata(
+        response,
+        instrument_id=instrument_id,
+        account=account,
+        action=action,
+        chain_id=chain_id,
+        amount=amount,
+        min_ttl_seconds=min_ttl_seconds(config),
+        now=now,
+    )
+    if token is not None:
+        ensure_deposit_token(response, token)
+    return plan_bundle(
+        response,
+        leg_index=leg_index,
+        first_step_index=first_step_index,
+    )
+
+
+def min_ttl_seconds(config: object | None) -> int:
+    configured = _int_config(config, "min_calldata_ttl_seconds")
+    return DEFAULT_MIN_CALLDATA_TTL_SECONDS if configured is None else configured
+
+
+def bundle_id(leg_index: int, instrument_id: str, action: CalldataAction) -> str:
+    """The logical leg a bundle serves; stable when its calldata is rebuilt."""
+    return f"leg:{leg_index}:{instrument_id}:{action}"
+
+
+def ensure_calldata_supported(config: object | None) -> None:
+    """Reject settings the calldata API has no equivalent for."""
+    fee_bps = _config_value(config, "referral_fee_bps")
+    wallet = _config_value(config, "referral_wallet")
+    if (fee_bps is not None and int(fee_bps) > 0) or wallet is not None:
+        raise CalldataUnsupportedError(
+            "referral fees are not supported by the 1Tx calldata API; unset "
+            "ONE_TX_REFERRAL_FEE_BPS and ONE_TX_REFERRAL_WALLET or use "
+            "ONE_TX_TRANSACTION_API=legacy"
+        )
+
+
+def uses_calldata_api(config: object | None) -> bool:
+    return _config_value(config, "transaction_api") == "calldata"
+
+
 def validate_bridge_calldata(
     response: BridgeCalldataResponse,
     *,
@@ -151,6 +335,27 @@ def validate_bridge_calldata(
     _require_equal("amount", response.amount, amount)
     _require_equal("fast", response.fast, fast)
     return response
+
+
+def _bundle_token(token: CalldataTokenInfo) -> BundleToken:
+    return BundleToken(
+        address=token.address,
+        symbol=token.symbol,
+        decimals=token.decimals,
+    )
+
+
+def _config_value(config: object | None, attr: str) -> object | None:
+    if config is None:
+        return None
+    if isinstance(config, Mapping):
+        return config.get(attr)
+    return getattr(config, attr, None)
+
+
+def _int_config(config: object | None, attr: str) -> int | None:
+    value = _config_value(config, attr)
+    return None if value is None else int(value)  # type: ignore[call-overload]
 
 
 def _require_equal(

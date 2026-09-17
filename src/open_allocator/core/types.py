@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+from collections.abc import Sequence
 from datetime import date
 from enum import StrEnum
 from typing import Literal, TypeAlias
@@ -162,17 +165,185 @@ class Allocation(FrozenModel):
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+# The backend's calldata call types are kept as returned, never collapsed:
+# `approve`, `swap`, `deposit`, `withdraw`, `bridge_burn`, `fee`, plus the
+# client-composed `cctp_receive`. `buy`/`sell` exist only for plans built through
+# the legacy /transactions endpoints while ONE_TX_TRANSACTION_API allows them.
+TxStepKind: TypeAlias = Literal[
+    "approve",
+    "swap",
+    "deposit",
+    "withdraw",
+    "bridge_burn",
+    "cctp_receive",
+    "fee",
+    "buy",
+    "sell",
+]
+LEGACY_STEP_KINDS: frozenset[str] = frozenset({"buy", "sell"})
+
+
 class TxStep(FrozenModel):
     to: str
     data: str
     value: int = Field(ge=0)
     chain_id: int
-    kind: Literal["approve", "buy", "sell"]
+    kind: TxStepKind
+
+
+class BundleToken(FrozenModel):
+    address: str
+    symbol: str | None = None
+    decimals: int = Field(ge=0)
+
+
+class BundleRequirement(FrozenModel):
+    """A raw token balance the bundle's simulation assumed the account holds."""
+
+    token: str
+    amount: str = Field(pattern=r"^\d+$")
+
+
+class BundleLeftover(FrozenModel):
+    """The most of a token the bundle may leave behind in the account."""
+
+    token: str
+    max_amount: str = Field(pattern=r"^\d+$")
+
+
+class TxBundle(FrozenModel):
+    """One atomic calldata bundle as it was quoted, bound to its plan steps.
+
+    The steps it names are the bundle's calls, in order, and must be submitted
+    together. ``protocol_gas`` is Darex's wallet-neutral simulation of those bare
+    calls; it is not the Safe/UserOperation gas, which is estimated separately
+    and never reported as the same measurement.
+    """
+
+    # Stable across rebuilds of the same logical leg; ``digest`` changes with
+    # the calls, so completion recorded for one digest never carries over.
+    bundle_id: str = Field(min_length=1)
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    leg_index: int = Field(ge=0)
+    instrument_id: str = Field(min_length=1)
+    action: Literal["deposit", "withdraw"]
+    account: str
+    chain_id: int = Field(ge=1)
+    step_indexes: tuple[int, ...] = Field(min_length=1)
+    source: Literal["1tx-calldata"] = "1tx-calldata"
+    endpoint: str = Field(min_length=1)
+    # Raw units of ``token_in``, or ``max`` for a full withdrawal.
+    amount: str = Field(pattern=r"^(?:max|[1-9]\d*)$")
+    token_in: BundleToken
+    token_out: BundleToken
+    quote_block: int = Field(ge=0)
+    # Unix seconds; None when the bundle embeds no expiring quote.
+    expires_at: int | None = Field(default=None, ge=0)
+    requires: tuple[BundleRequirement, ...] = ()
+    leftovers: tuple[BundleLeftover, ...] = ()
+    # Raw units of ``token_out``.
+    expected_out: str | None = Field(default=None, pattern=r"^\d+$")
+    min_out: str | None = Field(default=None, pattern=r"^\d+$")
+    protocol_gas: str = Field(pattern=r"^\d+$")
+    simulation_scope: Literal["protocol_bundle"] = "protocol_bundle"
+    simulation_engine: Literal["wallet_neutral_atomic"] = "wallet_neutral_atomic"
+
+
+def bundle_digest(
+    *,
+    instrument_id: str,
+    action: str,
+    account: str,
+    chain_id: int,
+    amount: str,
+    steps: Sequence[TxStep],
+    quote_block: int,
+    expires_at: int | None,
+) -> str:
+    """SHA-256 over what a bundle commits the account to, in call order.
+
+    Covers the instrument, action, account, chain, amount, every call's target,
+    data, value, and type, and the quote block and expiry. Addresses and hex are
+    case-folded so a re-encoded but identical bundle keeps its digest.
+    """
+    payload = {
+        "instrument_id": instrument_id.casefold(),
+        "action": action,
+        "account": account.casefold(),
+        "chain_id": chain_id,
+        "amount": amount,
+        "calls": [
+            {
+                "to": step.to.casefold(),
+                "data": step.data.casefold(),
+                "value": str(step.value),
+                "type": step.kind,
+            }
+            for step in steps
+        ],
+        "quote_block": quote_block,
+        "expires_at": expires_at,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class TxPlan(FrozenModel):
     steps: tuple[TxStep, ...]
     summary: str
+    # Empty for legacy plans, so stored ones stay readable.
+    bundles: tuple[TxBundle, ...] = ()
+
+    @model_validator(mode="after")
+    def _bundles_bind_their_steps(self) -> "TxPlan":
+        claimed: set[int] = set()
+        for bundle in self.bundles:
+            indexes = bundle.step_indexes
+            first = indexes[0]
+            # Contiguous and ascending: a bundle is one ordered atomic batch, so
+            # nothing may be interleaved with or reordered inside it.
+            if indexes != tuple(range(first, first + len(indexes))):
+                raise ValueError(
+                    f"bundle {bundle.bundle_id} step indexes must be contiguous "
+                    f"and ascending, got {list(indexes)}"
+                )
+            if first < 0 or indexes[-1] >= len(self.steps):
+                raise ValueError(
+                    f"bundle {bundle.bundle_id} references steps outside the plan"
+                )
+            if claimed.intersection(indexes):
+                raise ValueError(
+                    f"bundle {bundle.bundle_id} shares steps with another bundle"
+                )
+            claimed.update(indexes)
+
+            steps = [self.steps[index] for index in indexes]
+            for index, step in zip(indexes, steps, strict=True):
+                if step.chain_id != bundle.chain_id:
+                    raise ValueError(
+                        f"step {index} is on chain {step.chain_id}, bundle "
+                        f"{bundle.bundle_id} is on chain {bundle.chain_id}"
+                    )
+                if step.kind in LEGACY_STEP_KINDS:
+                    raise ValueError(
+                        f"step {index} of bundle {bundle.bundle_id} has legacy "
+                        f"kind {step.kind!r}"
+                    )
+            digest = bundle_digest(
+                instrument_id=bundle.instrument_id,
+                action=bundle.action,
+                account=bundle.account,
+                chain_id=bundle.chain_id,
+                amount=bundle.amount,
+                steps=steps,
+                quote_block=bundle.quote_block,
+                expires_at=bundle.expires_at,
+            )
+            if digest != bundle.digest:
+                raise ValueError(
+                    f"bundle {bundle.bundle_id} digest does not match its steps"
+                )
+        return self
 
 
 class PolicyWallet(FrozenModel):

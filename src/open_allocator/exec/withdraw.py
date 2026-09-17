@@ -5,13 +5,17 @@ from typing import Literal
 
 from pydantic import Field
 
+from open_allocator.core import amounts
 from open_allocator.core import withdraw as withdraw_core
-from open_allocator.core.types import FrozenModel, Policy, TxPlan, TxStep
+from open_allocator.core.types import FrozenModel, Policy, TxBundle, TxPlan, TxStep
+from open_allocator.exec import calldata, chains
 from open_allocator.exec.execute import (
+    CALLDATA_EXECUTION_UNAVAILABLE,
     ExecutionBroadcastError,
     ExecutionReport,
     ExecutionStepReport,
     GasCheck,
+    TransactionPlanError,
     _append_allocation_log,
     _completed_keys,
     _copy_config_value,
@@ -81,6 +85,24 @@ def withdraw(
 ) -> WithdrawExecutionReport:
     withdraw_plan = withdraw_core.plan_withdraw(position, policy, amount=amount)
     address = signer.address()
+    if calldata.uses_calldata_api(config):
+        if confirm:
+            raise TransactionPlanError(CALLDATA_EXECUTION_UNAVAILABLE)
+        tx_plan, sell = _calldata_tx_plan(
+            client,
+            address,
+            withdraw_plan,
+            config,
+            idempotency_store,
+        )
+        return WithdrawExecutionReport(
+            status="planned",
+            withdraw_plan=withdraw_plan,
+            sell=sell,
+            plan=tx_plan,
+            messages=("dry-run only; no transactions broadcast",),
+        )
+
     tx_plan, step_refs, sell, messages = _build_tx_plan(
         client,
         address,
@@ -245,6 +267,59 @@ def _build_tx_plan(
         _sell_details(address, withdraw_plan, response),
         messages,
     )
+
+
+def _calldata_tx_plan(
+    client: object,
+    address: str,
+    withdraw_plan: withdraw_core.WithdrawPlan,
+    config: object | None,
+    idempotency_store: object | None,
+) -> tuple[TxPlan, WithdrawSellDetails]:
+    """A withdrawal planned from one calldata bundle on the position's chain."""
+    sell = _sell_details(address, withdraw_plan, None)
+    if _store_completed(idempotency_store, _withdraw_key(withdraw_plan)):
+        tx_plan = TxPlan(
+            steps=(),
+            summary=f"Withdraw already completed for {withdraw_plan.instrument_id}",
+        )
+        return tx_plan, sell
+
+    calldata.ensure_calldata_supported(config)
+    steps, bundle = calldata.request_bundle(
+        client,
+        instrument_id=withdraw_plan.instrument_id,
+        action="withdraw",
+        account=address,
+        chain_id=withdraw_plan.chain_id,
+        amount=withdraw_core.calldata_withdraw_amount(withdraw_plan),
+        leg_index=0,
+        first_step_index=0,
+        config=config,
+    )
+    tx_plan = TxPlan(
+        steps=steps,
+        summary=(
+            f"Build calldata withdraw bundle for {withdraw_plan.instrument_id} "
+            f"across {len(steps)} transaction steps"
+        ),
+        bundles=(bundle,),
+    )
+    return tx_plan, sell.model_copy(
+        update={"expected_usdc": _expected_usdc(bundle, config)}
+    )
+
+
+def _expected_usdc(bundle: TxBundle, config: object | None) -> str | None:
+    """The bundle's expected output in USDC, when that is what it pays out in."""
+    usdc = chains.usdc_address(bundle.chain_id, config)
+    if (
+        bundle.expected_out is None
+        or usdc is None
+        or bundle.token_out.address.casefold() != usdc.casefold()
+    ):
+        return None
+    return amounts.from_raw_units(bundle.expected_out, bundle.token_out.decimals)
 
 
 def _build_sell(client: object, body: Mapping[str, object]) -> object:
