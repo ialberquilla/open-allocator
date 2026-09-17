@@ -27,7 +27,7 @@ from open_allocator.exec.client import (
     InstrumentCalldataQuery,
     InstrumentCalldataResponse,
 )
-from open_allocator.exec.execute import GasCheck, TransactionPlanError
+from open_allocator.exec.execute import GasCheck
 from open_allocator.exec.signer import Receipt
 from open_allocator.exec.withdraw import withdraw
 
@@ -738,22 +738,68 @@ def test_calldata_withdraw_rejects_a_bundle_for_another_account() -> None:
         )
 
 
-def test_calldata_withdraw_execution_is_refused_before_anything_is_sent() -> None:
-    client = MockCalldataWithdrawClient()
-    signer = MockSigner()
+@dataclass
+class BatchingWithdrawSigner(MockSigner):
+    batches: list[tuple[TxStep, ...]] = field(default_factory=list)
 
-    with pytest.raises(TransactionPlanError, match="cannot execute them yet"):
-        withdraw(
-            client,
-            signer,
-            holding(),
-            permissive_policy(),
-            confirm=True,
-            config=CalldataConfig(),
+    def send_batch(self, steps: tuple[TxStep, ...], rpc_url: str) -> Receipt:
+        self.batches.append(tuple(steps))
+        return Receipt(
+            transaction_hash=f"0x{len(self.batches):064x}",
+            block_number=len(self.batches),
+            gas_used=21_000,
+            status=1,
+            from_address=ADDRESS,
+            to_address=steps[-1].to,
         )
 
-    assert client.requests == []
+
+def test_calldata_withdraw_executes_the_bundle_as_one_operation(
+    tmp_path: Path,
+) -> None:
+    client = MockCalldataWithdrawClient(overrides={"calls": swapped_withdraw_calls()})
+    signer = BatchingWithdrawSigner()
+    store: dict[str, object] = {}
+    log_path = tmp_path / "allocation-log.jsonl"
+
+    report = withdraw(
+        client,
+        signer,
+        holding(),
+        permissive_policy(),
+        confirm=True,
+        config=CalldataConfig(_allocation_log_path=log_path),
+        idempotency_store=store,
+    )
+
+    assert report.status == "success"
+    [batch] = signer.batches
+    assert [step.kind for step in batch] == ["withdraw", "approve", "swap"]
     assert signer.sent == []
+    assert report.sell.status == "sent"
+    assert report.sell.expected_usdc == "50.001234"
+    assert [step.status for step in report.steps] == ["sent"] * 3
+    assert "withdraw:0:base-aave-usdc:74.999123" in store
+    # Logged once for the bundle, with the share amount it retires.
+    [entry] = read_allocation_log(log_path=log_path)
+    assert (entry.action_type, entry.shares) == ("withdraw", "74.999123")
+
+
+def test_calldata_withdraw_rerun_submits_nothing_twice() -> None:
+    client = MockCalldataWithdrawClient()
+    signer = BatchingWithdrawSigner()
+    store: dict[str, object] = {}
+    arguments = (client, signer, holding(), permissive_policy())
+
+    withdraw(*arguments, confirm=True, config=CalldataConfig(), idempotency_store=store)
+    rerun = withdraw(
+        *arguments, confirm=True, config=CalldataConfig(), idempotency_store=store
+    )
+
+    assert len(client.requests) == 1
+    assert len(signer.batches) == 1
+    assert rerun.status == "success"
+    assert rerun.plan.steps == ()
 
 
 def test_calldata_withdraw_rejects_referral_configuration() -> None:

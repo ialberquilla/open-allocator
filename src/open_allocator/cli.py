@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, ParamSpec, TypeVar
 
 import typer
 
@@ -43,6 +43,9 @@ from open_allocator.exec import chains, safe_deployment
 from open_allocator.exec import gas as gas_module
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
+
+if TYPE_CHECKING:
+    from open_allocator.exec.bundle_execution import PlanPreparation
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonObject = dict[str, Any]
@@ -277,6 +280,7 @@ def _execution_report(
     status: str,
     policy_result: object,
     plan: TxPlan,
+    preparations: tuple[object, ...] = (),
     messages: tuple[str, ...] = (),
 ) -> object:
     from open_allocator.exec.execute import ExecutionReport
@@ -285,6 +289,7 @@ def _execution_report(
         status=status,
         policy_result=policy_result,
         plan=plan,
+        preparations=preparations,
         messages=messages,
     )
 
@@ -384,7 +389,7 @@ def _withdraw_scope(
 def _build_execution_plan(
     allocation_path: Path,
     policy_path: Path,
-) -> tuple[Allocation, Policy, TxPlan, list[Vault]]:
+) -> tuple[Allocation, Policy, TxPlan, list[Vault], PlanPreparation | None]:
     allocation = _read_allocation(allocation_path)
     policy = load_policy(policy_path)
     config = AllocatorConfig()
@@ -404,7 +409,18 @@ def _build_execution_plan(
 
     if not isinstance(plan, TxPlan):
         raise TypeError("execute_allocation(confirm=False) did not return a TxPlan")
-    return allocation, policy, plan, known_instruments
+    from open_allocator.exec.calldata import uses_calldata_api
+
+    preparation = (
+        prepare_plan(signer, plan, config) if uses_calldata_api(config) else None
+    )
+    return allocation, policy, plan, known_instruments, preparation
+
+
+def prepare_plan(signer: object, plan: TxPlan, config: object) -> PlanPreparation:
+    from open_allocator.exec.bundle_execution import prepare_plan as prepare
+
+    return prepare(signer, plan, config)
 
 
 def _execute_allocation_from_cli(
@@ -414,16 +430,20 @@ def _execute_allocation_from_cli(
     confirm: bool,
 ) -> JsonObject:
     if not confirm:
-        allocation, policy, plan, known_instruments = _build_execution_plan(
-            allocation_path,
-            policy_path,
+        allocation, policy, plan, known_instruments, preparation = (
+            _build_execution_plan(allocation_path, policy_path)
         )
         policy_result = policy_core.check(allocation, policy, known_instruments)
         report = _execution_report(
             status="planned",
             policy_result=policy_result,
             plan=plan,
-            messages=("dry-run only; no transactions broadcast",),
+            preparations=() if preparation is None else preparation.preparations,
+            messages=(
+                "dry-run only; no transactions broadcast",
+                *(() if preparation is None else preparation.messages),
+                *(() if preparation is None else preparation.blockers),
+            ),
         )
         return _model_payload(report)
 
@@ -1525,10 +1545,16 @@ def build_tx(
         typer.Option("--policy", dir_okay=False, readable=True),
     ] = DEFAULT_POLICY_PATH,
 ) -> JsonObject:
-    _allocation, _policy, plan, _known_instruments = _build_execution_plan(
-        allocation_path,
-        policy_path,
+    _allocation, _policy, plan, _known_instruments, preparation = _build_execution_plan(
+        allocation_path, policy_path
     )
+    # The plan is the output, so a calldata plan this signer cannot submit is an
+    # error here rather than a note nobody sees; `execute` without --confirm
+    # reports the same preparation, with its gas estimates, instead.
+    if preparation is not None and preparation.blockers:
+        from open_allocator.exec.execute import TransactionPlanError
+
+        raise TransactionPlanError("; ".join(preparation.blockers))
     payload = plan.model_dump(mode="json")
     validate(payload, "tx-plan")
     return payload

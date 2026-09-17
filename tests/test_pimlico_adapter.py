@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,7 +13,16 @@ from eth_account import Account
 from eth_utils import keccak
 from web3 import Web3
 
-from open_allocator.exec import paymaster_registry, safe_4337_signature, safe_deployment
+from open_allocator.core.policy import PolicyResult
+from open_allocator.core.types import TxPlan
+from open_allocator.exec import (
+    bundle_execution,
+    calldata,
+    paymaster_registry,
+    safe_4337_signature,
+    safe_deployment,
+)
+from open_allocator.exec.client import InstrumentCalldataResponse
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
     PaymasterConfigurationError,
@@ -26,7 +38,7 @@ from open_allocator.exec.pimlico_adapter import (
     pimlico_adapter_from_config,
 )
 from open_allocator.exec.safe_deployment import SafeSeed
-from open_allocator.exec.user_operation import MULTISEND_CALL_ONLY
+from open_allocator.exec.user_operation import MAX_UINT256, MULTISEND_CALL_ONLY
 
 BASE = 8453
 FANTOM = 250  # deliberately not in PAYMASTER_CHAINS
@@ -344,6 +356,218 @@ def test_a_deployed_safe_carries_no_factory_fields() -> None:
         account_address=None,
     ).submit_user_operation(_request())
     assert "factory" not in endpoint.sent_user_op()
+
+
+# --- preparation: built and estimated, never signed or sent ------------------
+
+_SUBMISSION_METHODS = ("pm_getPaymasterData", "eth_sendUserOperation")
+
+
+def test_prepare_estimates_the_operation_without_signing_or_sending() -> None:
+    endpoint = FakeEndpoint()
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+
+    methods = endpoint.methods()
+    assert "eth_estimateUserOperationGas" in methods
+    assert not any(method in methods for method in _SUBMISSION_METHODS)
+    assert prepared.sender == SAFE
+    assert prepared.chain_id == BASE
+    assert prepared.entry_point == paymaster_registry.ENTRY_POINT_V07
+    # Still the stub: nothing was signed.
+    stub = safe_4337_signature.dummy_signature(1)
+    assert prepared.user_operation["signature"] == stub
+    assert prepared.gas.call_gas_limit == 0x186A0
+    assert prepared.gas.verification_gas_limit == 0x30D40
+    assert prepared.gas.pre_verification_gas == 0xC350
+    assert prepared.gas.max_fee_per_gas == 0x3B9ACA00
+    assert prepared.gas.max_priority_fee_per_gas == 0xF4240
+    assert prepared.paymaster.paymaster == PAYMASTER
+    assert prepared.paymaster.token == USDC
+    assert prepared.paymaster.exchange_rate == 0x1BC16D674EC80000
+    assert prepared.paymaster.post_op_gas == 0x1388
+
+
+def test_prepare_does_not_invent_a_gas_token_charge() -> None:
+    """No bound until the rate arithmetic has been checked against a real charge."""
+    prepared = _adapter(FakeEndpoint()).prepare_user_operation(_request())
+    assert prepared.max_gas_token_charge_raw is None
+
+
+def test_prepare_carries_paymaster_gas_limits_when_estimated() -> None:
+    endpoint = FakeEndpoint(
+        eth_estimateUserOperationGas={
+            "callGasLimit": "0x186a0",
+            "verificationGasLimit": "0x30d40",
+            "preVerificationGas": "0xc350",
+            "paymasterVerificationGasLimit": "0x7530",
+            "paymasterPostOpGasLimit": "0x3a98",
+        }
+    )
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+
+    assert prepared.gas.paymaster_verification_gas_limit == 0x7530
+    assert prepared.gas.paymaster_post_op_gas_limit == 0x3A98
+
+
+def test_prepare_fails_closed_on_an_incomplete_estimate() -> None:
+    endpoint = FakeEndpoint(eth_estimateUserOperationGas={"callGasLimit": "0x1"})
+    with pytest.raises(PaymasterError, match="verificationGasLimit"):
+        _adapter(endpoint).prepare_user_operation(_request())
+
+
+def test_prepare_includes_deployment_for_a_counterfactual_safe() -> None:
+    endpoint = FakeEndpoint()
+    prepared = _adapter(
+        endpoint,
+        deployed=False,
+        seed=SafeSeed(owners=(OWNER,), threshold=1),
+        account_address=None,
+    ).prepare_user_operation(_request())
+
+    assert prepared.deployed is False
+    assert prepared.includes_deployment is True
+    assert prepared.factory is not None and prepared.factory_data is not None
+    # The bundler estimated the operation that deploys the Safe, not a bare call.
+    estimated = next(
+        call["params"][0]
+        for call in endpoint.calls
+        if call["method"] == "eth_estimateUserOperationGas"
+    )
+    assert estimated["factory"] == prepared.factory
+    assert estimated["factoryData"] == prepared.factory_data
+    assert not any(method in endpoint.methods() for method in _SUBMISSION_METHODS)
+
+
+def test_prepare_omits_deployment_for_a_deployed_safe() -> None:
+    prepared = _adapter(
+        FakeEndpoint(),
+        deployed=True,
+        seed=SafeSeed(owners=(OWNER,), threshold=1),
+        account_address=None,
+    ).prepare_user_operation(_request())
+
+    assert prepared.includes_deployment is False
+    assert prepared.factory is None and prepared.factory_data is None
+    assert "factory" not in prepared.user_operation
+
+
+def test_prepare_estimates_the_paymaster_approval_with_the_calls() -> None:
+    endpoint = FakeEndpoint()
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+
+    estimated = next(
+        call["params"][0]
+        for call in endpoint.calls
+        if call["method"] == "eth_estimateUserOperationGas"
+    )
+    call_data = estimated["callData"].lower()
+    assert PAYMASTER[2:].lower() in call_data
+    assert VAULT[2:].lower() in call_data
+    assert prepared.paymaster.approval_included is True
+
+
+def test_prepare_reports_a_standing_approval_as_not_included() -> None:
+    prepared = _adapter(FakeEndpoint(), allowance=MAX_UINT256).prepare_user_operation(
+        _request()
+    )
+    assert prepared.paymaster.approval_included is False
+
+
+def test_submit_prepares_afresh_instead_of_reusing_a_dry_run() -> None:
+    """Nonce, fees, and paymaster data from a dry run are stale by submission."""
+    endpoint = FakeEndpoint()
+    w3 = FakeWeb3(nonce=3)
+    adapter = PimlicoUserOperationAdapter(
+        api_key=API_KEY,
+        owner_keys=[OWNER_KEY],
+        account_address=SAFE,
+        rpc_urls={BASE: "https://base.invalid"},
+        http_client=endpoint.client(),
+        web3_factory=lambda _url: w3,
+        poll_interval_s=0,
+        sleep=lambda _seconds: None,
+    )
+    prepared = adapter.prepare_user_operation(_request())
+    w3._nonce = 4
+
+    adapter.submit_user_operation(_request())
+
+    assert int(prepared.user_operation["nonce"], 16) == 3
+    assert int(endpoint.sent_user_op()["nonce"], 16) == 4
+    assert endpoint.methods().count("eth_estimateUserOperationGas") == 2
+
+
+# --- a calldata plan through the real signer and adapter ----------------------
+
+
+def _deposit_plan(account: str) -> TxPlan:
+    payload = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "calldata-instrument-deposit-swap.json"
+        ).read_text(encoding="utf-8")
+    )
+    payload.update(account=account, expiresAt=None)
+    steps, bundle = calldata.plan_bundle(
+        InstrumentCalldataResponse.model_validate(payload),
+        leg_index=0,
+        first_step_index=0,
+    )
+    return TxPlan(steps=steps, summary="deposit", bundles=(bundle,))
+
+
+@pytest.mark.parametrize("deployed", [False, True], ids=["counterfactual", "deployed"])
+def test_a_calldata_plan_is_prepared_without_sending_then_submitted_afresh(
+    deployed: bool,
+) -> None:
+    endpoint = FakeEndpoint()
+    seed = SafeSeed(owners=(OWNER,), threshold=1)
+    adapter = _adapter(endpoint, deployed=deployed, seed=seed, account_address=None)
+    signer = Erc4337PaymasterSigner(adapter=adapter, usdc_address=USDC)
+    tx_plan = _deposit_plan(adapter.address())
+
+    preparation = bundle_execution.prepare_plan(signer, tx_plan)
+
+    assert not any(method in endpoint.methods() for method in _SUBMISSION_METHODS)
+    [prepared] = preparation.preparations
+    assert prepared.bundle_ids == (tx_plan.bundles[0].bundle_id,)
+    assert prepared.includes_deployment is (not deployed)
+    assert prepared.call_gas_limit == 0x186A0
+
+    result = bundle_execution.execute_plan(
+        object(),
+        signer,
+        tx_plan,
+        stage="execute",
+        policy_result=PolicyResult(ok=True, violations=()),
+        completion_key=lambda bundle: f"leg:{bundle.leg_index}",
+        log=lambda _bundle: bundle_execution.BundleLog(action_type="buy"),
+        config=_PlanConfig(),
+    )
+
+    assert result.status == "success"
+    # The dry run, the confirmed run's check before anything is sent, and once
+    # more immediately before signing — never a stale estimate reused.
+    assert endpoint.methods().count("eth_estimateUserOperationGas") == 3
+    assert len(result.preparations) == 1
+    assert endpoint.methods().count("eth_sendUserOperation") == 1
+    sent = endpoint.sent_user_op()
+    assert ("factory" in sent) is (not deployed)
+    # One operation carrying every bundle call, in the order Darex returned them.
+    call_data = sent["callData"].lower()
+    cursor = 0
+    for step in tx_plan.steps:
+        cursor = call_data.index(step.to[2:].lower(), cursor)
+        cursor = call_data.index(step.data[2:].lower(), cursor) + len(step.data) - 2
+
+
+@dataclass(frozen=True)
+class _PlanConfig:
+    signer_mode: str = "erc4337-paymaster"
+    paymaster_provider: str = "pimlico"
+    pimlico_api_key: str = API_KEY
+    _rpc_overrides: dict[int, str] = dataclass_field(
+        default_factory=lambda: {BASE: "https://base.invalid"}
+    )
 
 
 def test_the_sender_is_derived_from_the_seed_not_the_configured_address() -> None:

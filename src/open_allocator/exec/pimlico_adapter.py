@@ -20,9 +20,12 @@ from open_allocator.exec import (
 from open_allocator.exec.paymaster_types import (
     PaymasterConfigurationError,
     PaymasterError,
+    PaymasterTokenQuote,
     PaymasterUnsupportedChain,
     PaymasterUserOperationRequest,
     PaymasterUserOperationSubmission,
+    PreparedUserOperation,
+    UserOperationGas,
 )
 from open_allocator.exec.pimlico import (
     DEFAULT_FEE_TIER,
@@ -154,10 +157,69 @@ class PimlicoUserOperationAdapter:
             "be derived; set RPC_URL_<chain id> for at least one chain"
         )
 
+    def prepare_user_operation(
+        self,
+        request: PaymasterUserOperationRequest,
+    ) -> PreparedUserOperation:
+        """Build and estimate the complete operation; sign and send nothing.
+
+        The estimate covers everything that will ride in the real operation:
+        the Safe's deployment when it is counterfactual, the paymaster approval
+        when none is standing, and every call in order. It is a report, not a
+        reservation — submission prepares again rather than reusing it.
+        """
+        prepared, _pimlico = self._prepare(request)
+        return prepared
+
     def submit_user_operation(
         self,
         request: PaymasterUserOperationRequest,
     ) -> PaymasterUserOperationSubmission:
+        # Prepared afresh here, never taken from a dry run: the nonce, fees,
+        # paymaster quote, and estimate are only good at the moment of signing.
+        prepared, pimlico = self._prepare(request)
+        chain_id = prepared.chain_id
+
+        # Sponsor before signing: paymasterAndData is inside the SafeOp hash, so
+        # signing first would produce a signature for a different operation.
+        sponsored = pimlico.sponsor(
+            prepared.user_operation,
+            token=request.gas_token_address,
+        )
+        signed = safe_4337_signature.sign_user_operation(
+            sponsored,
+            private_keys=self._owner_keys,
+            chain_id=chain_id,
+            module=self._module,
+            entry_point=pimlico.entry_point,
+        )
+
+        user_op_hash = pimlico.send(signed)
+        message = (
+            f"user operation submitted via Pimlico on "
+            f"{chains.chain_name(chain_id)}, gas paid in USDC"
+            + ("" if prepared.deployed else "; deploys the Safe in this operation")
+        )
+
+        # Wait for it: the next operation from this Safe reads the nonce and the
+        # deployment status from the chain, and both are wrong until this one is
+        # mined — the second op re-sends the factory and the EntryPoint rejects
+        # it with AA10. Ops from one sender are sequential whether we like it or
+        # not.
+        included = self._await_inclusion(pimlico, user_op_hash)
+        if included is None:
+            return PaymasterUserOperationSubmission(
+                user_op_hash=user_op_hash,
+                status="submitted",
+                message=f"{message}; still pending after "
+                f"{self._inclusion_timeout_s:.0f}s",
+            )
+        return _submission_from_receipt(user_op_hash, included, message)
+
+    def _prepare(
+        self,
+        request: PaymasterUserOperationRequest,
+    ) -> tuple[PreparedUserOperation, PimlicoPaymasterAdapter]:
         chain_id = request.chain_id
         if not paymaster_registry.is_gas_payable(chain_id, provider="pimlico"):
             raise PaymasterUnsupportedChain(chain_id)
@@ -181,15 +243,16 @@ class PimlicoUserOperationAdapter:
         actions = [
             Call(to=call.to, data=call.data, value=call.value) for call in request.calls
         ]
+        approved = self._paymaster_already_approved(
+            w3,
+            token,
+            owner=sender,
+            spender=quote.paymaster,
+            deployed=deployed,
+        )
         calls = (
             tuple(actions)
-            if self._paymaster_already_approved(
-                w3,
-                token,
-                owner=sender,
-                spender=quote.paymaster,
-                deployed=deployed,
-            )
+            if approved
             else paymaster_calls(actions, token=token, paymaster=quote.paymaster)
         )
 
@@ -201,47 +264,49 @@ class PimlicoUserOperationAdapter:
             deployed=deployed,
             signature=safe_4337_signature.dummy_signature(len(self._owner_keys)),
         )
-        user_op.update(_hex_values(pimlico.gas_price(self._fee_tier)))
+        fees = pimlico.gas_price(self._fee_tier)
+        user_op.update(_hex_values(fees))
         # pm_getPaymasterStubData rejects a userOp whose gas limits are absent,
         # but the limits come from an estimate that needs the stub first. Seed
         # zeros to break the cycle — the estimate below overwrites all three.
         user_op.update(_GAS_LIMIT_PLACEHOLDERS)
-        user_op.update(
-            _hex_values(pimlico.estimate_gas(pimlico.stub_data(user_op, token=token)))
-        )
+        estimate = pimlico.estimate_gas(pimlico.stub_data(user_op, token=token))
+        user_op.update(_hex_values(estimate))
 
-        # Sponsor before signing: paymasterAndData is inside the SafeOp hash, so
-        # signing first would produce a signature for a different operation.
-        sponsored = pimlico.sponsor(user_op, token=token)
-        signed = safe_4337_signature.sign_user_operation(
-            sponsored,
-            private_keys=self._owner_keys,
+        prepared = PreparedUserOperation(
+            sender=sender,
             chain_id=chain_id,
-            module=self._module,
             entry_point=pimlico.entry_point,
+            user_operation=user_op,
+            deployed=deployed,
+            factory=user_op.get("factory"),
+            factory_data=user_op.get("factoryData"),
+            gas=UserOperationGas(
+                call_gas_limit=_estimate_field(estimate, "callGasLimit"),
+                verification_gas_limit=_estimate_field(
+                    estimate, "verificationGasLimit"
+                ),
+                pre_verification_gas=_estimate_field(estimate, "preVerificationGas"),
+                paymaster_verification_gas_limit=estimate.get(
+                    "paymasterVerificationGasLimit"
+                ),
+                paymaster_post_op_gas_limit=estimate.get("paymasterPostOpGasLimit"),
+                max_fee_per_gas=fees["maxFeePerGas"],
+                max_priority_fee_per_gas=fees["maxPriorityFeePerGas"],
+            ),
+            paymaster=PaymasterTokenQuote(
+                paymaster=quote.paymaster,
+                token=token,
+                exchange_rate=quote.exchange_rate,
+                post_op_gas=quote.post_op_gas,
+                approval_included=not approved,
+            ),
+            # Not derived yet: bounding the USDC charge means scaling the
+            # quote's exchangeRate, and TokenQuote deliberately does no such
+            # arithmetic until it has been checked against a real charge.
+            max_gas_token_charge_raw=None,
         )
-
-        user_op_hash = pimlico.send(signed)
-        message = (
-            f"user operation submitted via Pimlico on "
-            f"{chains.chain_name(chain_id)}, gas paid in USDC"
-            + ("" if deployed else "; deploys the Safe in this operation")
-        )
-
-        # Wait for it: the next operation from this Safe reads the nonce and the
-        # deployment status from the chain, and both are wrong until this one is
-        # mined — the second op re-sends the factory and the EntryPoint rejects
-        # it with AA10. Ops from one sender are sequential whether we like it or
-        # not.
-        included = self._await_inclusion(pimlico, user_op_hash)
-        if included is None:
-            return PaymasterUserOperationSubmission(
-                user_op_hash=user_op_hash,
-                status="submitted",
-                message=f"{message}; still pending after "
-                f"{self._inclusion_timeout_s:.0f}s",
-            )
-        return _submission_from_receipt(user_op_hash, included, message)
+        return prepared, pimlico
 
     def _await_inclusion(
         self,
@@ -385,6 +450,12 @@ def _submission_from_receipt(
         ),
         message=message,
     )
+
+
+def _estimate_field(estimate: Mapping[str, int], key: str) -> int:
+    if key not in estimate:
+        raise PaymasterError(f"user operation gas estimate is missing {key}")
+    return estimate[key]
 
 
 def _optional_str(value: object) -> str | None:

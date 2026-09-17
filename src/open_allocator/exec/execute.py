@@ -67,10 +67,14 @@ class WalletPreparation(FrozenModel):
     call_gas_limit: int | None = Field(default=None, ge=0)
     verification_gas_limit: int | None = Field(default=None, ge=0)
     pre_verification_gas: int | None = Field(default=None, ge=0)
+    paymaster_verification_gas_limit: int | None = Field(default=None, ge=0)
+    paymaster_post_op_gas_limit: int | None = Field(default=None, ge=0)
     max_fee_per_gas: int | None = Field(default=None, ge=0)
     max_priority_fee_per_gas: int | None = Field(default=None, ge=0)
     paymaster_address: str | None = None
     paymaster_token: str | None = None
+    # Whether the paymaster's token approval rides in front of the calls.
+    paymaster_approval_included: bool | None = None
     # None when the adapter cannot bound the charge defensibly.
     max_gas_token_charge_raw: str | None = Field(default=None, pattern=r"^\d+$")
 
@@ -102,14 +106,6 @@ class PolicyCheckFailed(ExecutionError):
 
 class TransactionPlanError(ExecutionError):
     pass
-
-
-# Calldata bundles are planned but not yet executable: signing them needs the
-# wallet-aware preparation, expiry refresh, and requirement checks first.
-CALLDATA_EXECUTION_UNAVAILABLE = (
-    "ONE_TX_TRANSACTION_API=calldata can build plans but cannot execute them yet; "
-    "use ONE_TX_TRANSACTION_API=legacy to execute"
-)
 
 
 class GasPreflightError(ExecutionError):
@@ -196,13 +192,22 @@ def execute_allocation(
     address = signer.address()
     vaults_by_id = _vaults_by_id(known)
     if calldata.uses_calldata_api(config):
-        if confirm:
-            raise TransactionPlanError(CALLDATA_EXECUTION_UNAVAILABLE)
-        return _calldata_deposit_plan(
+        calldata_plan = _calldata_deposit_plan(
             client,
             address,
             allocation_model,
             vaults_by_id,
+            config,
+            idempotency_store,
+        )
+        if not confirm:
+            return calldata_plan
+        return _execute_calldata_deposits(
+            client,
+            signer,
+            calldata_plan,
+            allocation_model,
+            policy_result,
             config,
             idempotency_store,
         )
@@ -408,6 +413,65 @@ def _calldata_deposit_plan(
         ),
         bundles=tuple(bundles),
     )
+
+
+def _execute_calldata_deposits(
+    client: object,
+    signer: Signer,
+    plan: TxPlan,
+    allocation: Allocation,
+    policy_result: policy_core.PolicyResult,
+    config: object | None,
+    idempotency_store: object | None,
+) -> ExecutionReport:
+    """Submit a calldata deposit plan, one wallet operation per chain run.
+
+    Funding is not checked against the bundles' requirements yet; an
+    underfunded operation fails at the bundler's estimate or on chain.
+    """
+    from open_allocator.exec import bundle_execution
+
+    usd_by_leg = {index: leg.usd for index, leg in enumerate(allocation.legs)}
+    result = bundle_execution.execute_plan(
+        client,
+        signer,
+        plan,
+        stage="execute",
+        policy_result=policy_result,
+        completion_key=lambda bundle: _leg_key(bundle.leg_index, bundle.instrument_id),
+        log=lambda bundle: bundle_execution.BundleLog(
+            action_type="buy",
+            usd=usd_by_leg.get(bundle.leg_index),
+        ),
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+    # Legs finished by an earlier run were never planned, but they are still
+    # complete; the checkpoint is a snapshot of the whole allocation.
+    earlier = tuple(
+        _leg_key(index, leg.instrument_id)
+        for index, leg in enumerate(allocation.legs)
+        if _leg_key(index, leg.instrument_id) not in result.completed_keys
+        and _store_completed(idempotency_store, _leg_key(index, leg.instrument_id))
+    )
+    report = ExecutionReport(
+        status=result.status,
+        policy_result=policy_result,
+        plan=result.plan,
+        steps=result.steps,
+        receipts=result.receipts,
+        gas_checks=result.gas_checks,
+        preparations=result.preparations,
+        in_progress=result.in_progress,
+        messages=result.messages,
+    )
+    _write_checkpoint(
+        config,
+        "execute",
+        report,
+        completed_keys=(*earlier, *result.completed_keys),
+    )
+    return report
 
 
 def _pinned_source_chain_id(

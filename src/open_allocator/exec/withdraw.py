@@ -8,14 +8,13 @@ from pydantic import Field
 from open_allocator.core import amounts
 from open_allocator.core import withdraw as withdraw_core
 from open_allocator.core.types import FrozenModel, Policy, TxBundle, TxPlan, TxStep
-from open_allocator.exec import calldata, chains
+from open_allocator.exec import bundle_execution, calldata, chains
 from open_allocator.exec.execute import (
-    CALLDATA_EXECUTION_UNAVAILABLE,
     ExecutionBroadcastError,
     ExecutionReport,
     ExecutionStepReport,
     GasCheck,
-    TransactionPlanError,
+    WalletPreparation,
     _append_allocation_log,
     _completed_keys,
     _copy_config_value,
@@ -53,6 +52,7 @@ class WithdrawExecutionReport(FrozenModel):
     steps: tuple[ExecutionStepReport, ...] = Field(default_factory=tuple)
     receipts: tuple[Receipt, ...] = Field(default_factory=tuple)
     gas_checks: tuple[GasCheck, ...] = Field(default_factory=tuple)
+    preparations: tuple[WalletPreparation, ...] = Field(default_factory=tuple)
     in_progress: bool = False
     messages: tuple[str, ...] = Field(default_factory=tuple)
 
@@ -86,8 +86,6 @@ def withdraw(
     withdraw_plan = withdraw_core.plan_withdraw(position, policy, amount=amount)
     address = signer.address()
     if calldata.uses_calldata_api(config):
-        if confirm:
-            raise TransactionPlanError(CALLDATA_EXECUTION_UNAVAILABLE)
         tx_plan, sell = _calldata_tx_plan(
             client,
             address,
@@ -95,12 +93,28 @@ def withdraw(
             config,
             idempotency_store,
         )
-        return WithdrawExecutionReport(
-            status="planned",
-            withdraw_plan=withdraw_plan,
-            sell=sell,
-            plan=tx_plan,
-            messages=("dry-run only; no transactions broadcast",),
+        if not confirm:
+            preparation = bundle_execution.prepare_plan(signer, tx_plan, config)
+            return WithdrawExecutionReport(
+                status="planned",
+                withdraw_plan=withdraw_plan,
+                sell=sell,
+                plan=tx_plan,
+                preparations=preparation.preparations,
+                messages=(
+                    "dry-run only; no transactions broadcast",
+                    *preparation.messages,
+                    *preparation.blockers,
+                ),
+            )
+        return _execute_calldata_withdraw(
+            client,
+            signer,
+            tx_plan,
+            withdraw_plan,
+            sell,
+            config,
+            idempotency_store,
         )
 
     tx_plan, step_refs, sell, messages = _build_tx_plan(
@@ -308,6 +322,59 @@ def _calldata_tx_plan(
     return tx_plan, sell.model_copy(
         update={"expected_usdc": _expected_usdc(bundle, config)}
     )
+
+
+def _execute_calldata_withdraw(
+    client: object,
+    signer: Signer,
+    tx_plan: TxPlan,
+    withdraw_plan: withdraw_core.WithdrawPlan,
+    sell: WithdrawSellDetails,
+    config: object | None,
+    idempotency_store: object | None,
+) -> WithdrawExecutionReport:
+    """Submit the withdrawal bundle as one wallet operation."""
+    withdraw_key = _withdraw_key(withdraw_plan)
+    result = bundle_execution.execute_plan(
+        client,
+        signer,
+        tx_plan,
+        stage="withdraw",
+        policy_result=_ok_policy_result(),  # type: ignore[arg-type]
+        completion_key=lambda _bundle: withdraw_key,
+        log=lambda _bundle: bundle_execution.BundleLog(
+            action_type="withdraw",
+            shares=withdraw_plan.yield_token_amount,
+            share_price=withdraw_plan.share_price_usd,
+        ),
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+    if result.plan.bundles:
+        # The bundle may have been rebuilt before signing; report what was sent.
+        sell = sell.model_copy(
+            update={
+                "status": "sent",
+                "expected_usdc": _expected_usdc(result.plan.bundles[0], config),
+            }
+        )
+    completed_keys = result.completed_keys
+    if not result.plan.bundles and _store_completed(idempotency_store, withdraw_key):
+        completed_keys = (withdraw_key,)
+    report = WithdrawExecutionReport(
+        status=result.status,
+        withdraw_plan=withdraw_plan,
+        sell=sell,
+        plan=result.plan,
+        steps=result.steps,
+        receipts=result.receipts,
+        gas_checks=result.gas_checks,
+        preparations=result.preparations,
+        in_progress=result.in_progress,
+        messages=result.messages,
+    )
+    _write_checkpoint(config, "withdraw", report, completed_keys=completed_keys)
+    return report
 
 
 def _expected_usdc(bundle: TxBundle, config: object | None) -> str | None:

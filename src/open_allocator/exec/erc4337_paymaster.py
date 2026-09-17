@@ -11,11 +11,14 @@ from open_allocator.exec.composition import composition_from_config
 from open_allocator.exec.paymaster_types import (
     PaymasterConfigurationError,
     PaymasterError,
+    PaymasterPreparationUnavailable,
     PaymasterRejected,
     PaymasterUnsupportedChain,
     PaymasterUserOperationAdapter,
     PaymasterUserOperationRequest,
     PaymasterUserOperationSubmission,
+    PreparedUserOperation,
+    PreparingPaymasterUserOperationAdapter,
     UserOperationCall,
 )
 from open_allocator.exec.pimlico import (
@@ -76,25 +79,7 @@ class Erc4337PaymasterSigner:
         the account does not have.
         """
         _ = rpc_url
-        if not steps:
-            raise PaymasterConfigurationError("a user operation needs a step")
-        chain_ids = {step.chain_id for step in steps}
-        if len(chain_ids) != 1:
-            raise PaymasterConfigurationError(
-                f"one user operation cannot span chains {sorted(chain_ids)}"
-            )
-        tx = steps[0]
-        request = PaymasterUserOperationRequest(
-            sender=self.address(),
-            chain_id=tx.chain_id,
-            entry_point=self._required_entry_point(),
-            calls=tuple(
-                UserOperationCall(to=step.to, data=step.data, value=step.value)
-                for step in steps
-            ),
-            gas_token_address=self._required_usdc_address(tx.chain_id),
-            account_type=self._account_type,
-        )
+        request = self._request(steps)
         submission = self._require_adapter().submit_user_operation(request)
         return Receipt(
             transaction_hash=submission.transaction_hash or submission.user_op_hash,
@@ -112,6 +97,47 @@ class Erc4337PaymasterSigner:
             ),
             message=submission.message
             or "ERC-4337 user operation submitted via USDC paymaster",
+        )
+
+    def prepare_batch(
+        self,
+        steps: Sequence[TxStep],
+        rpc_url: str,
+    ) -> PreparedUserOperation:
+        """The operation send_batch would submit, estimated but never signed.
+
+        Stale by construction — send_batch prepares again right before signing —
+        so this is what a dry run reports, not something to submit later.
+        """
+        _ = rpc_url
+        request = self._request(steps)
+        adapter = self._require_adapter()
+        if not isinstance(adapter, PreparingPaymasterUserOperationAdapter):
+            raise PaymasterPreparationUnavailable(
+                f"{type(adapter).__name__} cannot estimate a user operation "
+                "without submitting it"
+            )
+        return adapter.prepare_user_operation(request)
+
+    def _request(self, steps: Sequence[TxStep]) -> PaymasterUserOperationRequest:
+        if not steps:
+            raise PaymasterConfigurationError("a user operation needs a step")
+        chain_ids = {step.chain_id for step in steps}
+        if len(chain_ids) != 1:
+            raise PaymasterConfigurationError(
+                f"one user operation cannot span chains {sorted(chain_ids)}"
+            )
+        chain_id = steps[0].chain_id
+        return PaymasterUserOperationRequest(
+            sender=self.address(),
+            chain_id=chain_id,
+            entry_point=self._required_entry_point(),
+            calls=tuple(
+                UserOperationCall(to=step.to, data=step.data, value=step.value)
+                for step in steps
+            ),
+            gas_token_address=self._required_usdc_address(chain_id),
+            account_type=self._account_type,
         )
 
     def _require_adapter(self) -> PaymasterUserOperationAdapter:
@@ -634,11 +660,13 @@ __all__ = [
     "GenericHttpPaymasterUserOperationAdapter",
     "PaymasterConfigurationError",
     "PaymasterError",
+    "PaymasterPreparationUnavailable",
     "PaymasterRejected",
     "PaymasterUnsupportedChain",
     "PaymasterUserOperationAdapter",
     "PaymasterUserOperationRequest",
     "PaymasterUserOperationSubmission",
+    "PreparedUserOperation",
     "UserOperationCall",
     "require_usdc_address",
     "submits_via_paymaster",

@@ -961,12 +961,62 @@ def test_calldata_deposit_skips_a_completed_leg() -> None:
     assert plan.bundles[0].step_indexes == (0, 1, 2, 3, 4)
 
 
-def test_calldata_execution_is_refused_before_anything_is_built_or_sent() -> None:
-    client = MockCalldataClient()
-    signer = MockSigner()
+@dataclass
+class BatchingCalldataSigner(MockSigner):
+    batches: list[tuple[TxStep, ...]] = field(default_factory=list)
 
-    with pytest.raises(TransactionPlanError, match="cannot execute them yet"):
-        execute_allocation(
+    def send_batch(self, steps: tuple[TxStep, ...], rpc_url: str) -> Receipt:
+        self.batches.append(tuple(steps))
+        return Receipt(
+            transaction_hash=f"0x{len(self.batches):064x}",
+            block_number=len(self.batches),
+            gas_used=21_000,
+            status=1,
+            from_address=self.address(),
+            to_address=steps[-1].to,
+        )
+
+
+def test_calldata_deposits_on_one_chain_execute_as_one_operation() -> None:
+    client = MockCalldataClient()
+    signer = BatchingCalldataSigner()
+    store: dict[str, object] = {}
+
+    report = execute_allocation(
+        client,
+        signer,
+        allocation("vault-a", "vault-b"),
+        permissive_policy(),
+        confirm=True,
+        known_instruments=[calldata_vault("vault-a"), calldata_vault("vault-b")],
+        config=CalldataConfig(),
+        idempotency_store=store,
+    )
+
+    assert report.status == "success"
+    [batch] = signer.batches
+    assert batch == report.plan.steps
+    assert [step.kind for step in batch] == [
+        "approve",
+        "swap",
+        "approve",
+        "approve",
+        "deposit",
+    ] * 2
+    assert signer.sent == []
+    assert {"leg:0:vault-a", "leg:1:vault-b"} <= set(store)
+    assert not any(":call:" in key for key in store)
+    payload = report.plan.model_dump(mode="json")
+    assert validate(payload, "tx-plan") == payload
+
+
+def test_calldata_deposit_rerun_does_not_rebuild_or_resend_a_submitted_leg() -> None:
+    client = MockCalldataClient()
+    signer = BatchingCalldataSigner()
+    store: dict[str, object] = {}
+
+    def run() -> Any:
+        return execute_allocation(
             client,
             signer,
             allocation("vault-a"),
@@ -974,10 +1024,58 @@ def test_calldata_execution_is_refused_before_anything_is_built_or_sent() -> Non
             confirm=True,
             known_instruments=[calldata_vault("vault-a")],
             config=CalldataConfig(),
+            idempotency_store=store,
         )
 
-    assert client.requests == []
-    assert signer.sent == []
+    run()
+    rerun = run()
+
+    assert len(client.requests) == 1
+    assert len(signer.batches) == 1
+    assert rerun.plan.steps == ()
+
+
+def test_calldata_deposit_checkpoint_keeps_legs_finished_by_an_earlier_run(
+    tmp_path: Path,
+) -> None:
+    config = CalldataCheckpointConfig(checkpoint_dir=tmp_path)
+
+    execute_allocation(
+        MockCalldataClient(),
+        BatchingCalldataSigner(),
+        allocation("vault-a", "vault-b"),
+        permissive_policy(),
+        confirm=True,
+        known_instruments=[calldata_vault("vault-a"), calldata_vault("vault-b")],
+        config=config,
+        idempotency_store={"leg:0:vault-a": True},
+    )
+
+    [path] = tmp_path.glob("*.json")
+    completed = set(json.loads(path.read_text())["completed_keys"])
+    assert {"leg:0:vault-a", "leg:1:vault-b"} <= completed
+
+
+def test_calldata_deposits_without_batching_send_calls_in_plan_order() -> None:
+    signer = MockSigner()
+
+    report = execute_allocation(
+        MockCalldataClient(),
+        signer,
+        allocation("vault-a"),
+        permissive_policy(),
+        confirm=True,
+        known_instruments=[calldata_vault("vault-a")],
+        config=CalldataConfig(),
+    )
+
+    assert tuple(step for step, _rpc in signer.sent) == report.plan.steps
+    assert report.status == "success"
+
+
+@dataclass(frozen=True)
+class CalldataCheckpointConfig(CalldataConfig):
+    checkpoint_dir: object = None
 
 
 def test_calldata_deposit_rejects_referral_configuration() -> None:

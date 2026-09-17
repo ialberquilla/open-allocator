@@ -134,7 +134,7 @@ def validate_instrument_calldata(
 
 
 def ensure_calldata_lifetime(
-    response: InstrumentCalldataResponse,
+    response: InstrumentCalldataResponse | TxBundle,
     *,
     min_ttl_seconds: int,
     now: float | None = None,
@@ -292,6 +292,59 @@ def request_bundle(
         leg_index=leg_index,
         first_step_index=first_step_index,
     )
+
+
+def refresh_bundle(
+    client: object,
+    bundle: TxBundle,
+    *,
+    config: object | None = None,
+    now: float | None = None,
+) -> tuple[tuple[TxStep, ...], TxBundle]:
+    """Fresh calldata for the same logical leg, validated like the original.
+
+    Same instrument, action, account, chain, and raw amount; a deposit must
+    still spend the token the amount was computed in. The result keeps the
+    bundle ID but carries a new digest, so nothing recorded against the old
+    calls can be read as completion of these. Step indexes start at zero and
+    are placed by whoever assembles the plan.
+    """
+    token = (
+        DepositToken(
+            chain_id=bundle.chain_id,
+            address=bundle.token_in.address,
+            decimals=bundle.token_in.decimals,
+        )
+        if bundle.action == "deposit"
+        else None
+    )
+    return request_bundle(
+        client,
+        instrument_id=bundle.instrument_id,
+        action=bundle.action,
+        account=bundle.account,
+        chain_id=bundle.chain_id,
+        amount=bundle.amount,
+        leg_index=bundle.leg_index,
+        first_step_index=0,
+        config=config,
+        token=token,
+        now=now,
+    )
+
+
+def needs_refresh(
+    bundle: TxBundle,
+    *,
+    min_ttl_seconds: int,
+    now: float | None = None,
+) -> bool:
+    """Whether a planned bundle is too close to expiry to be signed as it is."""
+    try:
+        ensure_calldata_lifetime(bundle, min_ttl_seconds=min_ttl_seconds, now=now)
+    except CalldataExpiredError:
+        return True
+    return False
 
 
 def min_ttl_seconds(config: object | None) -> int:
