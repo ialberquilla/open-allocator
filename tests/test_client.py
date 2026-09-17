@@ -6,8 +6,16 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
-from open_allocator.exec.client import OneTxClient, OneTxDecodeError, OneTxHTTPError
+from open_allocator.exec.client import (
+    BridgeCalldataQuery,
+    InstrumentCalldataQuery,
+    InstrumentCalldataResponse,
+    OneTxClient,
+    OneTxDecodeError,
+    OneTxHTTPError,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -780,3 +788,294 @@ def test_live_list_instruments_smoke_skips_without_creds() -> None:
         result = client.list_instruments(limit=1)
 
     assert result.pagination.total >= 0
+
+
+CALLDATA_INSTRUMENT_ID = "0x" + "ab" * 32
+CALLDATA_SAFE = "0x1111111111111111111111111111111111111111"
+
+
+def calldata_payload(name: str) -> dict[str, Any]:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def calldata_client(payload: object) -> OneTxClient:
+    return make_client(
+        httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    )
+
+
+def request_instrument_calldata(client: OneTxClient) -> InstrumentCalldataResponse:
+    return client.instrument_calldata(
+        CALLDATA_INSTRUMENT_ID,
+        {"action": "deposit", "account": CALLDATA_SAFE, "amount": "100250000"},
+    )
+
+
+def test_instrument_calldata_gets_path_and_query_aliases() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert (
+            request.url.path == f"/api/v1/instruments/{CALLDATA_INSTRUMENT_ID}/calldata"
+        )
+        assert dict(request.url.params) == {
+            "action": "deposit",
+            "account": CALLDATA_SAFE,
+            "amount": "100250000",
+            "slippageBps": "75",
+        }
+        assert "executor" not in request.url.params
+        assert request.content == b""
+        assert_common_headers(request)
+        return httpx.Response(
+            200,
+            json=calldata_payload("calldata-instrument-deposit-swap.json"),
+        )
+
+    result = make_client(httpx.MockTransport(handler)).instrument_calldata(
+        CALLDATA_INSTRUMENT_ID,
+        InstrumentCalldataQuery(
+            action="deposit",
+            account=CALLDATA_SAFE,
+            amount="100250000",
+            slippage_bps=75,
+        ),
+    )
+
+    assert [call.type for call in result.calls] == [
+        "approve",
+        "swap",
+        "approve",
+        "approve",
+        "deposit",
+    ]
+    assert result.calls[0].chain_id == 8453
+    assert result.token_in.decimals == 6
+    assert result.deposit_amount == "100180000000000000000"
+    assert result.expires_at == 1789650060
+    assert result.requires[0].amount == "100250000"
+    assert result.leftovers[0].max_amount == "100250000"
+    assert result.simulation.scope == "protocol_bundle"
+    assert result.simulation.engine == "wallet_neutral_atomic"
+    assert result.simulation.gas_used == "412345"
+
+
+def test_instrument_calldata_parses_full_withdrawal() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {
+            "action": "withdraw",
+            "account": CALLDATA_SAFE,
+            "amount": "max",
+        }
+        return httpx.Response(
+            200,
+            json=calldata_payload("calldata-instrument-withdraw-max.json"),
+        )
+
+    result = make_client(httpx.MockTransport(handler)).instrument_calldata(
+        CALLDATA_INSTRUMENT_ID,
+        {"action": "withdraw", "account": CALLDATA_SAFE, "amount": "max"},
+    )
+
+    assert result.amount_in == "max"
+    assert result.expires_at is None
+    assert result.leftovers == ()
+    assert [call.type for call in result.calls] == ["withdraw"]
+
+
+def test_bridge_calldata_gets_path_and_query_aliases() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/v1/bridge/calldata"
+        assert dict(request.url.params) == {
+            "fromChainId": "8453",
+            "toChainId": "42161",
+            "amount": "100000000",
+            "account": CALLDATA_SAFE,
+            "fast": "true",
+        }
+        assert_common_headers(request)
+        return httpx.Response(200, json=calldata_payload("calldata-bridge-fast.json"))
+
+    result = make_client(httpx.MockTransport(handler)).bridge_calldata(
+        BridgeCalldataQuery(
+            from_chain_id=8453,
+            to_chain_id=42161,
+            amount="100000000",
+            account=CALLDATA_SAFE,
+            fast=True,
+        )
+    )
+
+    assert [call.type for call in result.calls] == ["approve", "bridge_burn"]
+    assert result.source_domain == 6
+    assert result.destination_domain == 3
+    assert result.max_fee == "12000"
+    assert result.min_finality_threshold == 1000
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"action": "deposit", "account": CALLDATA_SAFE, "amount": "max"},
+        {"action": "deposit", "account": CALLDATA_SAFE, "amount": "0"},
+        {"action": "deposit", "account": CALLDATA_SAFE, "amount": "100.25"},
+        {"action": "deposit", "account": "0x1234", "amount": "1"},
+        {"action": "stake", "account": CALLDATA_SAFE, "amount": "1"},
+        {
+            "action": "deposit",
+            "account": CALLDATA_SAFE,
+            "amount": "1",
+            "slippageBps": 10_001,
+        },
+        {
+            "action": "deposit",
+            "account": CALLDATA_SAFE,
+            "amount": "1",
+            "executor": CALLDATA_SAFE,
+        },
+    ],
+)
+def test_instrument_calldata_rejects_invalid_queries_before_requesting(
+    query: dict[str, object],
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("an invalid query must not reach the API")
+
+    with pytest.raises(ValidationError):
+        make_client(httpx.MockTransport(handler)).instrument_calldata(
+            CALLDATA_INSTRUMENT_ID,
+            query,
+        )
+
+
+def test_bridge_calldata_rejects_same_chain_route() -> None:
+    with pytest.raises(ValidationError, match="must differ"):
+        BridgeCalldataQuery(
+            from_chain_id=8453,
+            to_chain_id=8453,
+            amount="1",
+            account=CALLDATA_SAFE,
+            fast=False,
+        )
+
+
+def _set(path: tuple[object, ...], value: object) -> Any:
+    def mutate(payload: dict[str, Any]) -> None:
+        target: Any = payload
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+
+    return mutate
+
+
+def _delete(path: tuple[object, ...]) -> Any:
+    def mutate(payload: dict[str, Any]) -> None:
+        target: Any = payload
+        for key in path[:-1]:
+            target = target[key]
+        del target[path[-1]]
+
+    return mutate
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(_set(("executor",), CALLDATA_SAFE), id="unknown-field"),
+        pytest.param(
+            _set(("simulation", "executor"), CALLDATA_SAFE), id="nested-extra"
+        ),
+        pytest.param(_delete(("leftovers",)), id="missing-field"),
+        pytest.param(_delete(("expiresAt",)), id="missing-nullable-field"),
+        pytest.param(_set(("simulation", "ok"), False), id="simulation-not-ok"),
+        pytest.param(_set(("simulation", "scope"), "wallet"), id="unsupported-scope"),
+        pytest.param(
+            _set(("simulation", "engine"), "safe_adapter"),
+            id="unsupported-engine",
+        ),
+        pytest.param(_set(("simulation", "quoteBlock"), 1), id="quote-block-mismatch"),
+        pytest.param(_set(("calls",), []), id="empty-calls"),
+        pytest.param(_set(("calls", 1, "chainId"), 42161), id="call-chain-mismatch"),
+        pytest.param(_set(("calls", 1, "type"), "buy"), id="unknown-call-type"),
+        pytest.param(_set(("calls", 0, "to"), "0x1234"), id="short-address"),
+        pytest.param(_set(("calls", 0, "data"), "0x095ea7b"), id="odd-hex"),
+        pytest.param(_set(("calls", 0, "data"), "095ea7b3"), id="unprefixed-hex"),
+        pytest.param(_set(("calls", 0, "value"), "-1"), id="negative-value"),
+        pytest.param(_set(("calls", 0, "value"), 0), id="numeric-value"),
+        pytest.param(_set(("calls", 0, "value"), "01"), id="non-canonical-value"),
+        pytest.param(_set(("chainId",), "8453"), id="string-chain-id"),
+        pytest.param(_set(("expiresAt",), "1789650060"), id="string-expiry"),
+        pytest.param(_set(("requires", 0, "amount"), "1.5"), id="fractional-amount"),
+        pytest.param(_set(("amountIn",), "max"), id="max-deposit"),
+    ],
+)
+def test_instrument_calldata_fails_closed_on_contract_drift(mutation: Any) -> None:
+    payload = calldata_payload("calldata-instrument-deposit-swap.json")
+    mutation(payload)
+
+    with pytest.raises(OneTxDecodeError, match="outside the execution contract"):
+        request_instrument_calldata(calldata_client(payload))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(_set(("leftovers",), []), id="unknown-field"),
+        pytest.param(_set(("minFinalityThreshold",), 2000), id="finality-mismatch"),
+        pytest.param(_set(("minFinalityThreshold",), 500), id="unknown-finality"),
+        pytest.param(_set(("toChainId",), 8453), id="same-chain"),
+        pytest.param(_set(("calls", 1, "chainId"), 42161), id="destination-call"),
+        pytest.param(_set(("amount",), "0"), id="zero-amount"),
+        pytest.param(_set(("simulation", "engine"), "kernel"), id="unsupported-engine"),
+    ],
+)
+def test_bridge_calldata_fails_closed_on_contract_drift(mutation: Any) -> None:
+    payload = calldata_payload("calldata-bridge-fast.json")
+    mutation(payload)
+
+    with pytest.raises(OneTxDecodeError, match="outside the execution contract"):
+        calldata_client(payload).bridge_calldata(
+            {
+                "fromChainId": 8453,
+                "toChainId": 42161,
+                "amount": "100000000",
+                "account": CALLDATA_SAFE,
+                "fast": True,
+            }
+        )
+
+
+def test_instrument_calldata_retries_like_other_requests() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, json={"message": "Simulation unavailable"})
+        return httpx.Response(
+            200,
+            json=calldata_payload("calldata-instrument-deposit-swap.json"),
+        )
+
+    client = make_client(httpx.MockTransport(handler), max_retries=1)
+
+    assert request_instrument_calldata(client).quote_block == 35123456
+    assert calls == 2
+
+
+def test_instrument_calldata_surfaces_reverted_simulation_as_http_error() -> None:
+    client = make_client(
+        httpx.MockTransport(
+            lambda _request: httpx.Response(
+                400,
+                json={"message": "Atomic simulation produced no output tokens"},
+            )
+        )
+    )
+
+    with pytest.raises(OneTxHTTPError) as error:
+        request_instrument_calldata(client)
+
+    assert error.value.status_code == 400

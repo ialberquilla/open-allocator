@@ -90,6 +90,13 @@ class AllocatorConfig(BaseSettings):
     onetx_api_key: SecretStr = Field(..., validation_alias="ONE_TX_API_KEY", repr=False)
     slippage_bps: int = Field(50, validation_alias="ONE_TX_SLIPPAGE_BPS")
     fast_transfer: bool = Field(False, validation_alias="ONE_TX_FAST_TRANSFER")
+    # Lifetime a calldata bundle's swap quote must still have, both when it is
+    # planned and immediately before signing. 1Tx swap quotes live for 60s.
+    min_calldata_ttl_seconds: int = Field(
+        20,
+        ge=0,
+        validation_alias="ONE_TX_MIN_CALLDATA_TTL_SECONDS",
+    )
     referral_fee_bps: int = Field(
         0,
         ge=0,

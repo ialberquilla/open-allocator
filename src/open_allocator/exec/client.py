@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonObject = dict[str, Any]
@@ -342,6 +350,181 @@ class AccountResponse(OneTxModel):
     grant: AccountGrant | None
 
 
+# Execution responses are parsed strictly: an unknown or missing field is a
+# contract change, and it must fail here rather than after the calls have been
+# handed to a signer. Discovery models above stay forward-compatible.
+class OneTxExecutionModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+
+EvmAddress = Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{40}$")]
+HexData = Annotated[str, StringConstraints(pattern=r"^0x(?:[0-9a-fA-F]{2})*$")]
+RawUint = Annotated[str, StringConstraints(pattern=r"^(?:0|[1-9][0-9]*)$")]
+PositiveRawUint = Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]*$")]
+RawAmountOrMax = Annotated[str, StringConstraints(pattern=r"^(?:max|[1-9][0-9]*)$")]
+ChainId = Annotated[int, Field(strict=True, ge=1)]
+BlockNumber = Annotated[int, Field(strict=True, ge=0)]
+
+CalldataAction = Literal["deposit", "withdraw"]
+CalldataCallType = Literal[
+    "approve", "swap", "deposit", "withdraw", "bridge_burn", "fee"
+]
+
+
+class InstrumentCalldataQuery(OneTxExecutionModel):
+    action: CalldataAction
+    account: EvmAddress
+    amount: RawAmountOrMax
+    slippage_bps: int | None = Field(
+        default=None,
+        alias="slippageBps",
+        strict=True,
+        ge=0,
+        le=10_000,
+    )
+    token_in: EvmAddress | None = Field(default=None, alias="tokenIn")
+    token_out: EvmAddress | None = Field(default=None, alias="tokenOut")
+
+    @model_validator(mode="after")
+    def _max_is_withdraw_only(self) -> Self:
+        if self.amount == "max" and self.action != "withdraw":
+            raise ValueError("amount=max is only valid for withdrawals")
+        return self
+
+
+class BridgeCalldataQuery(OneTxExecutionModel):
+    from_chain_id: ChainId = Field(alias="fromChainId")
+    to_chain_id: ChainId = Field(alias="toChainId")
+    amount: PositiveRawUint
+    account: EvmAddress
+    fast: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def _distinct_chains(self) -> Self:
+        if self.from_chain_id == self.to_chain_id:
+            raise ValueError("bridge source and destination chains must differ")
+        return self
+
+
+class CalldataTokenInfo(OneTxExecutionModel):
+    address: EvmAddress
+    symbol: str | None
+    decimals: int = Field(strict=True, ge=0, le=255)
+
+
+class CalldataBalanceRequirement(OneTxExecutionModel):
+    token: EvmAddress
+    amount: RawUint
+
+
+class CalldataLeftover(OneTxExecutionModel):
+    token: EvmAddress
+    max_amount: RawUint = Field(alias="maxAmount")
+
+
+class CalldataCall(OneTxExecutionModel):
+    to: EvmAddress
+    data: HexData
+    value: RawUint
+    chain_id: ChainId = Field(alias="chainId")
+    type: CalldataCallType
+
+
+class BundleSimulation(OneTxExecutionModel):
+    ok: Literal[True]
+    scope: Literal["protocol_bundle"]
+    engine: Literal["wallet_neutral_atomic"]
+    # Gas of the bare protocol calls under Darex's ephemeral executor. It is not
+    # the Safe/UserOperation gas, which Open Allocator estimates separately.
+    gas_used: RawUint = Field(alias="gasUsed")
+    quote_block: BlockNumber = Field(alias="quoteBlock")
+    token_out_delta: RawUint = Field(alias="tokenOutDelta")
+    assumed_balances: bool = Field(alias="assumedBalances", strict=True)
+
+
+def _check_bundle_chain(
+    calls: tuple[CalldataCall, ...],
+    chain_id: int,
+    simulation: BundleSimulation,
+    quote_block: int,
+) -> None:
+    for index, call in enumerate(calls):
+        if call.chain_id != chain_id:
+            raise ValueError(
+                f"call {index} targets chain {call.chain_id}, "
+                f"bundle chain is {chain_id}"
+            )
+    if simulation.quote_block != quote_block:
+        raise ValueError(
+            f"simulation quote block {simulation.quote_block} does not match "
+            f"bundle quote block {quote_block}"
+        )
+
+
+class InstrumentCalldataResponse(OneTxExecutionModel):
+    instrument_id: str = Field(alias="instrumentId", min_length=1)
+    chain_id: ChainId = Field(alias="chainId")
+    account: EvmAddress
+    action: CalldataAction
+    token_in: CalldataTokenInfo = Field(alias="tokenIn")
+    token_out: CalldataTokenInfo = Field(alias="tokenOut")
+    amount_in: RawAmountOrMax = Field(alias="amountIn")
+    deposit_amount: RawUint | None = Field(alias="depositAmount")
+    expected_out: RawUint | None = Field(alias="expectedOut")
+    min_out: RawUint | None = Field(alias="minOut")
+    # Unix seconds; set only when the bundle embeds an expiring swap quote.
+    expires_at: int | None = Field(alias="expiresAt", strict=True, ge=0)
+    quote_block: BlockNumber = Field(alias="quoteBlock")
+    requires: tuple[CalldataBalanceRequirement, ...]
+    leftovers: tuple[CalldataLeftover, ...]
+    calls: tuple[CalldataCall, ...] = Field(min_length=1)
+    simulation: BundleSimulation
+
+    @model_validator(mode="after")
+    def _consistent_bundle(self) -> Self:
+        _check_bundle_chain(
+            self.calls, self.chain_id, self.simulation, self.quote_block
+        )
+        if self.amount_in == "max" and self.action != "withdraw":
+            raise ValueError("amountIn=max is only valid for withdrawals")
+        return self
+
+
+class BridgeCalldataResponse(OneTxExecutionModel):
+    from_chain_id: ChainId = Field(alias="fromChainId")
+    to_chain_id: ChainId = Field(alias="toChainId")
+    source_domain: int = Field(alias="sourceDomain", strict=True, ge=0)
+    destination_domain: int = Field(alias="destinationDomain", strict=True, ge=0)
+    account: EvmAddress
+    amount: PositiveRawUint
+    token: EvmAddress
+    fast: bool = Field(strict=True)
+    max_fee: RawUint = Field(alias="maxFee")
+    min_finality_threshold: Literal[1000, 2000] = Field(alias="minFinalityThreshold")
+    quote_block: BlockNumber = Field(alias="quoteBlock")
+    requires: tuple[CalldataBalanceRequirement, ...]
+    calls: tuple[CalldataCall, ...] = Field(min_length=1)
+    simulation: BundleSimulation
+
+    @model_validator(mode="after")
+    def _consistent_bundle(self) -> Self:
+        _check_bundle_chain(
+            self.calls,
+            self.from_chain_id,
+            self.simulation,
+            self.quote_block,
+        )
+        if self.from_chain_id == self.to_chain_id:
+            raise ValueError("bridge source and destination chains must differ")
+        # CCTP V2: 1000 is Fast Transfer, 2000 is Standard.
+        if self.fast != (self.min_finality_threshold == 1000):
+            raise ValueError(
+                f"minFinalityThreshold {self.min_finality_threshold} does not "
+                f"match fast={self.fast}"
+            )
+        return self
+
+
 class OneTxClientError(RuntimeError):
     pass
 
@@ -457,6 +640,34 @@ class OneTxClient:
     def build_sell(self, body: Mapping[str, object]) -> JsonValue:
         return self._request_json("POST", "/transactions/sell", body=body)
 
+    def instrument_calldata(
+        self,
+        instrument_id: str,
+        query: InstrumentCalldataQuery | Mapping[str, object],
+    ) -> InstrumentCalldataResponse:
+        request = _execution_query(InstrumentCalldataQuery, query)
+        escaped_id = quote(instrument_id, safe="")
+        path = f"/instruments/{escaped_id}/calldata"
+        payload = self._request_json(
+            "GET",
+            path,
+            query=request.model_dump(by_alias=True, exclude_none=True),
+        )
+        return _parse_execution_response(InstrumentCalldataResponse, payload, path)
+
+    def bridge_calldata(
+        self,
+        query: BridgeCalldataQuery | Mapping[str, object],
+    ) -> BridgeCalldataResponse:
+        request = _execution_query(BridgeCalldataQuery, query)
+        path = "/bridge/calldata"
+        payload = self._request_json(
+            "GET",
+            path,
+            query=request.model_dump(by_alias=True, exclude_none=True),
+        )
+        return _parse_execution_response(BridgeCalldataResponse, payload, path)
+
     def positions(self, body: Mapping[str, object]) -> PositionsResponse:
         payload = self._request_json("GET", "/positions", query=_aliases(body))
         return PositionsResponse.model_validate(payload)
@@ -567,6 +778,28 @@ def _validate_rewards_response(
                 f"reward token chain {token_chain_id} does not match reward chain "
                 f"{reward.chain_id}"
             )
+
+
+def _execution_query[QueryT: OneTxExecutionModel](
+    model: type[QueryT],
+    query: QueryT | Mapping[str, object],
+) -> QueryT:
+    if isinstance(query, model):
+        return query
+    return model.model_validate(query)
+
+
+def _parse_execution_response[ResponseT: OneTxExecutionModel](
+    model: type[ResponseT],
+    payload: JsonValue,
+    path: str,
+) -> ResponseT:
+    try:
+        return model.model_validate(payload)
+    except ValidationError as error:
+        raise OneTxDecodeError(
+            f"GET {path} returned a response outside the execution contract: {error}"
+        ) from error
 
 
 def _aliases(query: Mapping[str, object]) -> dict[str, object]:

@@ -624,6 +624,20 @@ def test_rpc_url_returns_override_default_or_none(
     assert override_config.rpc_url(8453) == "https://rpc.example/base"
 
 
+def test_min_calldata_ttl_defaults_and_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_valid_env(monkeypatch)
+    assert AllocatorConfig().min_calldata_ttl_seconds == 20
+
+    monkeypatch.setenv("ONE_TX_MIN_CALLDATA_TTL_SECONDS", "45")
+    assert AllocatorConfig().min_calldata_ttl_seconds == 45
+
+    monkeypatch.setenv("ONE_TX_MIN_CALLDATA_TTL_SECONDS", "-1")
+    with pytest.raises(ValidationError, match="ONE_TX_MIN_CALLDATA_TTL_SECONDS"):
+        AllocatorConfig()
+
+
 @pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "YeS"])
 def test_fast_transfer_boolean_true_values(
     monkeypatch: pytest.MonkeyPatch,
