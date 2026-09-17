@@ -588,7 +588,7 @@ def test_a_calldata_plan_is_prepared_without_sending_then_submitted_afresh(
         stage="execute",
         policy_result=PolicyResult(ok=True, violations=()),
         completion_key=lambda bundle: f"leg:{bundle.leg_index}",
-        log=lambda _bundle: bundle_execution.BundleLog(action_type="buy"),
+        log=lambda _bundle, _receipt: bundle_execution.BundleLog(action_type="buy"),
         config=_PlanConfig(),
     )
 

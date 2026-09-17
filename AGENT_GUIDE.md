@@ -101,6 +101,8 @@ Full surface and the known limits of every metric: [docs/capabilities.md](docs/c
 2. Build deltas only; do not redeploy unchanged positions.
 3. Run scoring, simulation, and `check-policy` for the proposed deltas.
 4. Announce the exact exits, deposits, chains, amounts, risks, and expected transactions.
+   For a calldata plan, announce the deposit amounts the dry run actually built —
+   a buy may be sized down to what its chain holds after its sells — not the target's.
 5. Wait for approval, then run `rebalance --confirm`.
 
 ## Withdraw Loop

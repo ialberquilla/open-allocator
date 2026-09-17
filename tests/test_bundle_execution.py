@@ -87,7 +87,7 @@ def leg_key(bundle: TxBundle) -> str:
     return f"leg:{bundle.leg_index}:{bundle.instrument_id}"
 
 
-def buy_log(bundle: TxBundle) -> BundleLog:
+def buy_log(bundle: TxBundle, receipt: Receipt) -> BundleLog:
     return BundleLog(action_type="buy", usd=100.25)
 
 

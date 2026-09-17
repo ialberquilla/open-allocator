@@ -276,10 +276,10 @@ def execute_plan(
     signer: object,
     plan: TxPlan,
     *,
-    stage: Literal["execute", "withdraw"],
+    stage: Literal["execute", "withdraw", "rebalance"],
     policy_result: policy_core.PolicyResult,
     completion_key: Callable[[TxBundle], str],
-    log: Callable[[TxBundle], BundleLog],
+    log: Callable[[TxBundle, Receipt], BundleLog],
     config: object | None = None,
     idempotency_store: object | None = None,
     clock: Callable[[], float] = time.time,
@@ -293,7 +293,9 @@ def execute_plan(
     operation again itself, so nonce, fees, and paymaster data are current.
 
     ``completion_key`` names the leg a bundle serves; it is marked when the
-    operation is submitted, so a rerun never builds that leg again.
+    operation is submitted, so a rerun never builds that leg again. ``log`` is
+    called once per bundle with the receipt of the operation that carried it,
+    so a caller can reconcile what actually settled before it is recorded.
     """
     bundles = planned_bundles(plan)
     if not bundles:
@@ -664,7 +666,7 @@ def _complete(
     store: object | None,
     config: object | None,
     completion_key: Callable[[TxBundle], str],
-    log: Callable[[TxBundle], BundleLog],
+    log: Callable[[TxBundle, Receipt], BundleLog],
 ) -> tuple[str, ...]:
     """Mark a submitted bundle and its leg; log it once, not once per call."""
     bundle = item.bundle
@@ -672,7 +674,7 @@ def _complete(
     _store_mark_completed(store, item.key, receipt)
     _store_mark_completed(store, leg_key, True)
     if receipt is not None:
-        entry = log(bundle)
+        entry = log(bundle, receipt)
         # The bundle's final call is the one it exists for; approvals and swaps
         # before it only clear the way.
         _append_allocation_log(

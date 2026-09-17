@@ -447,7 +447,7 @@ def _execute_calldata_deposits(
         stage="execute",
         policy_result=policy_result,
         completion_key=lambda bundle: _leg_key(bundle.leg_index, bundle.instrument_id),
-        log=lambda bundle: bundle_execution.BundleLog(
+        log=lambda bundle, _receipt: bundle_execution.BundleLog(
             action_type="buy",
             usd=usd_by_leg.get(bundle.leg_index),
         ),

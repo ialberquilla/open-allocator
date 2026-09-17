@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Literal, NamedTuple
 
 from pydantic import Field
 
+from open_allocator.core import amounts
 from open_allocator.core import policy as policy_core
 from open_allocator.core import rebalance as rebalance_core
 from open_allocator.core.state import backend_from_config
@@ -15,17 +17,20 @@ from open_allocator.core.types import (
     AllocationLeg,
     FrozenModel,
     Policy,
+    TxBundle,
     TxPlan,
     TxStep,
     Vault,
 )
-from open_allocator.exec import calldata
+from open_allocator.exec import bundle_execution, calldata, chains, funding
 from open_allocator.exec.execute import (
     ExecutionBroadcastError,
     ExecutionReport,
     ExecutionStepReport,
     FundingLedger,
     GasCheck,
+    TransactionPlanError,
+    WalletPreparation,
     _amount_usdc,
     _append_allocation_log,
     _build_buy,
@@ -46,6 +51,7 @@ from open_allocator.exec.execute import (
     _write_checkpoint,
     pending_receipt_messages,
 )
+from open_allocator.exec.funding import FundingRequirement
 from open_allocator.exec.signer import Receipt, Signer
 
 
@@ -61,6 +67,8 @@ class RebalanceExecutionReport(FrozenModel):
     steps: tuple[ExecutionStepReport, ...] = Field(default_factory=tuple)
     receipts: tuple[Receipt, ...] = Field(default_factory=tuple)
     gas_checks: tuple[GasCheck, ...] = Field(default_factory=tuple)
+    preparations: tuple[WalletPreparation, ...] = Field(default_factory=tuple)
+    funding: tuple[FundingRequirement, ...] = Field(default_factory=tuple)
     in_progress: bool = False
     messages: tuple[str, ...] = Field(default_factory=tuple)
 
@@ -95,13 +103,6 @@ def execute_rebalance(
     idempotency_store: object | None = None,
     min_trade_usd: float = 1.0,
 ) -> RebalanceExecutionReport:
-    if calldata.uses_calldata_api(config):
-        # Sell proceeds funding buys needs the calldata funding ledger and
-        # sell-before-buy bundling; until then, refuse rather than fall back.
-        raise calldata.CalldataUnsupportedError(
-            "rebalance is not supported with ONE_TX_TRANSACTION_API=calldata yet; "
-            "use ONE_TX_TRANSACTION_API=legacy"
-        )
     known = tuple(known_instruments or ())
     rebalance_plan = rebalance_core.plan_rebalance(
         positions,
@@ -113,6 +114,18 @@ def execute_rebalance(
     should_execute = confirm or autonomous
     if autonomous and not confirm:
         _require_autonomous_rebalance(rebalance_plan, policy)
+
+    if calldata.uses_calldata_api(config):
+        return _calldata_rebalance(
+            client,
+            signer,
+            positions,
+            rebalance_plan,
+            known,
+            config,
+            idempotency_store,
+            execute=should_execute,
+        )
 
     address = signer.address()
     sells = tuple(t for t in rebalance_plan.trades if t.action == "sell")
@@ -265,6 +278,429 @@ def execute_rebalance(
         completed_keys=_completed_keys(step_refs, execution_steps),
     )
     return report
+
+
+# --- calldata API (ONE_TX_TRANSACTION_API=calldata) --------------------------
+
+# Preparations spent fitting a chain's deposits around the paymaster's maximum
+# gas charge. A shortfall still standing after the last one is reported as a
+# blocker, not guessed around.
+_MAX_CALLDATA_PREPARATIONS = 3
+
+
+@dataclass(frozen=True)
+class _CalldataBuy:
+    index: int
+    trade: rebalance_core.RebalanceTrade
+    chain_id: int
+    token: calldata.DepositToken
+    wanted_raw: int
+
+
+@dataclass(frozen=True)
+class _CalldataRebalancePlan:
+    plan: TxPlan
+    preparation: bundle_execution.PlanPreparation
+    messages: tuple[str, ...]
+    # What each planned deposit actually spends, by trade index — the target's
+    # size less whatever the chain could not fund.
+    deposit_usd: dict[int, float]
+
+
+def _calldata_rebalance(
+    client: object,
+    signer: Signer,
+    positions: object,
+    rebalance_plan: rebalance_core.RebalancePlan,
+    known: Sequence[Vault | Mapping[str, object]],
+    config: object | None,
+    idempotency_store: object | None,
+    *,
+    execute: bool,
+) -> RebalanceExecutionReport:
+    """A same-chain rebalance: each chain's withdrawals, then its deposits.
+
+    No staging is needed. The Safe submits one chain's calls as one atomic
+    operation, so a deposit funded by a withdrawal in the same operation runs
+    after it or not at all. Execution then reads positions to record the shares
+    each confirmed deposit actually received; what 1Tx simulated is never
+    logged as settled.
+    """
+    address = signer.address()
+    built = _calldata_rebalance_plan(
+        client,
+        signer,
+        address,
+        positions,
+        rebalance_plan,
+        known,
+        config,
+        idempotency_store,
+    )
+    if not execute:
+        return RebalanceExecutionReport(
+            status="planned",
+            rebalance_plan=rebalance_plan,
+            policy_result=rebalance_plan.policy_result,
+            plan=built.plan,
+            preparations=built.preparation.preparations,
+            funding=built.preparation.funding,
+            messages=(
+                "dry-run only; no transactions broadcast",
+                *built.messages,
+                *built.preparation.messages,
+                *built.preparation.blockers,
+            ),
+        )
+
+    attribution_required = (
+        backend_from_config(config, needs="allocation_log_path") is not None
+    )
+    share_baselines = _share_balances(positions)
+    unobserved: list[str] = []
+
+    def log(bundle: TxBundle, receipt: Receipt) -> bundle_execution.BundleLog:
+        trade = rebalance_plan.trades[bundle.leg_index]
+        if bundle.action == "withdraw":
+            return bundle_execution.BundleLog(
+                action_type="sell",
+                usd=float(trade.usd),
+                shares=trade.yield_token_amount,
+            )
+        shares = None
+        if attribution_required:
+            if receipt.status == 1 and not receipt.pending:
+                shares = _settled_buy_delta(
+                    client,
+                    address,
+                    positions,
+                    bundle.instrument_id,
+                    bundle.chain_id,
+                    config,
+                    share_baselines,
+                )
+            if shares is None:
+                unobserved.append(
+                    f"buy cost basis is not yet observable: {bundle.instrument_id}; "
+                    "the allocation log records the USDC it spent without shares"
+                )
+        return bundle_execution.BundleLog(
+            action_type="buy",
+            usd=built.deposit_usd.get(bundle.leg_index),
+            shares=shares,
+        )
+
+    result = bundle_execution.execute_plan(
+        client,
+        signer,
+        built.plan,
+        stage="rebalance",
+        policy_result=rebalance_plan.policy_result,
+        completion_key=lambda bundle: _leg_key(bundle.leg_index, bundle.instrument_id),
+        log=log,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+    # Trades finished by an earlier run were never planned, but they are still
+    # complete; the checkpoint is a snapshot of the whole rebalance.
+    earlier = tuple(
+        key
+        for index, trade in enumerate(rebalance_plan.trades)
+        if (key := _leg_key(index, trade.instrument_id)) not in result.completed_keys
+        and _store_completed(idempotency_store, key)
+    )
+    report = RebalanceExecutionReport(
+        status=result.status,
+        rebalance_plan=rebalance_plan,
+        policy_result=rebalance_plan.policy_result,
+        plan=result.plan,
+        steps=result.steps,
+        receipts=result.receipts,
+        gas_checks=result.gas_checks,
+        preparations=result.preparations,
+        funding=result.funding,
+        in_progress=result.in_progress,
+        messages=(*built.messages, *result.messages, *unobserved),
+    )
+    _write_checkpoint(
+        config,
+        "rebalance",
+        report,
+        completed_keys=(*earlier, *result.completed_keys),
+    )
+    return report
+
+
+def _calldata_rebalance_plan(
+    client: object,
+    signer: Signer,
+    address: str,
+    positions: object,
+    plan: rebalance_core.RebalancePlan,
+    known: Sequence[Vault | Mapping[str, object]],
+    config: object | None,
+    idempotency_store: object | None,
+) -> _CalldataRebalancePlan:
+    """Withdrawals first, then deposits sized to what each chain will hold.
+
+    A deposit spends USDC on its vault's chain, funded by the Safe's balance
+    there plus the conservative proceeds (``min_out``, else ``expected_out``
+    less slippage) of the withdrawals on that chain. Proceeds are counted in
+    raw units, so a withdrawal that pays out slightly less than its position's
+    dollar value sizes the deposit down rather than leaving it underfunded.
+
+    Sizing absorbs only that gap and the paymaster's gas charge. A chain whose
+    buys need more than it holds plus its own sells' dollar value is either
+    cross-chain — another chain's sells free the money, which the calldata
+    path cannot bridge yet, so it is refused — or plainly underfunded, which is
+    left at full size for the funding check to report.
+    """
+    calldata.ensure_calldata_supported(config)
+    vaults_by_id = _vaults_by_id(known)
+    open_trades = [
+        (index, trade)
+        for index, trade in enumerate(plan.trades)
+        if not _store_completed(idempotency_store, _leg_key(index, trade.instrument_id))
+    ]
+    chain_order: dict[int, None] = {}
+
+    sells: dict[int, list[bundle_execution.PlannedBundle]] = {}
+    for index, trade in open_trades:
+        if trade.action != "sell":
+            continue
+        chain_id = _trade_chain(trade, positions, vaults_by_id)
+        if chain_id is None:
+            raise TransactionPlanError(
+                f"the chain of position {trade.instrument_id} is unknown"
+            )
+        if trade.calldata_amount is None:
+            raise calldata.CalldataAmountError(
+                f"cannot build a partial withdrawal of {trade.instrument_id}: the "
+                "position has no raw underlying balance or decimals, and a share "
+                "amount must never be sent as the calldata amount"
+            )
+        steps, bundle = calldata.request_bundle(
+            client,
+            instrument_id=trade.instrument_id,
+            action="withdraw",
+            account=address,
+            chain_id=chain_id,
+            amount=trade.calldata_amount,
+            leg_index=index,
+            first_step_index=0,
+            config=config,
+        )
+        chain_order[chain_id] = None
+        sells.setdefault(chain_id, []).append(
+            bundle_execution.PlannedBundle(bundle=bundle, steps=steps)
+        )
+
+    buys: dict[int, list[_CalldataBuy]] = {}
+    for index, trade in open_trades:
+        if trade.action != "buy":
+            continue
+        vault = vaults_by_id.get(trade.instrument_id)
+        if vault is None:
+            raise TransactionPlanError(
+                f"instrument {trade.instrument_id} is not in the discovered universe; "
+                "its chain and deposit token are unknown"
+            )
+        token = calldata.deposit_token(vault.chain_id, vaults_by_id.values(), config)
+        chain_order[vault.chain_id] = None
+        buys.setdefault(vault.chain_id, []).append(
+            _CalldataBuy(
+                index=index,
+                trade=trade,
+                chain_id=vault.chain_id,
+                token=token,
+                wanted_raw=amounts.to_raw_units(
+                    trade.usd, token.decimals, name="buy amount"
+                ),
+            )
+        )
+
+    idle_keys = {
+        chain_id: funding.key_for(chain_id, address, chain_buys[0].token.address)
+        for chain_id, chain_buys in buys.items()
+    }
+    read, _unread = funding.read_balances(idle_keys.values(), config)
+    # None when unreadable: such a chain is not sized, and the funding check
+    # reports the balance it could not read.
+    idle = {chain_id: read.get(key) for chain_id, key in idle_keys.items()}
+    slippage = funding.slippage_bps(config)
+    planned_proceeds: dict[int, int] = {}
+    safe_proceeds: dict[int, int] = {}
+    for chain_id, chain_sells in sells.items():
+        usdc = chains.usdc_address(chain_id, config)
+        for item in chain_sells:
+            bundle = item.bundle
+            if usdc is None or bundle.token_out.address.casefold() != usdc.casefold():
+                # Pays out in something a deposit cannot spend.
+                continue
+            planned_proceeds[chain_id] = planned_proceeds.get(
+                chain_id, 0
+            ) + amounts.to_raw_units(
+                plan.trades[bundle.leg_index].usd,
+                bundle.token_out.decimals,
+                name="sell amount",
+            )
+            safe_proceeds[chain_id] = safe_proceeds.get(
+                chain_id, 0
+            ) + funding.conservative_output(bundle, slippage)
+
+    def slack(chain_id: int) -> int:
+        # Each dollar-to-raw conversion rounds down by at most one unit.
+        return len(sells.get(chain_id, ())) + len(buys.get(chain_id, ()))
+
+    short: dict[int, int] = {}
+    surplus: dict[int, int] = {}
+    for chain_id in chain_order:
+        proceeds = planned_proceeds.get(chain_id, 0)
+        if chain_id not in buys:
+            surplus[chain_id] = proceeds
+            continue
+        held = idle[chain_id]
+        if held is None:
+            continue
+        wanted = sum(buy.wanted_raw for buy in buys[chain_id])
+        gap = wanted - held - proceeds
+        if gap > slack(chain_id):
+            short[chain_id] = gap
+        else:
+            surplus[chain_id] = min(proceeds, proceeds - gap)
+    for chain_id, gap in short.items():
+        elsewhere = [
+            other
+            for other, amount in surplus.items()
+            if other != chain_id and amount > slack(other)
+        ]
+        if elsewhere:
+            raise calldata.CalldataUnsupportedError(
+                f"cross-chain rebalance: buys on {_chain_label(chain_id)} need "
+                f"{gap} raw units of USDC more than the Safe holds there plus "
+                "the proceeds of its sells there, while sells on "
+                f"{', '.join(_chain_label(other) for other in elsewhere)} pay "
+                "out on another chain; bridging is not supported by the calldata "
+                "API path yet"
+            )
+
+    def sized(reserve: Mapping[int, int]) -> tuple[dict[int, int], list[str]]:
+        sizes: dict[int, int] = {}
+        notes: list[str] = []
+        for chain_id, chain_buys in buys.items():
+            held = idle[chain_id]
+            if held is None or chain_id in short:
+                sizes.update((buy.index, buy.wanted_raw) for buy in chain_buys)
+                continue
+            budget = held + safe_proceeds.get(chain_id, 0) - reserve.get(chain_id, 0)
+            for buy in chain_buys:
+                size = max(0, min(buy.wanted_raw, budget))
+                budget -= size
+                sizes[buy.index] = size
+                if size < buy.wanted_raw:
+                    notes.append(_sized_note(buy, size, reserved=chain_id in reserve))
+        return sizes, notes
+
+    deposits: dict[tuple[int, int], bundle_execution.PlannedBundle] = {}
+
+    def deposit(buy: _CalldataBuy, size: int) -> bundle_execution.PlannedBundle:
+        # A size seen before reuses its bundle, so fitting the paymaster charge
+        # re-requests only the deposits it actually changed.
+        if (buy.index, size) not in deposits:
+            steps, bundle = calldata.request_bundle(
+                client,
+                instrument_id=buy.trade.instrument_id,
+                action="deposit",
+                account=address,
+                chain_id=buy.chain_id,
+                amount=str(size),
+                leg_index=buy.index,
+                first_step_index=0,
+                config=config,
+                token=buy.token,
+            )
+            deposits[(buy.index, size)] = bundle_execution.PlannedBundle(
+                bundle=bundle, steps=steps
+            )
+        return deposits[(buy.index, size)]
+
+    reserve: dict[int, int] = {}
+    for _attempt in range(_MAX_CALLDATA_PREPARATIONS):
+        sizes, notes = sized(reserve)
+        ordered: list[bundle_execution.PlannedBundle] = []
+        for chain_id in chain_order:
+            # 🔑 Sells before buys on each chain, and each chain contiguous: the
+            # signer merges consecutive same-chain bundles into one operation.
+            ordered.extend(sells.get(chain_id, ()))
+            ordered.extend(
+                deposit(buy, sizes[buy.index])
+                for buy in buys.get(chain_id, ())
+                if sizes[buy.index] > 0
+            )
+        withdrawals = sum(len(items) for items in sells.values())
+        tx_plan = bundle_execution.assemble_plan(
+            ordered,
+            f"Same-chain rebalance from calldata bundles: {withdrawals} withdrawals "
+            f"before {len(ordered) - withdrawals} deposits across "
+            f"{sum(len(item.steps) for item in ordered)} transaction steps",
+        )
+        preparation = bundle_execution.prepare_plan(
+            signer, tx_plan, config, idempotency_store
+        )
+        grown = dict(reserve)
+        for item in preparation.funding:
+            chain_buys = buys.get(item.chain_id, ())
+            if (
+                item.ok
+                or not item.includes_gas_charge
+                or item.available_raw is None
+                or not chain_buys
+                or item.chain_id in short
+                or idle[item.chain_id] is None
+                or item.token.casefold() != chain_buys[0].token.address.casefold()
+                or not any(sizes[buy.index] > 0 for buy in chain_buys)
+            ):
+                continue
+            grown[item.chain_id] = grown.get(item.chain_id, 0) + int(item.shortfall_raw)
+        if grown == reserve:
+            break
+        reserve = grown
+
+    return _CalldataRebalancePlan(
+        plan=tx_plan,
+        preparation=preparation,
+        messages=tuple(notes),
+        deposit_usd={
+            buy.index: float(
+                amounts.from_raw_units(sizes[buy.index], buy.token.decimals)
+            )
+            for chain_buys in buys.values()
+            for buy in chain_buys
+            if sizes[buy.index] > 0
+        },
+    )
+
+
+def _sized_note(buy: _CalldataBuy, size: int, *, reserved: bool) -> str:
+    wanted = amounts.from_raw_units(buy.wanted_raw, buy.token.decimals)
+    fits = (
+        f"the USDC {_chain_label(buy.chain_id)} will hold — its balance plus its "
+        "sells' minimum proceeds"
+        + (", less the paymaster's maximum gas charge" if reserved else "")
+    )
+    if size == 0:
+        return (
+            f"buy {buy.trade.instrument_id} of {wanted} USDC skipped: none fits {fits}"
+        )
+    return (
+        f"buy {buy.trade.instrument_id} sized to "
+        f"{amounts.from_raw_units(size, buy.token.decimals)} of {wanted} USDC to fit "
+        f"{fits}"
+    )
+
+
+def _chain_label(chain_id: int) -> str:
+    return f"{chains.chain_name(chain_id)} (chain {chain_id})"
 
 
 # 1Tx holds back roughly this much USDC per chain to sponsor gas. Measured on
@@ -514,7 +950,8 @@ def _broadcast(
                             client,
                             address,
                             initial_positions,
-                            ref,
+                            ref.instrument_id,
+                            ref.settlement_chain_id or ref.step.chain_id,
                             config,
                             share_baselines,
                         )
@@ -589,7 +1026,8 @@ def _broadcast(
                 client,
                 address,
                 initial_positions,
-                ref,
+                ref.instrument_id,
+                ref.settlement_chain_id or ref.step.chain_id,
                 config,
                 share_baselines,
             )
@@ -654,7 +1092,8 @@ def _settled_buy_delta(
     client: object,
     address: str,
     initial_positions: object,
-    ref: _StepRef,
+    instrument_id: str,
+    chain_id: int,
     config: object | None,
     share_baselines: dict[str, Decimal],
 ) -> str | None:
@@ -663,8 +1102,8 @@ def _settled_buy_delta(
     if not callable(read):
         return None
     baseline = share_baselines.get(
-        ref.instrument_id,
-        _share_balance(initial_positions, ref.instrument_id) or Decimal("0"),
+        instrument_id,
+        _share_balance(initial_positions, instrument_id) or Decimal("0"),
     )
     attempts_value = _config_value(config, "position_settlement_attempts")
     try:
@@ -672,17 +1111,12 @@ def _settled_buy_delta(
     except (TypeError, ValueError):
         attempts = 1
     for attempt in range(attempts):
-        response = read(
-            {
-                "address": address,
-                "chainId": ref.settlement_chain_id or ref.step.chain_id,
-            }
-        )
-        observed = _share_balance(response, ref.instrument_id)
+        response = read({"address": address, "chainId": chain_id})
+        observed = _share_balance(response, instrument_id)
         if observed is not None:
             delta = observed - baseline
             if delta > 0:
-                share_baselines[ref.instrument_id] = observed
+                share_baselines[instrument_id] = observed
                 return format(delta, "f")
             if delta < 0:
                 return None

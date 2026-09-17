@@ -52,6 +52,25 @@ wallet is funded on, in this precedence (`exec/execute.py:_source_chain_id` →
 > balance` instead of bridging. This was a real bug; the balance-aware default
 > fixes it. Rebalance buys use the same path (`exec/rebalance.py`).
 
+### With the calldata API (`ONE_TX_TRANSACTION_API=calldata`)
+
+The calldata path does not bridge yet: every bundle executes on its
+instrument's own chain, from the Safe's USDC there.
+
+- **Deposits** are built on the vault's chain; a leg pinned to another source
+  chain is refused.
+- **Rebalances** fund each chain's buys from that chain alone: the Safe's USDC
+  there plus the conservative proceeds (`minOut`, else `expectedOut` less
+  `slippage_bps`) of the sells on the same chain. Each chain's sells and buys go
+  out as one atomic Safe operation, sells first, so no staging or settle wait
+  is needed. A buy is sized down only to absorb the gap between a sell's dollar
+  value and its conservative proceeds, plus the paymaster's maximum gas charge;
+  the dry run names every buy it sized down.
+- A rebalance whose buys on one chain need proceeds from sells on another is
+  **refused as cross-chain** until client-side CCTP lands. One that needs more
+  money than the chain holds and sells is left at full size and reported as a
+  funding shortfall, which blocks execution.
+
 ## What a wallet actually needs
 
 For a normal (`local-eoa`) self-custody wallet:

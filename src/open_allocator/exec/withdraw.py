@@ -347,7 +347,7 @@ def _execute_calldata_withdraw(
         stage="withdraw",
         policy_result=_ok_policy_result(),  # type: ignore[arg-type]
         completion_key=lambda _bundle: withdraw_key,
-        log=lambda _bundle: bundle_execution.BundleLog(
+        log=lambda _bundle, _receipt: bundle_execution.BundleLog(
             action_type="withdraw",
             shares=withdraw_plan.yield_token_amount,
             share_price=withdraw_plan.share_price_usd,
