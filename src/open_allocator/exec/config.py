@@ -103,6 +103,25 @@ class AllocatorConfig(BaseSettings):
         ge=0,
         validation_alias="ONE_TX_MIN_CALLDATA_TTL_SECONDS",
     )
+    # Circle's attestation service, which a bridged leg's destination waits on.
+    # Injectable so tests and sandboxes can point it elsewhere.
+    circle_iris_api_url: str = Field(
+        "https://iris-api.circle.com",
+        validation_alias="CIRCLE_IRIS_API_URL",
+    )
+    # Per HTTP request to Circle. These bound one readiness check, not the wait
+    # for an attestation: an unready one returns in_progress and a rerun of the
+    # same command checks again.
+    circle_http_timeout_seconds: float = Field(
+        10.0,
+        gt=0,
+        validation_alias="CIRCLE_HTTP_TIMEOUT_SECONDS",
+    )
+    circle_http_max_retries: int = Field(
+        2,
+        ge=0,
+        validation_alias="CIRCLE_HTTP_MAX_RETRIES",
+    )
     referral_fee_bps: int = Field(
         0,
         ge=0,

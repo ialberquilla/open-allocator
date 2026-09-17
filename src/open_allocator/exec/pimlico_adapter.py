@@ -28,6 +28,7 @@ from open_allocator.exec.paymaster_types import (
     PaymasterUserOperationSubmission,
     PreparedUserOperation,
     UserOperationGas,
+    UserOperationReverted,
     UserOperationSimulationReverted,
 )
 from open_allocator.exec.pimlico import (
@@ -235,6 +236,24 @@ class PimlicoUserOperationAdapter:
                 f"{self._inclusion_timeout_s:.0f}s",
             )
         return _submission_from_receipt(user_op_hash, included, message)
+
+    def user_operation_receipt(
+        self,
+        chain_id: int,
+        user_op_hash: str,
+    ) -> PaymasterUserOperationSubmission | None:
+        """An earlier operation's inclusion, or None while it is still pending.
+
+        Raises ``PaymasterError`` when it was included and reverted.
+        """
+        included = self._paymaster(chain_id).receipt(user_op_hash)
+        if included is None:
+            return None
+        return _submission_from_receipt(
+            user_op_hash,
+            included,
+            f"user operation included on {chains.chain_name(chain_id)}",
+        )
 
     def _prepare(
         self,
@@ -482,7 +501,7 @@ def _submission_from_receipt(
         # Included and reverted still costs the user gas, so it must not read as
         # a success anywhere downstream.
         reason = receipt.get("reason") or "no reason given"
-        raise PaymasterError(
+        raise UserOperationReverted(
             f"user operation {user_op_hash} reverted on chain: {reason}"
         )
     return PaymasterUserOperationSubmission(

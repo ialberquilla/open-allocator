@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-allocator.local/schemas/bridge-state.schema.json",
+  "title": "BridgeState",
+  "description": "The persisted state of one bridged (CCTP) calldata deposit leg.",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "leg_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "leg_index": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "instrument_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "bridge_planned",
+        "source_submitted",
+        "awaiting_attestation",
+        "destination_ready",
+        "destination_submitted",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "account": {
+      "type": "string"
+    },
+    "source_chain_id": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "destination_chain_id": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_domain": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "destination_domain": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "source_token": {
+      "type": "string"
+    },
+    "source_token_messenger": {
+      "type": "string"
+    },
+    "burn_amount_raw": {
+      "pattern": "^[1-9]\\d*$",
+      "type": "string"
+    },
+    "max_fee_raw": {
+      "pattern": "^\\d+$",
+      "type": "string"
+    },
+    "min_finality_threshold": {
+      "enum": [
+        1000,
+        2000
+      ],
+      "type": "integer"
+    },
+    "fast": {
+      "type": "boolean"
+    },
+    "wanted_deposit_raw": {
+      "pattern": "^\\d+$",
+      "type": "string"
+    },
+    "source_bundle_id": {
+      "type": "string"
+    },
+    "source_bundle_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "burn_index": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "burns_in_operation": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_operation_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_transaction_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_message_transmitter": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_log_index": {
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "source_message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message_ordinal": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "attestation_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delay_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nonce": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "attestation": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fee_executed_raw": {
+      "pattern": "^\\d+$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "net_mint_raw": {
+      "pattern": "^\\d+$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expiration_block": {
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "destination_bundle_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "deposit_amount_raw": {
+      "pattern": "^\\d+$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_operation_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_transaction_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "updated_at": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "leg_id",
+    "leg_index",
+    "instrument_id",
+    "state",
+    "account",
+    "source_chain_id",
+    "destination_chain_id",
+    "source_domain",
+    "destination_domain",
+    "source_token",
+    "source_token_messenger",
+    "burn_amount_raw",
+    "max_fee_raw",
+    "min_finality_threshold",
+    "fast",
+    "wanted_deposit_raw",
+    "source_bundle_id",
+    "source_bundle_digest",
+    "created_at",
+    "updated_at"
+  ],
+  "type": "object"
+}

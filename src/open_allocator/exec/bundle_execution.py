@@ -97,6 +97,10 @@ class Operation:
         return tuple(item.bundle.bundle_id for item in self.bundles)
 
 
+# Called with a submitted bundle, the operation that carried it, and its receipt.
+SubmittedHook = Callable[[PlannedBundle, Operation, Receipt | None], None]
+
+
 class PlanPreparation(FrozenModel):
     """What a dry run can say about executing a plan with this signer."""
 
@@ -301,10 +305,11 @@ def execute_plan(
     stage: Literal["execute", "withdraw", "rebalance"],
     policy_result: policy_core.PolicyResult,
     completion_key: Callable[[TxBundle], str],
-    log: Callable[[TxBundle, Receipt], BundleLog],
+    log: Callable[[TxBundle, Receipt], BundleLog | None],
     config: object | None = None,
     idempotency_store: object | None = None,
     clock: Callable[[], float] = time.time,
+    on_submitted: SubmittedHook | None = None,
 ) -> BundleExecution:
     """Submit a calldata plan, one wallet operation at a time.
 
@@ -312,7 +317,9 @@ def execute_plan(
     Bundles within ``ONE_TX_MIN_CALLDATA_TTL_SECONDS`` of expiry are rebuilt
     right before signing. ``completion_key`` names the leg a bundle serves and
     is marked on submission; ``log`` is called once per bundle with the receipt
-    of the operation that carried it.
+    of the operation that carried it, and a None entry logs nothing.
+    ``on_submitted`` sees each bundle, its operation, and that receipt before
+    any completion is marked, so what it records is durable first.
     """
     bundles = planned_bundles(plan)
     if not bundles:
@@ -440,6 +447,7 @@ def execute_plan(
                             config,
                             completion_key,
                             log,
+                            on_submitted=_bound(on_submitted, operation),
                         )
                     )
             else:
@@ -478,6 +486,7 @@ def execute_plan(
                             config,
                             completion_key,
                             log,
+                            on_submitted=_bound(on_submitted, operation),
                         )
                     )
         except Exception as error:
@@ -703,15 +712,19 @@ def _complete(
     store: object | None,
     config: object | None,
     completion_key: Callable[[TxBundle], str],
-    log: Callable[[TxBundle, Receipt], BundleLog],
+    log: Callable[[TxBundle, Receipt], BundleLog | None],
+    *,
+    on_submitted: Callable[[PlannedBundle, Receipt | None], None] | None = None,
 ) -> tuple[str, ...]:
     """Mark a submitted bundle and its leg; log it once, not once per call."""
     bundle = item.bundle
     leg_key = completion_key(bundle)
+    if on_submitted is not None:
+        on_submitted(item, receipt)
     _store_mark_completed(store, item.key, receipt)
     _store_mark_completed(store, leg_key, True)
-    if receipt is not None:
-        entry = log(bundle, receipt)
+    entry = None if receipt is None else log(bundle, receipt)
+    if receipt is not None and entry is not None:
         # The bundle's final call is the one it exists for; approvals and swaps
         # before it only clear the way.
         _append_allocation_log(
@@ -766,6 +779,15 @@ def _step_report(
     )
 
 
+def _bound(
+    hook: SubmittedHook | None,
+    operation: Operation,
+) -> Callable[[PlannedBundle, Receipt | None], None] | None:
+    if hook is None:
+        return None
+    return lambda item, receipt: hook(item, operation, receipt)
+
+
 def _bundles_of(pending: Sequence[Operation]) -> list[PlannedBundle]:
     return [item for operation in pending for item in operation.bundles]
 
@@ -777,6 +799,7 @@ __all__ = [
     "PlanPreparation",
     "PlannedBundle",
     "SubmissionModeError",
+    "SubmittedHook",
     "UnderfundedPlanError",
     "assemble_plan",
     "execute_plan",

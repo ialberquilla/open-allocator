@@ -23,6 +23,10 @@ class PaymasterRejected(PaymasterError):
     pass
 
 
+class UserOperationReverted(PaymasterError):
+    """A submitted operation was included and reverted; none of its calls stuck."""
+
+
 class PaymasterPreparationUnavailable(PaymasterError):
     """The adapter can submit an operation but cannot prepare one unsent."""
 

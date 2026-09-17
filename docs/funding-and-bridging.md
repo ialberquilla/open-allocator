@@ -54,16 +54,29 @@ wallet is funded on, in this precedence (`exec/execute.py:_source_chain_id` →
 
 ### With the calldata API (`ONE_TX_TRANSACTION_API=calldata`)
 
-The calldata path does not bridge yet: every bundle executes on its
-instrument's own chain, from the Safe's USDC there.
+1Tx's calldata API builds same-chain bundles and a separate CCTP source burn; it
+does not settle a destination. The allocator does that itself (`exec/bridge.py`).
 
-- **Deposits** are built on the vault's chain, from the Safe's USDC there; a
-  leg pinned to another source chain is refused, and USDC held only on another
-  chain is not bridged in. Each chain's deposits go out as one Safe operation.
-  A deposit is sized down only to leave the paymaster's maximum gas charge in
-  the Safe, and the dry run names every deposit it sized down. A chain that
-  holds less than its deposits by more than that is left at full size and
-  reported as a funding shortfall, which blocks execution.
+- **Deposits** are built on the vault's chain from the Safe's USDC there when
+  that chain holds enough. Otherwise the leg is **bridged**: the source is the
+  pinned `source_chain_id` (allocation metadata) when set, else the best-funded
+  CCTP chain in 1Tx's `GET /cctp/config` whose USDC covers the leg, read on
+  chain, legs taken in order. A leg nothing covers stays on its chain and is
+  reported as a funding shortfall. Each chain's deposits and burns go out as one
+  Safe operation. A deposit or burn is sized down only to leave the paymaster's
+  maximum gas charge in the Safe, and the dry run names every one it sized down.
+- **A bridged leg takes several runs of `execute --confirm`.** The burn is sent
+  with its source chain's operation. Each later run checks, once, whether Circle
+  has attested it (`in_progress` until then), and when it has, requests fresh
+  deposit calldata and sends `MessageTransmitterV2.receiveMessage` followed by
+  the deposit as **one destination operation**. The deposit is the smaller of
+  the leg and the Safe's destination USDC plus the attested mint, less the
+  paymaster's maximum charge; Circle's fee comes out of the mint. The leg is
+  complete only once that operation is included.
+- **Needs** `SIGNER_SUBMISSION=erc4337-paymaster` with a provider that estimates
+  operations and bounds their charge (`PAYMASTER_PROVIDER=pimlico`): the
+  destination operation pays its gas out of the mint. Any other signer refuses a
+  pinned cross-chain leg and never routes one.
 - **Rebalances** fund each chain's buys from that chain alone: the Safe's USDC
   there plus the conservative proceeds (`minOut`, else `expectedOut` less
   `slippage_bps`) of the sells on the same chain. Each chain's sells and buys go
@@ -72,9 +85,53 @@ instrument's own chain, from the Safe's USDC there.
   value and its conservative proceeds, plus the paymaster's maximum gas charge;
   the dry run names every buy it sized down.
 - A rebalance whose buys on one chain need proceeds from sells on another is
-  **refused as cross-chain** until client-side CCTP lands. One that needs more
-  money than the chain holds and sells is left at full size and reported as a
-  funding shortfall, which blocks execution.
+  still **refused as cross-chain**. One that needs more money than the chain
+  holds and sells is left at full size and reported as a funding shortfall,
+  which blocks execution.
+
+#### Bridged legs, step by step
+
+Each leg's progress is a record in the run's idempotency store under
+`bridge:leg:<index>:<instrument>`, validated by
+[bridge-state.schema.json](../src/open_allocator/schemas/bridge-state.schema.json)
+and copied into every `execute` report's `bridges`:
+
+| State | Meaning | A rerun |
+| --- | --- | --- |
+| `bridge_planned` | Burn built, not yet sent | Plans the leg afresh |
+| `source_submitted` | Burn operation sent | Looks the operation up; never resends it |
+| `awaiting_attestation` | Burn found in its transaction's `MessageSent` log | Asks Circle once |
+| `destination_ready` | Attestation checked against the burn | Builds and sends receive + deposit |
+| `destination_submitted` | Destination operation sent | Reconciles it; never resends it |
+| `completed` | Destination included, or its nonce already used | Nothing |
+| `failed` | Burn or attestation did not match; or the burn reverted | Nothing, unless the burn reverted, which replans |
+
+What is checked, and what happens when something goes wrong:
+
+- **Before the burn is sent**, its calldata is decoded: the approval, amount,
+  token, `mintRecipient` and `destinationCaller` (both the Safe), destination
+  domain, `maxFee`, and finality must match 1Tx's response, and the messenger
+  and domains must match 1Tx's CCTP configuration.
+- **The burn is identified** from the source receipt's `MessageSent` logs,
+  emitted by the configured MessageTransmitter and sent by the Safe, in call
+  order. Other accounts' burns in the same bundler transaction are ignored.
+- **An attestation is used only** when Circle's message is the source message
+  with only nonce, executed finality, executed fee, and expiration filled in,
+  and every field matches the burn, the executed fee is at most `maxFee`, and
+  the executed finality meets the requested one. A mismatch fails the leg; it
+  is never redeemed automatically.
+- **A destination deposit that reverts** reverts `receiveMessage` with it, so
+  the CCTP nonce stays unused; the leg stays `destination_ready`, the report is
+  `failed` with the reason, and a rerun rebuilds with fresh calldata.
+- **An expired attestation** is re-attested through Circle's
+  `POST /v2/reattest/{nonce}`; nothing is burned again.
+- **A nonce already used** on the destination completes the leg without a
+  second redemption, and the report says how much USDC the Safe holds there, so
+  `positions` can confirm whether it was deposited.
+
+Circle is `CIRCLE_IRIS_API_URL` (production by default); each check is bounded
+by `CIRCLE_HTTP_TIMEOUT_SECONDS` and `CIRCLE_HTTP_MAX_RETRIES`, not by the
+attestation wait.
 
 ## What a wallet actually needs
 
@@ -101,7 +158,10 @@ executable only when both are present.
 A complete execution announcement (see [AGENT_GUIDE.md](../AGENT_GUIDE.md)) must
 name the **source chain(s)** the USDC comes from, the **destination chain(s)** the
 instruments live on, whether any leg **bridges**, and the **native-gas assets**
-required on each chain that will be signed. A bridged leg is handed to 1Tx once its
-source-chain transaction lands; 1Tx settles the destination mint. Confirm the landed
-position with `positions` rather than re-running the leg — checkpoint and resume
-idempotently, never blind-retry.
+required on each chain that will be signed. On the legacy API a bridged leg is handed
+to 1Tx once its source-chain transaction lands; 1Tx settles the destination mint.
+On the calldata API the allocator settles it: announce that the leg bridges, from
+and to which chain, that its deposit is built only after Circle attests and is
+sized to the mint less Circle's fee and the destination paymaster charge, and that
+`execute --confirm` must be rerun until the leg's `bridges` state is `completed`.
+Either way, checkpoint and resume idempotently, never blind-retry.

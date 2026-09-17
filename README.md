@@ -252,7 +252,7 @@ flowchart LR
 
 Net effect: **fund one chain**. Deposits bridge out, exits pay their own way back, and no chain ever needs native gas.
 
-A cross-chain buy has two legs with one owner each. The allocator signs, submits, and reports the **source-chain** leg — `execute` returns once that transaction lands. Relaying the CCTP message and minting on the far side is **1Tx's to settle**; the allocator does not poll the bridge by design. Read what actually landed with `positions`. An operation that has settled nothing — a bundler hasn't included the user-op, a Safe is awaiting signatures — reports `in_progress`, never `success`.
+A cross-chain buy has two legs with one owner each. The allocator signs, submits, and reports the **source-chain** leg — `execute` returns once that transaction lands. Relaying the CCTP message and minting on the far side is **1Tx's to settle**; the allocator does not poll the bridge by design. With `ONE_TX_TRANSACTION_API=calldata` the allocator settles it instead: rerunning the same `execute --confirm` checks Circle's attestation and, once it is ready, redeems and deposits on the destination in one Safe operation ([details](docs/funding-and-bridging.md#with-the-calldata-api-one_tx_transaction_apicalldata)). Read what actually landed with `positions`. An operation that has settled nothing — a bundler hasn't included the user-op, a Safe is awaiting signatures — reports `in_progress`, never `success`.
 
 This path has been exercised end to end on Base and Arbitrum mainnet. The model, the traps, and its known limits are in [docs/gasless-execution.md](docs/gasless-execution.md).
 

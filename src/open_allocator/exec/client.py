@@ -533,6 +533,26 @@ class BridgeCalldataResponse(OneTxExecutionModel):
         return self
 
 
+class CctpChainConfig(OneTxModel):
+    """One chain 1Tx routes CCTP V2 through, with its Circle contracts."""
+
+    chain_id: ChainId = Field(alias="chainId")
+    name: str
+    cctp_domain: int = Field(alias="cctpDomain", strict=True, ge=0)
+    token_messenger: EvmAddress = Field(alias="tokenMessenger")
+    message_transmitter: EvmAddress = Field(alias="messageTransmitter")
+
+
+class CctpConfigResponse(OneTxModel):
+    supported_chains: tuple[CctpChainConfig, ...] = Field(alias="supportedChains")
+
+    def chain(self, chain_id: int) -> CctpChainConfig | None:
+        return next(
+            (item for item in self.supported_chains if item.chain_id == chain_id),
+            None,
+        )
+
+
 class OneTxClientError(RuntimeError):
     pass
 
@@ -675,6 +695,15 @@ class OneTxClient:
             query=request.model_dump(by_alias=True, exclude_none=True),
         )
         return _parse_execution_response(BridgeCalldataResponse, payload, path)
+
+    def cctp_config(self) -> CctpConfigResponse:
+        payload = self._request_json("GET", "/cctp/config")
+        try:
+            return CctpConfigResponse.model_validate(payload)
+        except ValidationError as error:
+            raise OneTxDecodeError(
+                f"GET /cctp/config returned an unusable CCTP configuration: {error}"
+            ) from error
 
     def positions(self, body: Mapping[str, object]) -> PositionsResponse:
         payload = self._request_json("GET", "/positions", query=_aliases(body))

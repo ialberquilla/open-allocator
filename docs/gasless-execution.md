@@ -100,6 +100,19 @@ the operation's maximum charge, they are rebuilt
 smaller by the shortfall and the operation is prepared again, at most three
 times. A shortfall still standing after that is reported, not guessed around.
 
+📍 **A bridged calldata deposit pays its destination gas out of its own mint.**
+The Safe may hold nothing on the destination chain, so the operation that
+redeems the CCTP message and deposits is funded by the mint it redeems: the
+funding check credits the attested net mint and reserves the bounded charge
+after it, and the deposit is rebuilt smaller until the charge fits, at most
+three preparations. An operation whose charge the adapter cannot bound is not
+submitted — a flat USDC reserve would be a guess — so cross-chain calldata
+deposits need an adapter that bounds it (`PAYMASTER_PROVIDER=pimlico`). Unlike
+the legacy receiver, nothing mints to a third party first: `receiveMessage`
+and the deposit are one Safe operation, so a reverting deposit leaves the CCTP
+message unredeemed rather than idle USDC. The destination operation deploys the
+Safe there when it is counterfactual.
+
 📍 **A calldata plan carries two gas numbers, and they are different
 measurements.** Each bundle's `protocol_gas` is 1Tx's simulation of the bare
 calls under its ephemeral, wallet-neutral executor (`simulation.scope =

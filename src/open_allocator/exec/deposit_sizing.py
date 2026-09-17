@@ -6,6 +6,10 @@ them on that chain, and are sized down only for proceeds rounding and the
 paymaster's maximum gas charge. A chain that needs more than that is left at
 full size, so the funding check reports the shortfall instead of a quietly
 smaller deposit.
+
+A bridged leg is sized the same way on its source chain: its CCTP burn spends
+that chain's USDC, and the deposit it funds is built on the destination only
+once Circle attests the burn (``exec.bridge``).
 """
 
 from __future__ import annotations
@@ -32,6 +36,9 @@ class DepositRequest:
     chain_id: int
     token: calldata.DepositToken
     wanted_raw: int
+    # Set for a bridged leg: ``chain_id`` and ``token`` are then the burn's
+    # source chain and its USDC, and this is the chain the leg deposits on.
+    bridge_to_chain_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -164,7 +171,22 @@ def fit(
     def deposit(buy: DepositRequest, size: int) -> bundle_execution.PlannedBundle:
         # A size seen before reuses its bundle, so fitting the paymaster charge
         # re-requests only the deposits it actually changed.
-        if (buy.index, size) not in built:
+        if (buy.index, size) not in built and buy.bridge_to_chain_id is not None:
+            steps, bundle = calldata.request_bridge_bundle(
+                client,
+                instrument_id=buy.instrument_id,
+                from_chain_id=buy.chain_id,
+                to_chain_id=buy.bridge_to_chain_id,
+                account=address,
+                amount=str(size),
+                leg_index=buy.index,
+                token=buy.token,
+                config=config,
+            )
+            built[(buy.index, size)] = bundle_execution.PlannedBundle(
+                bundle=bundle, steps=steps
+            )
+        elif (buy.index, size) not in built:
             steps, bundle = calldata.request_bundle(
                 client,
                 instrument_id=buy.instrument_id,
@@ -245,15 +267,20 @@ def _sized_note(
     reserved: bool,
 ) -> str:
     wanted = amounts.from_raw_units(buy.wanted_raw, buy.token.decimals)
+    what = (
+        f"bridge for buy {buy.instrument_id}"
+        if buy.bridge_to_chain_id is not None
+        else f"buy {buy.instrument_id}"
+    )
     fits = (
         f"the USDC {chain_label(buy.chain_id)} will hold — its balance"
         + (" plus its sells' minimum proceeds" if with_sells else "")
         + (", less the paymaster's maximum gas charge" if reserved else "")
     )
     if size == 0:
-        return f"buy {buy.instrument_id} of {wanted} USDC skipped: none fits {fits}"
+        return f"{what} of {wanted} USDC skipped: none fits {fits}"
     return (
-        f"buy {buy.instrument_id} sized to "
+        f"{what} sized to "
         f"{amounts.from_raw_units(size, buy.token.decimals)} of {wanted} USDC to fit "
         f"{fits}"
     )

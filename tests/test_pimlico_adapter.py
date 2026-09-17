@@ -32,7 +32,10 @@ from open_allocator.exec.erc4337_paymaster import (
     UserOperationCall,
     _adapter_from_config,
 )
-from open_allocator.exec.paymaster_types import UserOperationSimulationReverted
+from open_allocator.exec.paymaster_types import (
+    UserOperationReverted,
+    UserOperationSimulationReverted,
+)
 from open_allocator.exec.pimlico import PimlicoError
 from open_allocator.exec.pimlico_adapter import (
     PimlicoUserOperationAdapter,
@@ -1200,3 +1203,48 @@ def test_allowances_observed_on_mainnet_count_as_unlimited() -> None:
     ):
         _adapter(endpoint, allowance=standing).submit_user_operation(_request())
         assert "095ea7b3" not in endpoint.sent_user_op()["callData"]
+
+
+# --- looking an operation up later ------------------------------------------
+
+
+def test_an_earlier_operation_is_looked_up_by_hash() -> None:
+    signer = Erc4337PaymasterSigner(
+        adapter=_adapter(FakeEndpoint()), account_type="safe", usdc_address=USDC
+    )
+
+    receipt = signer.operation_receipt(BASE, USER_OP_HASH)
+
+    assert signer.supports_cross_chain()
+    assert receipt is not None
+    assert not receipt.pending
+    assert receipt.transaction_hash == TX_HASH
+    assert receipt.safe_tx_hash == USER_OP_HASH
+
+
+def test_an_operation_not_yet_included_has_no_receipt() -> None:
+    signer = Erc4337PaymasterSigner(
+        adapter=_adapter(FakeEndpoint(eth_getUserOperationReceipt=None)),
+        usdc_address=USDC,
+    )
+
+    assert signer.operation_receipt(BASE, USER_OP_HASH) is None
+
+
+def test_an_operation_that_reverted_on_chain_says_so_by_type() -> None:
+    endpoint = FakeEndpoint(
+        eth_getUserOperationReceipt={
+            "userOpHash": USER_OP_HASH,
+            "success": False,
+            "reason": "boom",
+            "receipt": {"transactionHash": TX_HASH},
+        }
+    )
+    signer = Erc4337PaymasterSigner(adapter=_adapter(endpoint), usdc_address=USDC)
+
+    with pytest.raises(UserOperationReverted):
+        signer.operation_receipt(BASE, USER_OP_HASH)
+
+
+def test_an_adapter_that_cannot_estimate_cannot_carry_a_bridge() -> None:
+    assert not Erc4337PaymasterSigner(adapter=object()).supports_cross_chain()

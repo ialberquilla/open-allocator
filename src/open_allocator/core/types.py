@@ -207,6 +207,26 @@ class BundleLeftover(FrozenModel):
     max_amount: str = Field(pattern=r"^\d+$")
 
 
+class BundleBridge(FrozenModel):
+    """The CCTP transfer a ``bridge`` bundle's burn commits to.
+
+    The burn happens on the bundle's chain; the mint lands on ``to_chain_id``
+    only after Circle attests the message, in a separate operation.
+    """
+
+    to_chain_id: int = Field(ge=1)
+    source_domain: int = Field(ge=0)
+    destination_domain: int = Field(ge=0)
+    # Raw source USDC Circle may keep from the burned amount.
+    max_fee: str = Field(pattern=r"^\d+$")
+    # 1000 is CCTP Fast Transfer, 2000 is Standard.
+    min_finality_threshold: Literal[1000, 2000]
+    fast: bool
+
+
+BundleAction: TypeAlias = Literal["deposit", "withdraw", "bridge", "cctp_receive"]
+
+
 class TxBundle(FrozenModel):
     """One atomic calldata bundle as it was quoted, bound to its plan steps.
 
@@ -214,23 +234,30 @@ class TxBundle(FrozenModel):
     together. ``protocol_gas`` is 1Tx's wallet-neutral simulation of those bare
     calls; it is not the Safe/UserOperation gas, which is estimated separately
     and never reported as the same measurement.
+
+    ``bridge`` bundles are 1Tx's CCTP source burn for a leg deposited on another
+    chain. ``cctp_receive`` bundles are composed here, not by 1Tx: the attested
+    redemption that funds a bridged leg's deposit in the same operation. They
+    carry no protocol simulation.
     """
 
     # Stable across rebuilds of a leg; ``digest`` changes with the calls.
     bundle_id: str = Field(min_length=1)
     digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     leg_index: int = Field(ge=0)
+    # For a bridge or receive bundle, the instrument the bridged leg deposits in.
     instrument_id: str = Field(min_length=1)
-    action: Literal["deposit", "withdraw"]
+    action: BundleAction
     account: str
     chain_id: int = Field(ge=1)
     step_indexes: tuple[int, ...] = Field(min_length=1)
-    source: Literal["1tx-calldata"] = "1tx-calldata"
+    source: Literal["1tx-calldata", "open-allocator"] = "1tx-calldata"
     endpoint: str = Field(min_length=1)
     # Raw units of ``token_in``, or ``max`` for a full withdrawal.
     amount: str = Field(pattern=r"^(?:max|[1-9]\d*)$")
     token_in: BundleToken
     token_out: BundleToken
+    # Zero for a composed bundle, which nothing quoted.
     quote_block: int = Field(ge=0)
     # Unix seconds; None when the bundle embeds no expiring quote.
     expires_at: int | None = Field(default=None, ge=0)
@@ -239,12 +266,39 @@ class TxBundle(FrozenModel):
     # Raw units of ``token_out``.
     expected_out: str | None = Field(default=None, pattern=r"^\d+$")
     min_out: str | None = Field(default=None, pattern=r"^\d+$")
-    protocol_gas: str = Field(pattern=r"^\d+$")
+    # None only for a composed bundle, which 1Tx never simulated.
+    protocol_gas: str | None = Field(pattern=r"^\d+$")
     # Raw ``token_out`` gained in the simulation, not settled value. None when
     # the stored plan lacks it.
     simulated_out: str | None = Field(default=None, pattern=r"^\d+$")
-    simulation_scope: Literal["protocol_bundle"] = "protocol_bundle"
-    simulation_engine: Literal["wallet_neutral_atomic"] = "wallet_neutral_atomic"
+    simulation_scope: Literal["protocol_bundle"] | None = "protocol_bundle"
+    simulation_engine: Literal["wallet_neutral_atomic"] | None = "wallet_neutral_atomic"
+    bridge: BundleBridge | None = None
+
+    @model_validator(mode="after")
+    def _source_matches_kind(self) -> "TxBundle":
+        composed = self.action == "cctp_receive"
+        if composed != (self.source == "open-allocator"):
+            raise ValueError(
+                f"bundle {self.bundle_id}: only cctp_receive bundles are composed "
+                "by open-allocator"
+            )
+        simulated = (
+            self.protocol_gas is not None
+            and self.simulation_scope is not None
+            and self.simulation_engine is not None
+        )
+        if composed == simulated:
+            raise ValueError(
+                f"bundle {self.bundle_id}: a 1Tx bundle carries its protocol "
+                "simulation and a composed one carries none"
+            )
+        if (self.action == "bridge") != (self.bridge is not None):
+            raise ValueError(
+                f"bundle {self.bundle_id}: bridge metadata belongs to bridge "
+                "bundles only"
+            )
+        return self
 
 
 def bundle_digest(
@@ -257,14 +311,16 @@ def bundle_digest(
     steps: Sequence[TxStep],
     quote_block: int,
     expires_at: int | None,
+    bridge: BundleBridge | None = None,
 ) -> str:
     """SHA-256 over what a bundle commits the account to, in call order.
 
     Covers the instrument, action, account, chain, amount, every call's target,
-    data, value, and type, and the quote block and expiry. Addresses and hex are
-    case-folded so a re-encoded but identical bundle keeps its digest.
+    data, value, and type, the quote block and expiry, and a bridge bundle's
+    CCTP transfer. Addresses and hex are case-folded so a re-encoded but
+    identical bundle keeps its digest.
     """
-    payload = {
+    payload: dict[str, object] = {
         "instrument_id": instrument_id.casefold(),
         "action": action,
         "account": account.casefold(),
@@ -282,6 +338,10 @@ def bundle_digest(
         "quote_block": quote_block,
         "expires_at": expires_at,
     }
+    if bridge is not None:
+        # Absent otherwise, so digests of deposit and withdraw bundles are the
+        # ones earlier plans recorded.
+        payload["bridge"] = bridge.model_dump(mode="json")
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -327,6 +387,13 @@ class TxPlan(FrozenModel):
                         f"step {index} of bundle {bundle.bundle_id} has legacy "
                         f"kind {step.kind!r}"
                     )
+                # A redemption is composed here from an attested message; it
+                # must never ride inside, or pass for, a bundle 1Tx built.
+                if (step.kind == "cctp_receive") != (bundle.action == "cctp_receive"):
+                    raise ValueError(
+                        f"step {index} of {bundle.action} bundle "
+                        f"{bundle.bundle_id} has kind {step.kind!r}"
+                    )
             digest = bundle_digest(
                 instrument_id=bundle.instrument_id,
                 action=bundle.action,
@@ -336,6 +403,7 @@ class TxPlan(FrozenModel):
                 steps=steps,
                 quote_block=bundle.quote_block,
                 expires_at=bundle.expires_at,
+                bridge=bundle.bridge,
             )
             if digest != bundle.digest:
                 raise ValueError(

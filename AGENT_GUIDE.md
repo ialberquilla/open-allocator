@@ -117,7 +117,7 @@ Full surface and the known limits of every metric: [docs/capabilities.md](docs/c
 
 ## Confirmation Discipline
 
-Announce before execute. A valid execution announcement includes the wallet, source and destination chains, instruments, amounts, calldata source, policy result, expected gas assets, and failure modes. For a calldata plan it also includes the dry run's `funding` rows — each token the plan spends, the balance held, and any shortfall, including the paymaster's maximum USDC charge.
+Announce before execute. A valid execution announcement includes the wallet, source and destination chains, instruments, amounts, calldata source, policy result, expected gas assets, and failure modes. For a calldata plan it also includes the dry run's `funding` rows — each token the plan spends, the balance held, and any shortfall, including the paymaster's maximum USDC charge. A calldata leg that bridges (a `bridge` bundle) is announced as such: source and destination chain, burned amount, and that its deposit is sized only after Circle attests; rerun the same `execute --confirm` until its `bridges` state is `completed`.
 
 `--unsafe` and `--autonomous` are not shortcuts. Use them only when the policy and task explicitly require them and the bounds are documented before execution.
 

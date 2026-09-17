@@ -390,6 +390,8 @@ def _build_execution_plan(
                 policy,
                 known_instruments=known_instruments,
                 config=config,
+                # Read only: legs already sent or bridging are not planned again.
+                idempotency_store=_execution_idempotency_store(config, allocation),
             )
             preparation = fitted.preparation.model_copy(
                 update={"messages": (*fitted.messages, *fitted.preparation.messages)}

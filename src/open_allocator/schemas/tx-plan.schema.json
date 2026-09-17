@@ -61,6 +61,42 @@
       "type": "string",
       "pattern": "^[0-9]+$"
     },
+    "BundleBridge": {
+      "title": "BundleBridge",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "to_chain_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source_domain": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "destination_domain": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_fee": {
+          "$ref": "#/$defs/RawUint"
+        },
+        "min_finality_threshold": {
+          "enum": [1000, 2000]
+        },
+        "fast": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "to_chain_id",
+        "source_domain",
+        "destination_domain",
+        "max_fee",
+        "min_finality_threshold",
+        "fast"
+      ]
+    },
     "BundleToken": {
       "title": "BundleToken",
       "type": "object",
@@ -101,7 +137,7 @@
           "minLength": 1
         },
         "action": {
-          "enum": ["deposit", "withdraw"]
+          "enum": ["deposit", "withdraw", "bridge", "cctp_receive"]
         },
         "account": {
           "type": "string"
@@ -119,7 +155,7 @@
           }
         },
         "source": {
-          "enum": ["1tx-calldata"]
+          "enum": ["1tx-calldata", "open-allocator"]
         },
         "endpoint": {
           "type": "string",
@@ -184,16 +220,19 @@
           "anyOf": [{ "$ref": "#/$defs/RawUint" }, { "type": "null" }]
         },
         "protocol_gas": {
-          "$ref": "#/$defs/RawUint"
+          "anyOf": [{ "$ref": "#/$defs/RawUint" }, { "type": "null" }]
         },
         "simulated_out": {
           "anyOf": [{ "$ref": "#/$defs/RawUint" }, { "type": "null" }]
         },
         "simulation_scope": {
-          "enum": ["protocol_bundle"]
+          "enum": ["protocol_bundle", null]
         },
         "simulation_engine": {
-          "enum": ["wallet_neutral_atomic"]
+          "enum": ["wallet_neutral_atomic", null]
+        },
+        "bridge": {
+          "anyOf": [{ "$ref": "#/$defs/BundleBridge" }, { "type": "null" }]
         }
       },
       "required": [

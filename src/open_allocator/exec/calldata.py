@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 
 from open_allocator.core import amounts
 from open_allocator.core.types import (
+    BundleBridge,
     BundleLeftover,
     BundleRequirement,
     BundleToken,
@@ -22,8 +23,9 @@ from open_allocator.core.types import (
     Vault,
     bundle_digest,
 )
-from open_allocator.exec import chains
+from open_allocator.exec import cctp, chains
 from open_allocator.exec.client import (
+    BridgeCalldataQuery,
     BridgeCalldataResponse,
     CalldataAction,
     CalldataTokenInfo,
@@ -33,6 +35,8 @@ from open_allocator.exec.client import (
 )
 
 INSTRUMENT_CALLDATA_ENDPOINT = "GET /instruments/:instrumentId/calldata"
+BRIDGE_CALLDATA_ENDPOINT = "GET /bridge/calldata"
+CCTP_RECEIVE_ENDPOINT = "MessageTransmitterV2.receiveMessage"
 # Mirrors AllocatorConfig's default for callers that pass a partial config.
 DEFAULT_MIN_CALLDATA_TTL_SECONDS = 20
 
@@ -292,6 +296,173 @@ def request_bundle(
     )
 
 
+def request_bridge_bundle(
+    client: object,
+    *,
+    instrument_id: str,
+    from_chain_id: int,
+    to_chain_id: int,
+    account: str,
+    amount: str,
+    leg_index: int,
+    token: DepositToken,
+    config: object | None = None,
+) -> tuple[tuple[TxStep, ...], TxBundle]:
+    """Fetch, validate, and plan the CCTP source burn for a bridged leg.
+
+    ``token`` is the source chain's USDC the raw ``amount`` was computed in; the
+    burn must spend exactly that token. The bundle keeps the leg's destination
+    instrument, whose deposit is built only after Circle attests the burn.
+    """
+    fetch = getattr(client, "bridge_calldata", None)
+    if not callable(fetch):
+        raise TypeError("client does not implement bridge_calldata")
+    fast = bool(_config_value(config, "fast_transfer"))
+    response = fetch(
+        BridgeCalldataQuery(
+            from_chain_id=from_chain_id,
+            to_chain_id=to_chain_id,
+            amount=amount,
+            account=account,
+            fast=fast,
+        )
+    )
+    validate_bridge_calldata(
+        response,
+        from_chain_id=from_chain_id,
+        to_chain_id=to_chain_id,
+        account=account,
+        amount=amount,
+        fast=fast,
+    )
+    _require_equal("token", response.token, token.address, fold=True)
+    steps = tuple(
+        TxStep(
+            to=call.to,
+            data=call.data,
+            value=int(call.value),
+            chain_id=call.chain_id,
+            kind=call.type,
+        )
+        for call in response.calls
+    )
+    try:
+        burn = cctp.decode_burn_steps(steps)
+    except cctp.CctpValidationError as error:
+        raise CalldataValidationError(str(error)) from error
+    # The calls must do what the response says they do, to this Safe.
+    _require_equal("burn amount", burn.amount_raw, response.amount)
+    _require_equal("burn token", burn.burn_token, response.token, fold=True)
+    _require_equal("mintRecipient", burn.mint_recipient, account, fold=True)
+    _require_equal("destinationCaller", burn.destination_caller, account, fold=True)
+    _require_equal(
+        "destinationDomain", burn.destination_domain, response.destination_domain
+    )
+    _require_equal("maxFee", burn.max_fee_raw, response.max_fee)
+    _require_equal(
+        "minFinalityThreshold",
+        burn.min_finality_threshold,
+        response.min_finality_threshold,
+    )
+    bridge = BundleBridge(
+        to_chain_id=response.to_chain_id,
+        source_domain=response.source_domain,
+        destination_domain=response.destination_domain,
+        max_fee=response.max_fee,
+        min_finality_threshold=response.min_finality_threshold,
+        fast=response.fast,
+    )
+    usdc = BundleToken(address=response.token, symbol=None, decimals=token.decimals)
+    digest = bundle_digest(
+        instrument_id=instrument_id,
+        action="bridge",
+        account=response.account,
+        chain_id=response.from_chain_id,
+        amount=response.amount,
+        steps=steps,
+        quote_block=response.quote_block,
+        expires_at=None,
+        bridge=bridge,
+    )
+    return steps, TxBundle(
+        bundle_id=f"leg:{leg_index}:{instrument_id}:bridge",
+        digest=digest,
+        leg_index=leg_index,
+        instrument_id=instrument_id,
+        action="bridge",
+        account=response.account,
+        chain_id=response.from_chain_id,
+        step_indexes=tuple(range(len(steps))),
+        endpoint=BRIDGE_CALLDATA_ENDPOINT,
+        amount=response.amount,
+        token_in=usdc,
+        # The mint lands on another chain, so nothing is credited here.
+        token_out=usdc,
+        quote_block=response.quote_block,
+        requires=tuple(
+            BundleRequirement(token=item.token, amount=item.amount)
+            for item in response.requires
+        ),
+        protocol_gas=response.simulation.gas_used,
+        simulated_out=response.simulation.token_out_delta,
+        simulation_scope=response.simulation.scope,
+        simulation_engine=response.simulation.engine,
+        bridge=bridge,
+    )
+
+
+def receive_bundle(
+    step: TxStep,
+    *,
+    leg_index: int,
+    instrument_id: str,
+    account: str,
+    token: DepositToken,
+    net_mint_raw: int,
+) -> TxBundle:
+    """The composed redemption of an attested burn, as a bundle of one call.
+
+    It requires nothing and credits exactly the attested net mint, so the
+    funding check lets the deposit after it in the same operation spend it.
+    """
+    if step.kind != "cctp_receive":
+        raise CalldataValidationError(f"a receive bundle cannot carry a {step.kind}")
+    if net_mint_raw <= 0:
+        raise CalldataAmountError("the attested burn mints nothing at the destination")
+    usdc = BundleToken(address=token.address, symbol=None, decimals=token.decimals)
+    amount = str(net_mint_raw)
+    return TxBundle(
+        bundle_id=f"leg:{leg_index}:{instrument_id}:cctp_receive",
+        digest=bundle_digest(
+            instrument_id=instrument_id,
+            action="cctp_receive",
+            account=account,
+            chain_id=step.chain_id,
+            amount=amount,
+            steps=(step,),
+            quote_block=0,
+            expires_at=None,
+        ),
+        leg_index=leg_index,
+        instrument_id=instrument_id,
+        action="cctp_receive",
+        account=account,
+        chain_id=step.chain_id,
+        step_indexes=(0,),
+        source="open-allocator",
+        endpoint=CCTP_RECEIVE_ENDPOINT,
+        amount=amount,
+        token_in=usdc,
+        token_out=usdc,
+        quote_block=0,
+        expected_out=amount,
+        min_out=amount,
+        protocol_gas=None,
+        simulation_scope=None,
+        simulation_engine=None,
+    )
+
+
 def refresh_bundle(
     client: object,
     bundle: TxBundle,
@@ -304,6 +475,11 @@ def refresh_bundle(
     Keeps the bundle ID with a new digest, so completion recorded for the old
     calls never applies. Step indexes start at zero.
     """
+    if bundle.action not in ("deposit", "withdraw"):
+        # Bridge burns and composed receives carry no expiring quote.
+        raise CalldataValidationError(
+            f"{bundle.action} bundle {bundle.bundle_id} cannot be rebuilt here"
+        )
     token = (
         DepositToken(
             chain_id=bundle.chain_id,
