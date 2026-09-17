@@ -600,7 +600,7 @@ def test_a_calldata_plan_is_prepared_without_sending_then_submitted_afresh(
     assert endpoint.methods().count("eth_sendUserOperation") == 1
     sent = endpoint.sent_user_op()
     assert ("factory" in sent) is (not deployed)
-    # One operation carrying every bundle call, in the order Darex returned them.
+    # One operation carrying every bundle call, in the order 1Tx returned them.
     call_data = sent["callData"].lower()
     cursor = 0
     for step in tx_plan.steps:

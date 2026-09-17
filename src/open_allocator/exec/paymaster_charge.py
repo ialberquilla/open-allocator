@@ -1,32 +1,7 @@
 """The most gas token Pimlico's ERC-20 paymaster can charge one operation.
 
-Derived from the deployed contract, not from the quote's documentation:
-``SingletonPaymasterV7`` (pimlicolabs/singleton-paymaster ``1e2305d``) charges in
-``postOp``::
-
-    penalty = (executionGasLimit - executionGasUsed) * 10 / 100 * feePerGas
-    cost    = (actualGasCost + penalty + postOpGas * feePerGas) * exchangeRate / 1e18
-              + constantFee
-
-with ``executionGasLimit = callGasLimit + paymasterPostOpGasLimit``. Each input
-is bounded by the operation as built: the EntryPoint refuses an operation whose
-``actualGasCost`` exceeds its prefund (every gas limit times ``maxFeePerGas``),
-the fee per gas never exceeds ``maxFeePerGas``, and the penalty never exceeds
-10% of the execution limit. So::
-
-    max = ((VGL + CGL + PVG + PMVGL + PMPOGL) + (CGL + PMPOGL) // 10 + postOpGas)
-          * maxFeePerGas * exchangeRate // 1e18 + constantFee
-
-Checked 2026-09-17 against 26 ERC-20-mode charges the paymaster emitted on Base
-mainnet (``UserOperationSponsored.tokenAmountPaid``, with limits and paymaster
-config decoded from each ``handleOps`` input): every charge sat inside this
-bound, the largest at 52% of it, and every charge was within 0.96-1.01x of
-``actualGasCost * exchangeRate / 1e18`` — so the 1e18 scaling is the real one.
-
-What it cannot bound: a sponsorship signed at a higher rate than the one the
-operation was prepared against. Submission prepares and sponsors afresh
-seconds later; the bound's headroom over real charges is what absorbs that
-drift, not a guarantee.
+The bound follows the charge ``SingletonPaymasterV7`` takes in ``postOp``, with
+every input at its limit; see docs/gasless-execution.md.
 """
 
 from __future__ import annotations
@@ -103,7 +78,7 @@ def max_token_charge(
     exchange_rate: int,
     constant_fee: int = 0,
 ) -> int | None:
-    """The bound above, or None when the estimate lacks a limit it needs."""
+    """The maximum charge, or None when the estimate lacks a limit it needs."""
     if (
         gas.paymaster_verification_gas_limit is None
         or gas.paymaster_post_op_gas_limit is None

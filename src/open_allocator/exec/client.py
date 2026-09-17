@@ -442,7 +442,7 @@ class BundleSimulation(OneTxExecutionModel):
     ok: Literal[True]
     scope: Literal["protocol_bundle"]
     engine: Literal["wallet_neutral_atomic"]
-    # Gas of the bare protocol calls under Darex's ephemeral executor. It is not
+    # Gas of the bare protocol calls under 1Tx's ephemeral executor. It is not
     # the Safe/UserOperation gas, which Open Allocator estimates separately.
     gas_used: RawUint = Field(alias="gasUsed")
     quote_block: BlockNumber = Field(alias="quoteBlock")

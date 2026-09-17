@@ -1,6 +1,6 @@
 """Wallet-aware preparation and submission of calldata bundle plans.
 
-A calldata plan is a sequence of bundles, each an ordered run of calls Darex
+A calldata plan is a sequence of bundles, each an ordered run of calls 1Tx
 simulated together. What gets estimated, submitted, deduplicated, and reported
 here is the wallet operation that carries them: consecutive bundles on one chain
 ride in one Safe operation when the signer can batch. Inner calls stay visible in
@@ -8,11 +8,11 @@ reports but are never marked complete on their own inside a batch — they share
 one receipt and cannot partially settle.
 
 Before anything is sent, and again before each later operation, the plan is
-checked against what the account actually holds (``funding``): Darex simulated
+checked against what the account actually holds (``funding``): 1Tx simulated
 the calls with assumed balances, so a passing simulation says nothing about
 whether this Safe can pay for them.
 
-Two measurements must not be confused. A bundle's ``protocol_gas`` is Darex's
+Two measurements must not be confused. A bundle's ``protocol_gas`` is 1Tx's
 wallet-neutral simulation of the bare calls. A ``WalletPreparation`` is this
 repo's estimate of the real envelope — deployment, paymaster approval, Safe
 batching — and is the one that says whether the operation can run.
@@ -602,7 +602,7 @@ def _wallet_preparation(
             f"chain {operation.chain_id}"
         )
     for item in operation.bundles:
-        # Darex built and simulated the calls for this account: approvals,
+        # 1Tx built and simulated the calls for this account: approvals,
         # receivers, and swap recipients all name it. Sent from any other
         # sender they do something else.
         if item.bundle.account.casefold() != prepared.sender.casefold():

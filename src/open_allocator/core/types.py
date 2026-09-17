@@ -215,7 +215,7 @@ class TxBundle(FrozenModel):
     """One atomic calldata bundle as it was quoted, bound to its plan steps.
 
     The steps it names are the bundle's calls, in order, and must be submitted
-    together. ``protocol_gas`` is Darex's wallet-neutral simulation of those bare
+    together. ``protocol_gas`` is 1Tx's wallet-neutral simulation of those bare
     calls; it is not the Safe/UserOperation gas, which is estimated separately
     and never reported as the same measurement.
     """

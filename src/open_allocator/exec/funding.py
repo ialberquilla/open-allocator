@@ -1,6 +1,6 @@
 """Whether the account actually holds what a calldata plan spends.
 
-Darex simulates a bundle with balance state overrides (``assumedBalances``), so
+1Tx simulates a bundle with balance state overrides (``assumedBalances``), so
 a successful simulation proves the calls compose, not that the Safe owns the
 tokens. This module closes that gap with a ledger in raw token units, per
 (chain, account, token), walked in the exact order the plan will execute:
