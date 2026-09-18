@@ -13,8 +13,13 @@ from typer.testing import CliRunner
 
 from open_allocator import cli
 from open_allocator.cli import JsonObject, json_command
+from open_allocator.core.policy import PolicyResult
 from open_allocator.core.schema import validate
+from open_allocator.core.types import Allocation, TxPlan
+from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.client import RewardsResponse
+from open_allocator.exec.execute import WalletPreparation
+from open_allocator.exec.funding import FundingRequirement
 
 runner = CliRunner()
 
@@ -1586,6 +1591,128 @@ def test_build_tx_and_execute_dry_run_and_confirmed_share_plan(
     assert len(signer.sent) == 2
 
 
+def _calldata_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    blockers: tuple[str, ...] = (),
+) -> None:
+    preparation = PlanPreparation(
+        preparations=(
+            WalletPreparation(
+                bundle_ids=("leg:0:base-aave-usdc:deposit",),
+                chain_id=8453,
+                sender="0x0000000000000000000000000000000000000001",
+                includes_deployment=True,
+                call_gas_limit=900_000,
+            ),
+        ),
+        funding=(
+            FundingRequirement(
+                chain_id=8453,
+                account="0x0000000000000000000000000000000000000001",
+                token="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                required_raw="100250000",
+                available_raw="100000000",
+                shortfall_raw="250000",
+                bundle_ids=("leg:0:base-aave-usdc:deposit",),
+                ok=False,
+            ),
+        ),
+        messages=("wallet note",),
+        blockers=blockers,
+    )
+    allocation = Allocation(legs=(), total_usd=0, metadata={})
+    monkeypatch.setattr(
+        cli,
+        "_build_execution_plan",
+        lambda _allocation, _policy: (
+            allocation,
+            None,
+            TxPlan(steps=(), summary="calldata plan"),
+            [],
+            preparation,
+        ),
+    )
+    monkeypatch.setattr(
+        cli.policy_core,
+        "check",
+        lambda *_args: PolicyResult(ok=True, violations=()),
+    )
+
+
+def test_execute_dry_run_reports_the_wallet_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _calldata_dry_run(monkeypatch, blockers=("the Safe is not deployed on Base",))
+    allocation_path, policy_path = write_execution_files(tmp_path)
+
+    result = runner.invoke(
+        cli.app,
+        ["execute", "--allocation", str(allocation_path), "--policy", str(policy_path)],
+    )
+
+    assert result.exit_code == 0
+    payload = parse_single_stdout_object(result.stdout)
+    assert payload["status"] == "planned"
+    [preparation] = payload["preparations"]
+    assert preparation["includes_deployment"] is True
+    assert preparation["call_gas_limit"] == 900_000
+    [usdc] = payload["funding"]
+    assert (usdc["required_raw"], usdc["available_raw"]) == ("100250000", "100000000")
+    assert payload["messages"] == [
+        "dry-run only; no transactions broadcast",
+        "wallet note",
+        "the Safe is not deployed on Base",
+    ]
+
+
+def test_build_tx_fails_closed_when_the_signer_cannot_submit_the_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _calldata_dry_run(monkeypatch, blockers=("the Safe is not deployed on Base",))
+    allocation_path, policy_path = write_execution_files(tmp_path)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-tx",
+            "--allocation",
+            str(allocation_path),
+            "--policy",
+            str(policy_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert json.loads(result.stderr) == {"error": "the Safe is not deployed on Base"}
+
+
+def test_build_tx_emits_a_submittable_calldata_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _calldata_dry_run(monkeypatch)
+    allocation_path, policy_path = write_execution_files(tmp_path)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "build-tx",
+            "--allocation",
+            str(allocation_path),
+            "--policy",
+            str(policy_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = parse_single_stdout_object(result.stdout)
+    assert validate(payload, "tx-plan") == payload
+
+
 @pytest.mark.parametrize("flag", ["--unsafe", "--autonomous"])
 def test_execute_unsafe_and_autonomous_do_not_bypass_confirm(
     monkeypatch: pytest.MonkeyPatch,
@@ -1740,11 +1867,11 @@ def test_withdraw_with_confirm_uses_positions_output_and_sells_shares(
     assert [getattr(sent[0], "data") for sent in signer.sent] == ["0xsell"]
 
 
-@pytest.mark.parametrize("flag", ["--unsafe", "--autonomous"])
-def test_withdraw_unsafe_and_autonomous_do_not_bypass_confirm(
+@pytest.mark.parametrize("flag", [None, "--unsafe", "--autonomous"])
+def test_withdraw_without_confirm_is_a_dry_run_that_sends_nothing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    flag: str,
+    flag: str | None,
 ) -> None:
     signer = install_withdraw_surface_mocks(monkeypatch)
     current_path, _target_path, policy_path = write_rebalance_files(tmp_path)
@@ -1759,16 +1886,26 @@ def test_withdraw_unsafe_and_autonomous_do_not_bypass_confirm(
             str(current_path),
             "--policy",
             str(policy_path),
-            flag,
+            *([flag] if flag else []),
         ],
     )
 
     assert result.exit_code == 0
-    assert parse_single_stdout_object(result.stdout) == {
-        "status": "plan_required",
-        "command": "withdraw",
-        "requires": "--confirm or explicit --unsafe/--autonomous",
-    }
+    payload = parse_single_stdout_object(result.stdout)
+    assert payload["status"] == "planned"
+    assert payload["messages"][0] == "dry-run only; no transactions broadcast"
+    assert payload["withdraw_plan"]["yield_token_amount"] == "80.000000"
+    assert [step["data"] for step in payload["plan"]["steps"]] == ["0xsell"]
+    assert signer.sent == []
+
+
+def test_withdraw_requires_a_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    signer = install_withdraw_surface_mocks(monkeypatch)
+
+    result = runner.invoke(cli.app, ["withdraw"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stderr) == {"error": "--position is required"}
     assert signer.sent == []
     assert WithdrawOneTxClient.calls == []
 
@@ -1799,36 +1936,6 @@ def test_json_command_routes_errors_to_stderr() -> None:
     assert result.exit_code == 1
     assert result.stdout == ""
     assert json.loads(result.stderr) == {"error": "boom"}
-
-
-@pytest.mark.parametrize(
-    ("command", "executor_name"),
-    [
-        ("withdraw", "_withdraw_executor"),
-    ],
-)
-def test_execution_commands_without_confirmation_do_not_call_executor(
-    monkeypatch: pytest.MonkeyPatch,
-    command: str,
-    executor_name: str,
-) -> None:
-    calls: list[str] = []
-
-    def spy() -> JsonObject:
-        calls.append(command)
-        return {"status": "spy_called"}
-
-    monkeypatch.setattr(cli, executor_name, spy)
-
-    result = runner.invoke(cli.app, [command])
-
-    assert result.exit_code == 0
-    assert calls == []
-    assert parse_single_stdout_object(result.stdout) == {
-        "status": "plan_required",
-        "command": command,
-        "requires": "--confirm or explicit --unsafe/--autonomous",
-    }
 
 
 def set_paymaster_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:

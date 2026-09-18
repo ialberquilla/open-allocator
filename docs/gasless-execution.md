@@ -81,6 +81,70 @@ and an unreadable RPC (no answer) both fall through to sending the approval. A
 redundant approval wastes a few thousand gas; a missing one reverts the
 operation after paying for everything up to `postOp`.
 
+📍 **The most an operation can be charged is bounded, not guessed.** Before a
+calldata plan is sent, each operation's maximum USDC charge is reserved out of
+the Safe's balance alongside what its bundles require (`exec/funding.py`). The
+bound (`exec/paymaster_charge.py`) is read off Pimlico's `SingletonPaymasterV7`
+`postOp`: every gas limit, plus the contract's 10% unused-execution penalty,
+plus `postOpGas`, at `maxFeePerGas`, times `exchangeRate / 1e18`, plus any
+constant fee. The rate, `postOpGas`, and fee flags come from the stub
+`paymasterData`, which carries the same ERC-20 config the sponsorship does; a
+stub that does not parse gives no bound, and the plan says so rather than
+reserving a made-up amount. Checked 2026-09-17 against 26 ERC-20 charges on
+Base: every one inside the bound (the largest at 52% of it), and every one
+within 0.96–1.01x of `actualGasCost × exchangeRate / 1e18`.
+
+Calldata deposits and rebalances fit their deposits around that bound
+(`exec/deposit_sizing.py`): when a chain's deposits would leave less USDC than
+the operation's maximum charge, they are rebuilt
+smaller by the shortfall and the operation is prepared again, at most three
+times. A shortfall still standing after that is reported, not guessed around.
+
+📍 **A bridged calldata deposit pays its destination gas out of its own mint.**
+The Safe may hold nothing on the destination chain, so the operation that
+redeems the CCTP message and deposits is funded by the mint it redeems: the
+funding check credits the attested net mint and reserves the bounded charge
+after it, and the deposit is rebuilt smaller until the charge fits, at most
+three preparations. An operation whose charge the adapter cannot bound is not
+submitted — a flat USDC reserve would be a guess — so cross-chain calldata
+deposits need an adapter that bounds it (`PAYMASTER_PROVIDER=pimlico`). Unlike
+the legacy receiver, nothing mints to a third party first: `receiveMessage`
+and the deposit are one Safe operation, so a reverting deposit leaves the CCTP
+message unredeemed rather than idle USDC. The destination operation deploys the
+Safe there when it is counterfactual.
+
+📍 **A calldata plan carries two gas numbers, and they are different
+measurements.** Each bundle's `protocol_gas` is 1Tx's simulation of the bare
+calls under its ephemeral, wallet-neutral executor (`simulation.scope =
+protocol_bundle`, `engine = wallet_neutral_atomic`). Each entry in a dry run's
+`preparations` is this repo's bundler estimate of the real operation — Safe
+deployment when counterfactual, the Safe4337Module batch, the paymaster approval
+and stub, current nonce and fees — and it is the one that says the operation can
+run. Neither is signed or sent; submission estimates again.
+
+📍 **An unfunded Safe is still estimated, against assumed balances.** A Safe that
+does not yet hold what its bundles spend — typically a counterfactual Safe before
+its first deposit — reverts in the bundler's simulation (`AA50 postOp reverted`
+when the gas USDC is missing, the module's `ExecutionFailed` when the calls'
+tokens are). Preparation then estimates once more with each bundle's `requires`
+(plus gas headroom in USDC) written into the Safe's balance through an
+`eth_estimateUserOperationGas` state override, and the entry reports
+`assumed_balances` and the original `simulation_revert`. That estimate validates
+the envelope; the `funding` rows still report the shortfall, which blocks
+execution, and `execute --confirm` never proceeds on an assumed-balance estimate.
+The balance slot is found per token by checking candidate storage layouts
+against the token's own `balanceOf` in an `eth_call`, so it needs an RPC that
+accepts state overrides (the public `mainnet.base.org` does not) and fails, with
+the reason in the error, for tokens whose balance is not a plain stored value.
+
+The live gate for all of this is opt-in:
+`OPEN_ALLOCATOR_LIVE_CALLDATA_PROBE=1 uv run pytest -m integration
+tests/test_calldata_probe.py`. It probes every active instrument for an account
+with no code and for the configured Safe (`exec/calldata_probe.py`: request
+answered without `executor`, strict contract, bound to the request), then
+prepares a deposit for the configured Safe and a counterfactual one on each
+paymaster chain.
+
 📍 **Modelled cost is a different number from charged cost, and the model prices
 gas in the chain's own token.** `core.costs` estimates what a leg will cost
 before it is sent; `exec.gas` reads the prices it needs. A chain whose gas token

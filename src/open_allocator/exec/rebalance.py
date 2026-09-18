@@ -7,6 +7,7 @@ from typing import Literal, NamedTuple
 
 from pydantic import Field
 
+from open_allocator.core import amounts
 from open_allocator.core import policy as policy_core
 from open_allocator.core import rebalance as rebalance_core
 from open_allocator.core.state import backend_from_config
@@ -15,16 +16,20 @@ from open_allocator.core.types import (
     AllocationLeg,
     FrozenModel,
     Policy,
+    TxBundle,
     TxPlan,
     TxStep,
     Vault,
 )
+from open_allocator.exec import bundle_execution, calldata, deposit_sizing
 from open_allocator.exec.execute import (
     ExecutionBroadcastError,
     ExecutionReport,
     ExecutionStepReport,
     FundingLedger,
     GasCheck,
+    TransactionPlanError,
+    WalletPreparation,
     _amount_usdc,
     _append_allocation_log,
     _build_buy,
@@ -45,6 +50,7 @@ from open_allocator.exec.execute import (
     _write_checkpoint,
     pending_receipt_messages,
 )
+from open_allocator.exec.funding import FundingRequirement
 from open_allocator.exec.signer import Receipt, Signer
 
 
@@ -60,6 +66,8 @@ class RebalanceExecutionReport(FrozenModel):
     steps: tuple[ExecutionStepReport, ...] = Field(default_factory=tuple)
     receipts: tuple[Receipt, ...] = Field(default_factory=tuple)
     gas_checks: tuple[GasCheck, ...] = Field(default_factory=tuple)
+    preparations: tuple[WalletPreparation, ...] = Field(default_factory=tuple)
+    funding: tuple[FundingRequirement, ...] = Field(default_factory=tuple)
     in_progress: bool = False
     messages: tuple[str, ...] = Field(default_factory=tuple)
 
@@ -105,6 +113,18 @@ def execute_rebalance(
     should_execute = confirm or autonomous
     if autonomous and not confirm:
         _require_autonomous_rebalance(rebalance_plan, policy)
+
+    if calldata.uses_calldata_api(config):
+        return _calldata_rebalance(
+            client,
+            signer,
+            positions,
+            rebalance_plan,
+            known,
+            config,
+            idempotency_store,
+            execute=should_execute,
+        )
 
     address = signer.address()
     sells = tuple(t for t in rebalance_plan.trades if t.action == "sell")
@@ -257,6 +277,230 @@ def execute_rebalance(
         completed_keys=_completed_keys(step_refs, execution_steps),
     )
     return report
+
+
+# --- calldata API (ONE_TX_TRANSACTION_API=calldata) --------------------------
+
+
+def _calldata_rebalance(
+    client: object,
+    signer: Signer,
+    positions: object,
+    rebalance_plan: rebalance_core.RebalancePlan,
+    known: Sequence[Vault | Mapping[str, object]],
+    config: object | None,
+    idempotency_store: object | None,
+    *,
+    execute: bool,
+) -> RebalanceExecutionReport:
+    """A same-chain rebalance: each chain's withdrawals, then its deposits.
+
+    Each chain's calls go in one atomic operation. Deposits are logged with the
+    shares read from positions afterwards, not the simulated amounts.
+    """
+    address = signer.address()
+    built = _calldata_rebalance_plan(
+        client,
+        signer,
+        address,
+        positions,
+        rebalance_plan,
+        known,
+        config,
+        idempotency_store,
+    )
+    if not execute:
+        return RebalanceExecutionReport(
+            status="planned",
+            rebalance_plan=rebalance_plan,
+            policy_result=rebalance_plan.policy_result,
+            plan=built.plan,
+            preparations=built.preparation.preparations,
+            funding=built.preparation.funding,
+            messages=(
+                "dry-run only; no transactions broadcast",
+                *built.messages,
+                *built.preparation.messages,
+                *built.preparation.blockers,
+            ),
+        )
+
+    attribution_required = (
+        backend_from_config(config, needs="allocation_log_path") is not None
+    )
+    share_baselines = _share_balances(positions)
+    unobserved: list[str] = []
+
+    def log(bundle: TxBundle, receipt: Receipt) -> bundle_execution.BundleLog:
+        trade = rebalance_plan.trades[bundle.leg_index]
+        if bundle.action == "withdraw":
+            return bundle_execution.BundleLog(
+                action_type="sell",
+                usd=float(trade.usd),
+                shares=trade.yield_token_amount,
+            )
+        shares = None
+        if attribution_required:
+            if receipt.status == 1 and not receipt.pending:
+                shares = _settled_buy_delta(
+                    client,
+                    address,
+                    positions,
+                    bundle.instrument_id,
+                    bundle.chain_id,
+                    config,
+                    share_baselines,
+                )
+            if shares is None:
+                unobserved.append(
+                    f"buy cost basis is not yet observable: {bundle.instrument_id}; "
+                    "the allocation log records the USDC it spent without shares"
+                )
+        return bundle_execution.BundleLog(
+            action_type="buy",
+            usd=built.deposit_usd.get(bundle.leg_index),
+            shares=shares,
+        )
+
+    result = bundle_execution.execute_plan(
+        client,
+        signer,
+        built.plan,
+        stage="rebalance",
+        policy_result=rebalance_plan.policy_result,
+        completion_key=lambda bundle: _leg_key(bundle.leg_index, bundle.instrument_id),
+        log=log,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+    # Trades finished by an earlier run were never planned, but they are still
+    # complete; the checkpoint is a snapshot of the whole rebalance.
+    earlier = tuple(
+        key
+        for index, trade in enumerate(rebalance_plan.trades)
+        if (key := _leg_key(index, trade.instrument_id)) not in result.completed_keys
+        and _store_completed(idempotency_store, key)
+    )
+    report = RebalanceExecutionReport(
+        status=result.status,
+        rebalance_plan=rebalance_plan,
+        policy_result=rebalance_plan.policy_result,
+        plan=result.plan,
+        steps=result.steps,
+        receipts=result.receipts,
+        gas_checks=result.gas_checks,
+        preparations=result.preparations,
+        funding=result.funding,
+        in_progress=result.in_progress,
+        messages=(*built.messages, *result.messages, *unobserved),
+    )
+    _write_checkpoint(
+        config,
+        "rebalance",
+        report,
+        completed_keys=(*earlier, *result.completed_keys),
+    )
+    return report
+
+
+def _calldata_rebalance_plan(
+    client: object,
+    signer: Signer,
+    address: str,
+    positions: object,
+    plan: rebalance_core.RebalancePlan,
+    known: Sequence[Vault | Mapping[str, object]],
+    config: object | None,
+    idempotency_store: object | None,
+) -> deposit_sizing.FittedPlan:
+    """Withdrawals first, then deposits sized to what each chain will hold.
+
+    A chain's deposits are funded by its USDC balance plus the conservative
+    proceeds of its withdrawals, and are sized down only for proceeds rounding
+    and the paymaster charge. Buys that need another chain's sells are refused;
+    otherwise an underfunded chain is left at full size for the funding check.
+    """
+    calldata.ensure_calldata_supported(config)
+    vaults_by_id = _vaults_by_id(known)
+    open_trades = [
+        (index, trade)
+        for index, trade in enumerate(plan.trades)
+        if not _store_completed(idempotency_store, _leg_key(index, trade.instrument_id))
+    ]
+    sells: dict[int, list[bundle_execution.PlannedBundle]] = {}
+    for index, trade in open_trades:
+        if trade.action != "sell":
+            continue
+        chain_id = _trade_chain(trade, positions, vaults_by_id)
+        if chain_id is None:
+            raise TransactionPlanError(
+                f"the chain of position {trade.instrument_id} is unknown"
+            )
+        if trade.calldata_amount is None:
+            raise calldata.CalldataAmountError(
+                f"cannot build a partial withdrawal of {trade.instrument_id}: no "
+                "positive raw underlying amount could be derived from the position "
+                "(missing balance_raw or decimals, or an amount that rounds down to "
+                "zero units), and a share amount must never be sent as the calldata "
+                "amount"
+            )
+        steps, bundle = calldata.request_bundle(
+            client,
+            instrument_id=trade.instrument_id,
+            action="withdraw",
+            account=address,
+            chain_id=chain_id,
+            amount=trade.calldata_amount,
+            leg_index=index,
+            first_step_index=0,
+            config=config,
+        )
+        sells.setdefault(chain_id, []).append(
+            bundle_execution.PlannedBundle(bundle=bundle, steps=steps)
+        )
+
+    deposits: list[deposit_sizing.DepositRequest] = []
+    for index, trade in open_trades:
+        if trade.action != "buy":
+            continue
+        vault = vaults_by_id.get(trade.instrument_id)
+        if vault is None:
+            raise TransactionPlanError(
+                f"instrument {trade.instrument_id} is not in the discovered universe; "
+                "its chain and deposit token are unknown"
+            )
+        token = calldata.deposit_token(vault.chain_id, vaults_by_id.values(), config)
+        deposits.append(
+            deposit_sizing.DepositRequest(
+                index=index,
+                instrument_id=trade.instrument_id,
+                chain_id=vault.chain_id,
+                token=token,
+                wanted_raw=amounts.to_raw_units(
+                    trade.usd, token.decimals, name="buy amount"
+                ),
+            )
+        )
+
+    def summary(ordered: Sequence[bundle_execution.PlannedBundle]) -> str:
+        withdrawals = sum(len(items) for items in sells.values())
+        return (
+            f"Same-chain rebalance from calldata bundles: {withdrawals} withdrawals "
+            f"before {len(ordered) - withdrawals} deposits across "
+            f"{sum(len(item.steps) for item in ordered)} transaction steps"
+        )
+
+    return deposit_sizing.fit(
+        client,
+        signer,
+        address,
+        deposits=deposits,
+        withdrawals=sells,
+        withdrawal_usd={index: float(trade.usd) for index, trade in open_trades},
+        summary=summary,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
 
 
 # 1Tx holds back roughly this much USDC per chain to sponsor gas. Measured on
@@ -506,7 +750,8 @@ def _broadcast(
                             client,
                             address,
                             initial_positions,
-                            ref,
+                            ref.instrument_id,
+                            ref.settlement_chain_id or ref.step.chain_id,
                             config,
                             share_baselines,
                         )
@@ -581,7 +826,8 @@ def _broadcast(
                 client,
                 address,
                 initial_positions,
-                ref,
+                ref.instrument_id,
+                ref.settlement_chain_id or ref.step.chain_id,
                 config,
                 share_baselines,
             )
@@ -646,7 +892,8 @@ def _settled_buy_delta(
     client: object,
     address: str,
     initial_positions: object,
-    ref: _StepRef,
+    instrument_id: str,
+    chain_id: int,
     config: object | None,
     share_baselines: dict[str, Decimal],
 ) -> str | None:
@@ -655,8 +902,8 @@ def _settled_buy_delta(
     if not callable(read):
         return None
     baseline = share_baselines.get(
-        ref.instrument_id,
-        _share_balance(initial_positions, ref.instrument_id) or Decimal("0"),
+        instrument_id,
+        _share_balance(initial_positions, instrument_id) or Decimal("0"),
     )
     attempts_value = _config_value(config, "position_settlement_attempts")
     try:
@@ -664,17 +911,12 @@ def _settled_buy_delta(
     except (TypeError, ValueError):
         attempts = 1
     for attempt in range(attempts):
-        response = read(
-            {
-                "address": address,
-                "chainId": ref.settlement_chain_id or ref.step.chain_id,
-            }
-        )
-        observed = _share_balance(response, ref.instrument_id)
+        response = read({"address": address, "chainId": chain_id})
+        observed = _share_balance(response, instrument_id)
         if observed is not None:
             delta = observed - baseline
             if delta > 0:
-                share_baselines[ref.instrument_id] = observed
+                share_baselines[instrument_id] = observed
                 return format(delta, "f")
             if delta < 0:
                 return None

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Literal, Protocol, runtime_checkable
 
 import httpx
 from pydantic import Field
+from web3 import HTTPProvider, Web3
 
 from open_allocator.core.types import FrozenModel, Policy, TxStep
+from open_allocator.exec import safe_deployment
 from open_allocator.exec.signer import Receipt, SignerError
+from open_allocator.exec.user_operation import (
+    DELEGATECALL,
+    MULTISEND_CALL_ONLY,
+    Call,
+    multisend_calldata,
+)
 
 
 class SafeSignerError(SignerError):
@@ -118,12 +126,17 @@ class SafeGuardPolicy:
 
 
 class SafeSigner:
+    # A proposal is only queued: owners co-sign and execute it later, so nothing
+    # it carries may depend on a quote that expires before they get to it.
+    proposes_asynchronously = True
+
     def __init__(
         self,
         config: object | None = None,
         *,
         adapter: SafeTransactionServiceAdapter | None = None,
         guard: SafeGuardPolicy | None = None,
+        web3_factory: Callable[[str], Web3] | None = None,
     ) -> None:
         # One adapter per chain, built on demand. The Safe is at the same
         # address everywhere, but the Transaction Service that carries the
@@ -135,6 +148,7 @@ class SafeSigner:
         self._address: str | None = None
         self._guard = guard
         self._proposer = _proposer_from_config(config)
+        self._web3_factory = web3_factory or _http_web3
 
     def __repr__(self) -> str:
         if self._pinned is None and self._config is None:
@@ -170,6 +184,66 @@ class SafeSigner:
             rpc_url=rpc_url,
         )
         return _pending_receipt(proposal)
+
+    def is_deployed(self, chain_id: int, rpc_url: str) -> bool:
+        """Whether the Safe exists on this chain; proposals cannot deploy one."""
+        # Not through the service adapter: chains without one fail in preflight.
+        address = (
+            self._pinned.address() if self._pinned is not None else self._safe_address()
+        )
+        return safe_deployment.is_deployed(
+            self._web3_factory(rpc_url),
+            Web3.to_checksum_address(address),
+        )
+
+    def send_batch(self, steps: Sequence[TxStep], rpc_url: str) -> Receipt:
+        """Every step as one Safe transaction, proposed once.
+
+        Several steps become one delegatecall to MultiSendCallOnly. Separate
+        proposals would all claim the same on-chain nonce.
+        """
+        if not steps:
+            raise SafeSignerError("a Safe transaction needs a step")
+        chain_ids = {step.chain_id for step in steps}
+        if len(chain_ids) != 1:
+            raise SafeSignerError(
+                f"one Safe transaction cannot span chains {sorted(chain_ids)}"
+            )
+        if len(steps) == 1:
+            return self.send(steps[0], rpc_url)
+
+        chain_id = steps[0].chain_id
+        adapter = self._adapter_for(chain_id)
+        if chain_id != adapter.chain_id():
+            raise SafeSignerError(
+                f"tx chain_id {chain_id} does not match Safe chain_id "
+                f"{adapter.chain_id()}"
+            )
+        if self._guard is not None:
+            # Each inner call, not the MultiSend wrapper: the wrapper is always
+            # the same contract and says nothing about where the funds go.
+            for step in steps:
+                self._guard.validate(step)
+
+        safe_tx = SafeTransaction(
+            safe_address=adapter.address(),
+            to=MULTISEND_CALL_ONLY,
+            data=multisend_calldata(
+                [Call(to=step.to, data=step.data, value=step.value) for step in steps]
+            ),
+            value=0,
+            chain_id=chain_id,
+            operation=DELEGATECALL,
+        )
+        proposal = adapter.propose_transaction(
+            safe_tx,
+            proposer=self._proposer,
+            rpc_url=rpc_url,
+        )
+        # The last step is the action the batch exists for, as on the 4337 path.
+        return _pending_receipt(proposal).model_copy(
+            update={"to_address": steps[-1].to}
+        )
 
     def collect_signature(
         self,
@@ -437,8 +511,6 @@ def safe_address_from_config(config: object) -> str:
             "no SAFE_ADDRESS and no SAFE_OWNERS/SAFE_THRESHOLD to derive one"
         )
 
-    from web3 import HTTPProvider, Web3
-
     from open_allocator.exec import chains, safe_deployment
 
     chain_id = safe_deployment.derivation_chain_id(config)
@@ -454,6 +526,10 @@ def safe_address_from_config(config: object) -> str:
         seed,
         chain_id=chain_id,
     )
+
+
+def _http_web3(rpc_url: str) -> Web3:
+    return Web3(HTTPProvider(rpc_url))
 
 
 def _transaction_service_url(config: object, chain_id: int) -> str:

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,7 +13,16 @@ from eth_account import Account
 from eth_utils import keccak
 from web3 import Web3
 
-from open_allocator.exec import paymaster_registry, safe_4337_signature, safe_deployment
+from open_allocator.core.policy import PolicyResult
+from open_allocator.core.types import TxPlan
+from open_allocator.exec import (
+    bundle_execution,
+    calldata,
+    paymaster_registry,
+    safe_4337_signature,
+    safe_deployment,
+)
+from open_allocator.exec.client import InstrumentCalldataResponse
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
     PaymasterConfigurationError,
@@ -20,13 +32,17 @@ from open_allocator.exec.erc4337_paymaster import (
     UserOperationCall,
     _adapter_from_config,
 )
+from open_allocator.exec.paymaster_types import (
+    UserOperationReverted,
+    UserOperationSimulationReverted,
+)
 from open_allocator.exec.pimlico import PimlicoError
 from open_allocator.exec.pimlico_adapter import (
     PimlicoUserOperationAdapter,
     pimlico_adapter_from_config,
 )
 from open_allocator.exec.safe_deployment import SafeSeed
-from open_allocator.exec.user_operation import MULTISEND_CALL_ONLY
+from open_allocator.exec.user_operation import MAX_UINT256, MULTISEND_CALL_ONLY
 
 BASE = 8453
 FANTOM = 250  # deliberately not in PAYMASTER_CHAINS
@@ -42,8 +58,18 @@ OWNER_KEY = "0x" + "11" * 32
 OWNER = Account.from_key(OWNER_KEY).address
 
 
+@dataclass(frozen=True)
+class RpcError:
+    code: int
+    message: str
+
+
 class FakeEndpoint:
-    """A Pimlico endpoint that records calls and replies from a script."""
+    """A Pimlico endpoint that records calls and replies from a script.
+
+    A reply may be a callable of the request's params, and may be an
+    ``RpcError`` to answer with a JSON-RPC error.
+    """
 
     def __init__(self, **overrides: Any) -> None:
         self.replies: dict[str, Any] = {
@@ -118,13 +144,21 @@ class FakeEndpoint:
                         "error": {"code": -32601, "message": f"no reply for {method}"},
                     },
                 )
+            reply = self.replies[method]
+            if callable(reply):
+                reply = reply(body["params"])
+            if isinstance(reply, RpcError):
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {"code": reply.code, "message": reply.message},
+                    },
+                )
             return httpx.Response(
                 200,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": body["id"],
-                    "result": self.replies[method],
-                },
+                json={"jsonrpc": "2.0", "id": body["id"], "result": reply},
             )
 
         return httpx.Client(transport=httpx.MockTransport(handle))
@@ -142,6 +176,15 @@ class FakeEndpoint:
 _PROXY_CREATION_CODE = keccak(text="proxyCreationCode()")[:4]
 _GET_NONCE = keccak(text="getNonce(address,uint192)")[:4]
 _ALLOWANCE = keccak(text="allowance(address,address)")[:4]
+_BALANCE_OF = keccak(text="balanceOf(address)")[:4]
+# Where FakeWeb3 keeps a holder's USDC balance: FiatToken's mapping at slot 9.
+_USDC_BALANCE_BASE = 9
+
+
+def _usdc_balance_slot(holder: str) -> str:
+    key = abi_encode(["address", "uint256"], [holder, _USDC_BALANCE_BASE])
+    return "0x" + keccak(key).hex()
+
 
 # Any bytes work: prediction only has to be self-consistent here, and a real
 # factory's creation code is already exercised against live chains in
@@ -163,8 +206,16 @@ class FakeWeb3:
         nonce: int = 0,
         deployed: bool = True,
         allowance: int = 0,
+        balances: dict[str, int] | None = None,
     ) -> None:
         self.eth = self
+        # Token -> the sender's balance. Only USDC has a storage slot that a
+        # state override can find; any other token's balance is not a plain
+        # stored value.
+        self._balances = {
+            Web3.to_checksum_address(token): amount
+            for token, amount in (balances or {}).items()
+        }
         self._nonce = nonce
         self._deployed = deployed
         # A fresh Safe has approved nothing, so the default here is the state
@@ -175,9 +226,29 @@ class FakeWeb3:
             Web3.to_checksum_address(safe_deployment.SAFE_SINGLETON_L2),
         }
 
-    def call(self, transaction: dict[str, Any]) -> bytes:
+    def call(
+        self,
+        transaction: dict[str, Any],
+        block: object = None,
+        state_override: dict[str, Any] | None = None,
+    ) -> bytes:
         data = bytes.fromhex(transaction["data"][2:])
         selector = data[:4]
+        if selector == _BALANCE_OF:
+            token = Web3.to_checksum_address(transaction["to"])
+            if token not in self._balances:
+                raise AssertionError(f"no balance scripted for {token}")
+            holder = Web3.to_checksum_address("0x" + data[16:36].hex())
+            balance = self._balances[token]
+            written = (
+                (state_override or {})
+                .get(token, {})
+                .get("stateDiff", {})
+                .get(_usdc_balance_slot(holder))
+            )
+            if token == USDC and written is not None:
+                balance = int(written, 16)
+            return balance.to_bytes(32, "big")
         if selector == _PROXY_CREATION_CODE:
             return abi_encode(["bytes"], [_FAKE_CREATION_CODE])
         if selector == _GET_NONCE:
@@ -204,8 +275,11 @@ def _adapter(
     inclusion_timeout_s: float = 120.0,
     allowance: int = 0,
     fee_tier: str = "standard",
+    balances: dict[str, int] | None = None,
 ) -> PimlicoUserOperationAdapter:
-    w3 = FakeWeb3(nonce=nonce, deployed=deployed, allowance=allowance)
+    w3 = FakeWeb3(
+        nonce=nonce, deployed=deployed, allowance=allowance, balances=balances
+    )
     return PimlicoUserOperationAdapter(
         api_key=API_KEY,
         owner_keys=[OWNER_KEY],
@@ -344,6 +418,362 @@ def test_a_deployed_safe_carries_no_factory_fields() -> None:
         account_address=None,
     ).submit_user_operation(_request())
     assert "factory" not in endpoint.sent_user_op()
+
+
+# --- preparation: built and estimated, never signed or sent ------------------
+
+_SUBMISSION_METHODS = ("pm_getPaymasterData", "eth_sendUserOperation")
+
+
+def test_prepare_estimates_the_operation_without_signing_or_sending() -> None:
+    endpoint = FakeEndpoint()
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+
+    methods = endpoint.methods()
+    assert "eth_estimateUserOperationGas" in methods
+    assert not any(method in methods for method in _SUBMISSION_METHODS)
+    assert prepared.sender == SAFE
+    assert prepared.chain_id == BASE
+    assert prepared.entry_point == paymaster_registry.ENTRY_POINT_V07
+    # Still the stub: nothing was signed.
+    stub = safe_4337_signature.dummy_signature(1)
+    assert prepared.user_operation["signature"] == stub
+    assert prepared.gas.call_gas_limit == 0x186A0
+    assert prepared.gas.verification_gas_limit == 0x30D40
+    assert prepared.gas.pre_verification_gas == 0xC350
+    assert prepared.gas.max_fee_per_gas == 0x3B9ACA00
+    assert prepared.gas.max_priority_fee_per_gas == 0xF4240
+    assert prepared.paymaster.paymaster == PAYMASTER
+    assert prepared.paymaster.token == USDC
+    assert prepared.paymaster.exchange_rate == 0x1BC16D674EC80000
+    assert prepared.paymaster.post_op_gas == 0x1388
+
+
+def _erc20_stub(token: str = USDC, *, post_op_gas: int = 0x1388) -> dict[str, Any]:
+    body = bytes([0x03, 0x00]) + bytes(12) + bytes.fromhex(token[2:])
+    body += post_op_gas.to_bytes(16, "big") + (10**18).to_bytes(32, "big")
+    body += (1).to_bytes(16, "big") + bytes(20) + b"\x01" * 65
+    return {
+        "paymaster": PAYMASTER,
+        "paymasterPostOpGasLimit": "0x4e20",
+        "paymasterData": "0x" + body.hex(),
+    }
+
+
+_ESTIMATE_WITH_PAYMASTER_LIMITS = {
+    "callGasLimit": "0x186a0",
+    "verificationGasLimit": "0x30d40",
+    "preVerificationGas": "0xc350",
+    "paymasterVerificationGasLimit": "0x7530",
+    "paymasterPostOpGasLimit": "0x3a98",
+}
+
+
+def test_prepare_bounds_the_gas_token_charge_from_the_stub_config() -> None:
+    endpoint = FakeEndpoint(
+        pm_getPaymasterStubData=_erc20_stub(),
+        eth_estimateUserOperationGas=_ESTIMATE_WITH_PAYMASTER_LIMITS,
+    )
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+
+    # Where the stub and the estimate or quote disagree, the larger value is
+    # bounded: the stub's postOp limit (0x4e20) over the estimate's (0x3a98),
+    # and the quote's rate (2e18) over the stub's (1e18).
+    limits = 0x30D40 + 0x186A0 + 0xC350 + 0x7530 + 0x4E20
+    penalty = (0x186A0 + 0x4E20) // 10
+    expected = (limits + penalty + 0x1388) * 0x3B9ACA00 * 2 * 10**18 // 10**18
+    assert prepared.max_gas_token_charge_raw == str(expected)
+
+
+def test_prepare_does_not_invent_a_charge_from_an_unparseable_stub() -> None:
+    """A stub without the ERC-20 config could be hiding a constant fee."""
+    endpoint = FakeEndpoint(
+        eth_estimateUserOperationGas=_ESTIMATE_WITH_PAYMASTER_LIMITS
+    )
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+    assert prepared.max_gas_token_charge_raw is None
+
+
+def test_prepare_does_not_bound_a_charge_in_another_token() -> None:
+    endpoint = FakeEndpoint(
+        pm_getPaymasterStubData=_erc20_stub("0x" + "99" * 20),
+        eth_estimateUserOperationGas=_ESTIMATE_WITH_PAYMASTER_LIMITS,
+    )
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+    assert prepared.max_gas_token_charge_raw is None
+
+
+def test_prepare_carries_paymaster_gas_limits_when_estimated() -> None:
+    endpoint = FakeEndpoint(
+        eth_estimateUserOperationGas={
+            "callGasLimit": "0x186a0",
+            "verificationGasLimit": "0x30d40",
+            "preVerificationGas": "0xc350",
+            "paymasterVerificationGasLimit": "0x7530",
+            "paymasterPostOpGasLimit": "0x3a98",
+        }
+    )
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+
+    assert prepared.gas.paymaster_verification_gas_limit == 0x7530
+    assert prepared.gas.paymaster_post_op_gas_limit == 0x3A98
+
+
+def test_prepare_fails_closed_on_an_incomplete_estimate() -> None:
+    endpoint = FakeEndpoint(eth_estimateUserOperationGas={"callGasLimit": "0x1"})
+    with pytest.raises(PaymasterError, match="verificationGasLimit"):
+        _adapter(endpoint).prepare_user_operation(_request())
+
+
+def test_prepare_includes_deployment_for_a_counterfactual_safe() -> None:
+    endpoint = FakeEndpoint()
+    prepared = _adapter(
+        endpoint,
+        deployed=False,
+        seed=SafeSeed(owners=(OWNER,), threshold=1),
+        account_address=None,
+    ).prepare_user_operation(_request())
+
+    assert prepared.deployed is False
+    assert prepared.includes_deployment is True
+    assert prepared.factory is not None and prepared.factory_data is not None
+    # The bundler estimated the operation that deploys the Safe, not a bare call.
+    estimated = next(
+        call["params"][0]
+        for call in endpoint.calls
+        if call["method"] == "eth_estimateUserOperationGas"
+    )
+    assert estimated["factory"] == prepared.factory
+    assert estimated["factoryData"] == prepared.factory_data
+    assert not any(method in endpoint.methods() for method in _SUBMISSION_METHODS)
+
+
+def test_prepare_omits_deployment_for_a_deployed_safe() -> None:
+    prepared = _adapter(
+        FakeEndpoint(),
+        deployed=True,
+        seed=SafeSeed(owners=(OWNER,), threshold=1),
+        account_address=None,
+    ).prepare_user_operation(_request())
+
+    assert prepared.includes_deployment is False
+    assert prepared.factory is None and prepared.factory_data is None
+    assert "factory" not in prepared.user_operation
+
+
+def test_prepare_estimates_the_paymaster_approval_with_the_calls() -> None:
+    endpoint = FakeEndpoint()
+    prepared = _adapter(endpoint).prepare_user_operation(_request())
+
+    estimated = next(
+        call["params"][0]
+        for call in endpoint.calls
+        if call["method"] == "eth_estimateUserOperationGas"
+    )
+    call_data = estimated["callData"].lower()
+    assert PAYMASTER[2:].lower() in call_data
+    assert VAULT[2:].lower() in call_data
+    assert prepared.paymaster.approval_included is True
+
+
+def test_prepare_reports_a_standing_approval_as_not_included() -> None:
+    prepared = _adapter(FakeEndpoint(), allowance=MAX_UINT256).prepare_user_operation(
+        _request()
+    )
+    assert prepared.paymaster.approval_included is False
+
+
+def test_submit_prepares_afresh_instead_of_reusing_a_dry_run() -> None:
+    """Nonce, fees, and paymaster data from a dry run are stale by submission."""
+    endpoint = FakeEndpoint()
+    w3 = FakeWeb3(nonce=3)
+    adapter = PimlicoUserOperationAdapter(
+        api_key=API_KEY,
+        owner_keys=[OWNER_KEY],
+        account_address=SAFE,
+        rpc_urls={BASE: "https://base.invalid"},
+        http_client=endpoint.client(),
+        web3_factory=lambda _url: w3,
+        poll_interval_s=0,
+        sleep=lambda _seconds: None,
+    )
+    prepared = adapter.prepare_user_operation(_request())
+    w3._nonce = 4
+
+    adapter.submit_user_operation(_request())
+
+    assert int(prepared.user_operation["nonce"], 16) == 3
+    assert int(endpoint.sent_user_op()["nonce"], 16) == 4
+    assert endpoint.methods().count("eth_estimateUserOperationGas") == 2
+
+
+# --- estimating an operation the Safe cannot fund yet -------------------------
+
+SHARES = Web3.to_checksum_address("0x" + "dd" * 20)
+_REVERTED = RpcError(-32521, "UserOperation reverted during simulation")
+
+
+def _estimate_unless_overridden(params: list[Any]) -> object:
+    """A bundler whose simulation reverts unless the state is overridden."""
+    if len(params) < 3:
+        return _REVERTED
+    return {
+        "callGasLimit": "0x186a0",
+        "verificationGasLimit": "0x30d40",
+        "preVerificationGas": "0xc350",
+    }
+
+
+def _estimates(endpoint: FakeEndpoint) -> list[list[Any]]:
+    return [
+        call["params"]
+        for call in endpoint.calls
+        if call["method"] == "eth_estimateUserOperationGas"
+    ]
+
+
+def test_prepare_turns_a_simulation_revert_into_a_typed_error() -> None:
+    endpoint = FakeEndpoint(eth_estimateUserOperationGas=_REVERTED)
+
+    with pytest.raises(UserOperationSimulationReverted, match="-32521"):
+        _adapter(endpoint).prepare_user_operation(_request())
+
+
+def test_prepare_leaves_other_bundler_errors_as_they_are() -> None:
+    endpoint = FakeEndpoint(
+        eth_estimateUserOperationGas=RpcError(-32602, "invalid params")
+    )
+
+    with pytest.raises(PimlicoError, match="invalid params") as raised:
+        _adapter(endpoint).prepare_user_operation(_request())
+    assert not isinstance(raised.value, UserOperationSimulationReverted)
+
+
+def test_submit_does_not_retype_a_revert() -> None:
+    endpoint = FakeEndpoint(eth_estimateUserOperationGas=_REVERTED)
+
+    with pytest.raises(PimlicoError) as raised:
+        _adapter(endpoint).submit_user_operation(_request())
+    assert not isinstance(raised.value, UserOperationSimulationReverted)
+
+
+def test_prepare_estimates_against_assumed_balances_where_the_safe_is_short() -> None:
+    endpoint = FakeEndpoint(eth_estimateUserOperationGas=_estimate_unless_overridden)
+
+    prepared = _adapter(endpoint, balances={USDC: 0}).prepare_user_operation(
+        _request(), assumed_balances={USDC: 300_000}
+    )
+
+    [params] = _estimates(endpoint)
+    override = params[2][USDC]["stateDiff"]
+    assumed = 300_000 + 2**64  # what the calls need, plus gas headroom
+    assert override == {
+        _usdc_balance_slot(SAFE): "0x" + assumed.to_bytes(32, "big").hex()
+    }
+    assert [item.model_dump() for item in prepared.assumed_balances] == [
+        {"token": USDC, "balance_raw": str(assumed)}
+    ]
+    assert prepared.gas.call_gas_limit == 0x186A0
+    assert not any(method in endpoint.methods() for method in _SUBMISSION_METHODS)
+
+
+def test_prepare_does_not_assume_a_balance_the_safe_already_holds() -> None:
+    endpoint = FakeEndpoint()
+
+    prepared = _adapter(endpoint, balances={USDC: 2**128}).prepare_user_operation(
+        _request(), assumed_balances={USDC: 300_000}
+    )
+
+    [params] = _estimates(endpoint)
+    assert len(params) == 2
+    assert prepared.assumed_balances == ()
+
+
+def test_a_revert_says_which_balances_could_not_be_assumed() -> None:
+    endpoint = FakeEndpoint(eth_estimateUserOperationGas=_REVERTED)
+
+    with pytest.raises(UserOperationSimulationReverted, match="not assumed") as raised:
+        _adapter(endpoint, balances={USDC: 0, SHARES: 0}).prepare_user_operation(
+            _request(), assumed_balances={SHARES: 10**18}
+        )
+    assert SHARES in str(raised.value)
+    # USDC could be assumed and was: the override still went to the bundler.
+    [params] = _estimates(endpoint)
+    assert USDC in params[2]
+
+
+# --- a calldata plan through the real signer and adapter ----------------------
+
+
+def _deposit_plan(account: str) -> TxPlan:
+    payload = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "calldata-instrument-deposit-swap.json"
+        ).read_text(encoding="utf-8")
+    )
+    payload.update(account=account, expiresAt=None)
+    steps, bundle = calldata.plan_bundle(
+        InstrumentCalldataResponse.model_validate(payload),
+        leg_index=0,
+        first_step_index=0,
+    )
+    return TxPlan(steps=steps, summary="deposit", bundles=(bundle,))
+
+
+@pytest.mark.parametrize("deployed", [False, True], ids=["counterfactual", "deployed"])
+def test_a_calldata_plan_is_prepared_without_sending_then_submitted_afresh(
+    deployed: bool,
+) -> None:
+    endpoint = FakeEndpoint()
+    seed = SafeSeed(owners=(OWNER,), threshold=1)
+    adapter = _adapter(endpoint, deployed=deployed, seed=seed, account_address=None)
+    signer = Erc4337PaymasterSigner(adapter=adapter, usdc_address=USDC)
+    tx_plan = _deposit_plan(adapter.address())
+
+    preparation = bundle_execution.prepare_plan(signer, tx_plan, _PlanConfig())
+
+    assert not any(method in endpoint.methods() for method in _SUBMISSION_METHODS)
+    [prepared] = preparation.preparations
+    assert prepared.bundle_ids == (tx_plan.bundles[0].bundle_id,)
+    assert prepared.includes_deployment is (not deployed)
+    assert prepared.call_gas_limit == 0x186A0
+
+    result = bundle_execution.execute_plan(
+        object(),
+        signer,
+        tx_plan,
+        stage="execute",
+        policy_result=PolicyResult(ok=True, violations=()),
+        completion_key=lambda bundle: f"leg:{bundle.leg_index}",
+        log=lambda _bundle, _receipt: bundle_execution.BundleLog(action_type="buy"),
+        config=_PlanConfig(),
+    )
+
+    assert result.status == "success"
+    # The dry run, the confirmed run's check before anything is sent, and once
+    # more immediately before signing — never a stale estimate reused.
+    assert endpoint.methods().count("eth_estimateUserOperationGas") == 3
+    assert len(result.preparations) == 1
+    assert endpoint.methods().count("eth_sendUserOperation") == 1
+    sent = endpoint.sent_user_op()
+    assert ("factory" in sent) is (not deployed)
+    # One operation carrying every bundle call, in the order 1Tx returned them.
+    call_data = sent["callData"].lower()
+    cursor = 0
+    for step in tx_plan.steps:
+        cursor = call_data.index(step.to[2:].lower(), cursor)
+        cursor = call_data.index(step.data[2:].lower(), cursor) + len(step.data) - 2
+
+
+@dataclass(frozen=True)
+class _PlanConfig:
+    signer_mode: str = "erc4337-paymaster"
+    paymaster_provider: str = "pimlico"
+    pimlico_api_key: str = API_KEY
+    _rpc_overrides: dict[int, str] = dataclass_field(
+        default_factory=lambda: {BASE: "https://base.invalid"}
+    )
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
 
 
 def test_the_sender_is_derived_from_the_seed_not_the_configured_address() -> None:
@@ -773,3 +1203,48 @@ def test_allowances_observed_on_mainnet_count_as_unlimited() -> None:
     ):
         _adapter(endpoint, allowance=standing).submit_user_operation(_request())
         assert "095ea7b3" not in endpoint.sent_user_op()["callData"]
+
+
+# --- looking an operation up later ------------------------------------------
+
+
+def test_an_earlier_operation_is_looked_up_by_hash() -> None:
+    signer = Erc4337PaymasterSigner(
+        adapter=_adapter(FakeEndpoint()), account_type="safe", usdc_address=USDC
+    )
+
+    receipt = signer.operation_receipt(BASE, USER_OP_HASH)
+
+    assert signer.supports_cross_chain()
+    assert receipt is not None
+    assert not receipt.pending
+    assert receipt.transaction_hash == TX_HASH
+    assert receipt.safe_tx_hash == USER_OP_HASH
+
+
+def test_an_operation_not_yet_included_has_no_receipt() -> None:
+    signer = Erc4337PaymasterSigner(
+        adapter=_adapter(FakeEndpoint(eth_getUserOperationReceipt=None)),
+        usdc_address=USDC,
+    )
+
+    assert signer.operation_receipt(BASE, USER_OP_HASH) is None
+
+
+def test_an_operation_that_reverted_on_chain_says_so_by_type() -> None:
+    endpoint = FakeEndpoint(
+        eth_getUserOperationReceipt={
+            "userOpHash": USER_OP_HASH,
+            "success": False,
+            "reason": "boom",
+            "receipt": {"transactionHash": TX_HASH},
+        }
+    )
+    signer = Erc4337PaymasterSigner(adapter=_adapter(endpoint), usdc_address=USDC)
+
+    with pytest.raises(UserOperationReverted):
+        signer.operation_receipt(BASE, USER_OP_HASH)
+
+
+def test_an_adapter_that_cannot_estimate_cannot_carry_a_bridge() -> None:
+    assert not Erc4337PaymasterSigner(adapter=object()).supports_cross_chain()

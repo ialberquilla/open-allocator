@@ -25,6 +25,7 @@ from open_allocator.exec import chains
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
     PaymasterConfigurationError,
+    PaymasterPreparationUnavailable,
     PaymasterUnsupportedChain,
     PaymasterUserOperationRequest,
     PaymasterUserOperationSubmission,
@@ -35,6 +36,11 @@ from open_allocator.exec.execute import (
     execute_allocation,
     supports_batching,
 )
+from open_allocator.exec.paymaster_types import (
+    PaymasterTokenQuote,
+    PreparedUserOperation,
+    UserOperationGas,
+)
 from open_allocator.exec.remote_signer import (
     GenericHttpRemoteSignerAdapter,
     RemoteSignerPolicyRejected,
@@ -43,6 +49,7 @@ from open_allocator.exec.safe_signer import (
     SafeGuardPolicy,
     SafeGuardRejected,
     SafeProposal,
+    SafeSignerError,
     SafeSignerThresholdError,
     SafeTransaction,
 )
@@ -54,6 +61,12 @@ from open_allocator.exec.signer import (
     Signer,
     TransactionReverted,
     signer_from_config,
+)
+from open_allocator.exec.user_operation import (
+    DELEGATECALL,
+    MULTISEND_CALL_ONLY,
+    Call,
+    multisend_calldata,
 )
 
 TEST_PRIVATE_KEY = "0x" + "11" * 32
@@ -1006,6 +1019,172 @@ def test_one_operation_cannot_span_two_chains() -> None:
             (paymaster_step(8453), paymaster_step(42161)),
             "rpc://base",
         )
+
+
+def _prepared(request: PaymasterUserOperationRequest) -> PreparedUserOperation:
+    return PreparedUserOperation(
+        sender=request.sender,
+        chain_id=request.chain_id,
+        entry_point=request.entry_point,
+        user_operation={"sender": request.sender, "signature": "0xstub"},
+        deployed=True,
+        gas=UserOperationGas(
+            call_gas_limit=1,
+            verification_gas_limit=2,
+            pre_verification_gas=3,
+            max_fee_per_gas=4,
+            max_priority_fee_per_gas=5,
+        ),
+        paymaster=PaymasterTokenQuote(
+            paymaster="0x00000000000000000000000000000000000000fa",
+            token=request.gas_token_address,
+            approval_included=True,
+        ),
+    )
+
+
+@dataclass
+class MockPreparingPaymasterAdapter(MockPaymasterAdapter):
+    prepared: list[PaymasterUserOperationRequest] = field(default_factory=list)
+
+    def prepare_user_operation(
+        self,
+        request: PaymasterUserOperationRequest,
+    ) -> PreparedUserOperation:
+        self.prepared.append(request)
+        return _prepared(request)
+
+
+def test_a_smart_account_prepares_a_whole_batch_as_one_operation() -> None:
+    adapter = MockPreparingPaymasterAdapter()
+    signer = Erc4337PaymasterSigner(
+        adapter=adapter,
+        entry_point="0x0000000000000000000000000000000000004337",
+        config=PaymasterExecutorConfig(),
+    )
+    approve = paymaster_step(8453).model_copy(update={"kind": "approve"})
+    deposit = paymaster_step(8453).model_copy(
+        update={"to": "0x00000000000000000000000000000000000000cc", "kind": "deposit"}
+    )
+
+    prepared = signer.prepare_batch((approve, deposit), "rpc://base")
+
+    assert len(adapter.prepared) == 1
+    assert [call.to for call in adapter.prepared[0].calls] == [approve.to, deposit.to]
+    assert prepared.chain_id == 8453
+    # Prepared, never submitted.
+    assert adapter.requests == []
+
+
+def test_preparing_says_so_when_the_adapter_can_only_submit() -> None:
+    adapter = MockPaymasterAdapter()
+    signer = Erc4337PaymasterSigner(
+        adapter=adapter,
+        entry_point="0x0000000000000000000000000000000000004337",
+        config=PaymasterExecutorConfig(),
+    )
+
+    with pytest.raises(PaymasterPreparationUnavailable, match="MockPaymasterAdapter"):
+        signer.prepare_batch((paymaster_step(8453),), "rpc://base")
+
+    assert adapter.requests == []
+
+
+def _two_safe_steps() -> tuple[TxStep, TxStep]:
+    return (
+        TxStep(
+            to="0x00000000000000000000000000000000000000bb",
+            data="0x095ea7b3",
+            value=0,
+            chain_id=8453,
+            kind="approve",
+        ),
+        TxStep(
+            to="0x00000000000000000000000000000000000000cc",
+            data="0x6e553f65",
+            value=7,
+            chain_id=8453,
+            kind="deposit",
+        ),
+    )
+
+
+def test_a_safe_proposes_a_batch_as_one_multisend_transaction() -> None:
+    """Separate proposals would all read the same Safe nonce; one can execute."""
+    adapter = MockSafeTransactionServiceAdapter()
+    signer = SafeSigner(adapter=adapter)
+    approve, deposit = _two_safe_steps()
+
+    receipt = signer.send_batch((approve, deposit), "rpc://base")
+
+    assert len(adapter.proposed) == 1
+    proposal = adapter.proposed[0]
+    assert proposal.to == MULTISEND_CALL_ONLY
+    assert proposal.operation == DELEGATECALL
+    assert proposal.value == 0
+    assert proposal.data == multisend_calldata(
+        [
+            Call(to=approve.to, data=approve.data, value=approve.value),
+            Call(to=deposit.to, data=deposit.data, value=deposit.value),
+        ]
+    )
+    assert receipt.pending is True
+    assert receipt.execution_status == "safe_proposed"
+    assert receipt.to_address == deposit.to
+
+
+def test_a_single_step_safe_batch_is_proposed_as_a_plain_call() -> None:
+    adapter = MockSafeTransactionServiceAdapter()
+    approve, _deposit = _two_safe_steps()
+
+    SafeSigner(adapter=adapter).send_batch((approve,), "rpc://base")
+
+    assert [proposal.to for proposal in adapter.proposed] == [approve.to]
+    assert adapter.proposed[0].operation == 0
+
+
+def test_the_safe_guard_checks_every_call_inside_a_batch() -> None:
+    adapter = MockSafeTransactionServiceAdapter()
+    approve, deposit = _two_safe_steps()
+    signer = SafeSigner(
+        adapter=adapter,
+        guard=SafeGuardPolicy(allowed_targets=(approve.to,)),
+    )
+
+    with pytest.raises(SafeGuardRejected, match=deposit.to):
+        signer.send_batch((approve, deposit), "rpc://base")
+
+    assert adapter.proposed == []
+
+
+def test_a_safe_batch_cannot_span_chains() -> None:
+    approve, deposit = _two_safe_steps()
+    with pytest.raises(SafeSignerError, match="cannot span chains"):
+        SafeSigner(adapter=MockSafeTransactionServiceAdapter()).send_batch(
+            (approve, deposit.model_copy(update={"chain_id": 42161})),
+            "rpc://base",
+        )
+
+
+@pytest.mark.parametrize("code", [b"", b"\x60\x60"], ids=["undeployed", "deployed"])
+def test_a_safe_signer_reads_whether_the_safe_exists(code: bytes) -> None:
+    seen: list[str] = []
+
+    class CodeReader:
+        def __init__(self) -> None:
+            self.eth = self
+
+        def get_code(self, address: str) -> bytes:
+            seen.append(address)
+            return code
+
+    signer = SafeSigner(
+        adapter=MockSafeTransactionServiceAdapter(),
+        web3_factory=lambda _url: CodeReader(),  # type: ignore[arg-type,return-value]
+    )
+
+    assert signer.is_deployed(8453, "rpc://base") is (code != b"")
+    assert seen == [Web3.to_checksum_address(SAFE_ADDRESS)]
 
 
 def test_an_eoa_signer_is_not_asked_to_batch() -> None:

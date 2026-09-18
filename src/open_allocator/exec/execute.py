@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, Protocol, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Protocol,
+    overload,
+    runtime_checkable,
+)
 
 from pydantic import Field
 from web3 import HTTPProvider, Web3
@@ -19,14 +26,22 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
-from open_allocator.exec import chains
+from open_allocator.exec import calldata, chains, funding
+from open_allocator.exec.bridge_state import BridgeState
 from open_allocator.exec.erc4337_paymaster import (
     PaymasterError,
     paymaster_cost_notes,
     submits_via_paymaster,
     validate_paymaster_preflight,
 )
+from open_allocator.exec.funding import FundingRequirement
+from open_allocator.exec.paymaster_types import AssumedBalance
 from open_allocator.exec.signer import Receipt, Signer
+
+if TYPE_CHECKING:
+    # Imported for annotations only: both modules import this one.
+    from open_allocator.exec.bundle_execution import PlannedBundle
+    from open_allocator.exec.deposit_sizing import FittedPlan as DepositFit
 
 
 class GasCheck(FrozenModel):
@@ -47,6 +62,39 @@ class ExecutionStepReport(FrozenModel):
     idempotency_key: str | None = None
 
 
+class WalletPreparation(FrozenModel):
+    """The wallet-aware estimate of one Safe operation, prepared but not sent.
+
+    Keyed by the plan bundles it carries. The UserOperation itself is left out:
+    its nonce, fees, and sponsorship expire before submission.
+    """
+
+    bundle_ids: tuple[str, ...] = Field(min_length=1)
+    chain_id: int = Field(ge=1)
+    sender: str
+    # Whether the operation carries counterfactual Safe deployment.
+    includes_deployment: bool
+    # Final wallet gas for the whole operation — deployment, the bundles' calls,
+    # and the paymaster approval — never the protocol-bundle simulation gas.
+    call_gas_limit: int | None = Field(default=None, ge=0)
+    verification_gas_limit: int | None = Field(default=None, ge=0)
+    pre_verification_gas: int | None = Field(default=None, ge=0)
+    paymaster_verification_gas_limit: int | None = Field(default=None, ge=0)
+    paymaster_post_op_gas_limit: int | None = Field(default=None, ge=0)
+    max_fee_per_gas: int | None = Field(default=None, ge=0)
+    max_priority_fee_per_gas: int | None = Field(default=None, ge=0)
+    paymaster_address: str | None = None
+    paymaster_token: str | None = None
+    # Whether the paymaster's token approval rides in front of the calls.
+    paymaster_approval_included: bool | None = None
+    # None when the adapter cannot bound the charge defensibly.
+    max_gas_token_charge_raw: str | None = Field(default=None, pattern=r"^\d+$")
+    # Balances assumed because the operation reverted against the real ones;
+    # ``funding`` says what is missing.
+    assumed_balances: tuple[AssumedBalance, ...] = ()
+    simulation_revert: str | None = None
+
+
 class ExecutionReport(FrozenModel):
     status: Literal["planned", "success", "in_progress", "failed"]
     policy_result: policy_core.PolicyResult
@@ -54,8 +102,14 @@ class ExecutionReport(FrozenModel):
     steps: tuple[ExecutionStepReport, ...] = Field(default_factory=tuple)
     receipts: tuple[Receipt, ...] = Field(default_factory=tuple)
     gas_checks: tuple[GasCheck, ...] = Field(default_factory=tuple)
+    preparations: tuple[WalletPreparation, ...] = Field(default_factory=tuple)
+    # What the plan spends per chain and token, against the balance read.
+    funding: tuple[FundingRequirement, ...] = Field(default_factory=tuple)
     in_progress: bool = False
     messages: tuple[str, ...] = Field(default_factory=tuple)
+    # Bridged legs as this run left them; the idempotency store holds the
+    # records a rerun resumes from.
+    bridges: tuple[BridgeState, ...] = Field(default_factory=tuple)
 
 
 class ExecutionError(RuntimeError):
@@ -158,7 +212,32 @@ def execute_allocation(
 
     address = signer.address()
     vaults_by_id = _vaults_by_id(known)
-    balances_by_chain = _idle_usdc_by_chain(client, address)
+    if calldata.uses_calldata_api(config):
+        fitted = _calldata_deposit_plan(
+            client,
+            signer,
+            address,
+            allocation_model,
+            vaults_by_id,
+            config,
+            idempotency_store,
+        )
+        if not confirm:
+            return fitted.plan
+        return _execute_calldata_deposits(
+            client,
+            signer,
+            fitted,
+            allocation_model,
+            vaults_by_id,
+            policy_result,
+            config,
+            idempotency_store,
+        )
+
+    # Source each leg from what earlier legs left, so two legs never spend the
+    # same balance.
+    ledger = FundingLedger(_idle_usdc_by_chain(client, address))
     plan_steps: list[TxStep] = []
     step_refs: list[_StepRef] = []
     build_payloads: list[object] = []
@@ -168,17 +247,18 @@ def execute_allocation(
         if _store_completed(idempotency_store, leg_key):
             continue
 
-        response = _build_buy(
-            client,
-            _buy_body(
-                address,
-                allocation_model,
-                leg_index,
-                vaults_by_id,
-                config,
-                balances_by_chain,
-            ),
+        body = _buy_body(
+            address,
+            allocation_model,
+            leg_index,
+            vaults_by_id,
+            config,
+            ledger.available,
         )
+        source = body.get("sourceChainId")
+        if isinstance(source, int):
+            ledger.debit(source, leg.usd)
+        response = _build_buy(client, body)
         build_payloads.append(response)
         raw_steps = _raw_transactions(response)
 
@@ -299,6 +379,412 @@ def execute_allocation(
         completed_keys=_completed_keys(step_refs, execution_steps),
     )
     return report
+
+
+def plan_calldata_allocation(
+    client: object,
+    signer: Signer,
+    allocation: Allocation | Mapping[str, object],
+    policy: Policy | Mapping[str, object],
+    *,
+    known_instruments: Iterable[Vault | Mapping[str, object]] | None = None,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> DepositFit:
+    """The calldata deposit plan a dry run reports, prepared and sized.
+
+    What ``execute_allocation(confirm=False)`` plans, plus the preparation and
+    sizing notes it leaves out, so a dry run need not prepare a second time.
+    """
+    allocation_model = _allocation(allocation)
+    known = tuple(known_instruments or ())
+    policy_result = policy_core.check(allocation_model, _policy(policy), known)
+    if not policy_result.ok:
+        raise PolicyCheckFailed(policy_result)
+    return _calldata_deposit_plan(
+        client,
+        signer,
+        signer.address(),
+        allocation_model,
+        _vaults_by_id(known),
+        config,
+        idempotency_store,
+    )
+
+
+def _calldata_deposit_plan(
+    client: object,
+    signer: Signer,
+    address: str,
+    allocation: Allocation,
+    vaults_by_id: Mapping[str, Vault],
+    config: object | None,
+    idempotency_store: object | None,
+) -> DepositFit:
+    """A deposit plan built from calldata bundles, one per unfinished leg.
+
+    A leg deposits from its own chain's USDC when that chain holds enough, and
+    otherwise — or when its source is pinned elsewhere — burns USDC over CCTP
+    on a chain that does; its deposit is settled later by ``exec.bridge``. A
+    leg already bridging is not planned again. Each chain's spends are sized to
+    leave the paymaster's maximum charge in the Safe; a chain short by more
+    than that keeps full size and is a blocker.
+    """
+    from open_allocator.exec import bridge, deposit_sizing
+
+    calldata.ensure_calldata_supported(config)
+    active = {
+        index: state
+        for index, state in bridge.load_states(
+            idempotency_store,
+            [(index, leg.instrument_id) for index, leg in enumerate(allocation.legs)],
+        ).items()
+        if state.active and state.state != "completed"
+    }
+    notes = [bridge.state_note(state) for state in active.values()]
+    pinned = _pinned_source_chain_id(allocation, config)
+    deposits: list[deposit_sizing.DepositRequest] = []
+    for leg_index, leg in enumerate(allocation.legs):
+        if _store_completed(idempotency_store, _leg_key(leg_index, leg.instrument_id)):
+            continue
+        if leg_index in active:
+            continue
+        vault = vaults_by_id.get(leg.instrument_id)
+        if vault is None:
+            raise TransactionPlanError(
+                f"instrument {leg.instrument_id} is not in the discovered universe; "
+                "its chain and deposit token are unknown"
+            )
+        token = calldata.deposit_token(vault.chain_id, vaults_by_id.values(), config)
+        request = deposit_sizing.DepositRequest(
+            index=leg_index,
+            instrument_id=leg.instrument_id,
+            chain_id=vault.chain_id,
+            token=token,
+            wanted_raw=int(calldata.deposit_amount_raw(leg.usd, token)),
+        )
+        if pinned is not None and pinned != vault.chain_id:
+            bridge.require_cross_chain(
+                signer,
+                f"leg {leg_index} ({leg.instrument_id}) is on chain {vault.chain_id} "
+                f"but sources from chain {pinned}",
+            )
+            source = calldata.deposit_token(pinned, vaults_by_id.values(), config)
+            request = deposit_sizing.DepositRequest(
+                index=leg_index,
+                instrument_id=leg.instrument_id,
+                chain_id=pinned,
+                token=source,
+                wanted_raw=int(calldata.deposit_amount_raw(leg.usd, source)),
+                bridge_to_chain_id=vault.chain_id,
+            )
+            notes.append(_bridge_note(request, leg.usd, config, pinned=True))
+        deposits.append(request)
+
+    if pinned is None:
+        deposits, routed = _route_short_legs(
+            client, signer, address, deposits, vaults_by_id, allocation, config
+        )
+        notes.extend(routed)
+
+    def summary(ordered: Sequence[PlannedBundle]) -> str:
+        return (
+            f"Build calldata deposit bundles for {len(ordered)} allocation legs "
+            f"across {sum(len(item.steps) for item in ordered)} transaction steps"
+        )
+
+    fitted = deposit_sizing.fit(
+        client,
+        signer,
+        address,
+        deposits=deposits,
+        summary=summary,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+    burns = [bundle for bundle in fitted.plan.bundles if bundle.action == "bridge"]
+    if burns:
+        routes = bridge.cctp_config(client)
+        for bundle in burns:
+            bridge.check_route(
+                bundle,
+                [fitted.plan.steps[index] for index in bundle.step_indexes],
+                routes,
+            )
+    return replace(fitted, messages=(*notes, *fitted.messages))
+
+
+def _route_short_legs(
+    client: object,
+    signer: Signer,
+    address: str,
+    deposits: Sequence[Any],
+    vaults_by_id: Mapping[str, Vault],
+    allocation: Allocation,
+    config: object | None,
+) -> tuple[list[Any], list[str]]:
+    """Fund a leg its own chain cannot cover from a chain that can, over CCTP.
+
+    Legs are taken in order against the Safe's USDC read on chain; a leg whose
+    chain is short is moved, whole, to the best-funded CCTP chain that covers
+    it. A leg nothing covers stays on its chain for the funding check to
+    report. Needs a signer that can carry a bridge and 1Tx's CCTP chains; with
+    neither, every leg stays where it is.
+    """
+    from open_allocator.exec import bridge, deposit_sizing
+
+    if not deposits or not bridge.supports_cross_chain(signer):
+        return list(deposits), []
+    try:
+        routes = bridge.cctp_config(client)
+    except Exception as error:  # noqa: BLE001 - routing is an optimisation
+        return list(deposits), [
+            "cross-chain funding was not considered: the CCTP configuration could "
+            f"not be read ({type(error).__name__})"
+        ]
+    tokens: dict[int, calldata.DepositToken] = {}
+    for route in routes.supported_chains:
+        try:
+            tokens[route.chain_id] = calldata.deposit_token(
+                route.chain_id, vaults_by_id.values(), config
+            )
+        except calldata.CalldataAmountError:
+            continue
+    for request in deposits:
+        tokens.setdefault(request.chain_id, request.token)
+    keys = {
+        chain_id: funding.key_for(chain_id, address, token.address)
+        for chain_id, token in tokens.items()
+    }
+    read, _unread = funding.read_balances(keys.values(), config)
+    available = {chain_id: read.get(key) for chain_id, key in keys.items()}
+
+    routed: list[Any] = []
+    notes: list[str] = []
+    for request in deposits:
+        held = available.get(request.chain_id)
+        if held is None or held >= request.wanted_raw:
+            if held is not None:
+                available[request.chain_id] = held - request.wanted_raw
+            routed.append(request)
+            continue
+        leg = allocation.legs[request.index]
+        sources = [
+            (amount, chain_id)
+            for chain_id, amount in available.items()
+            if chain_id != request.chain_id
+            and chain_id in tokens
+            and amount is not None
+            and routes.chain(request.chain_id) is not None
+            and routes.chain(chain_id) is not None
+            and amount >= int(calldata.deposit_amount_raw(leg.usd, tokens[chain_id]))
+        ]
+        if not sources:
+            available[request.chain_id] = held - request.wanted_raw
+            routed.append(request)
+            continue
+        _amount, source = max(sources)
+        token = tokens[source]
+        bridged = deposit_sizing.DepositRequest(
+            index=request.index,
+            instrument_id=request.instrument_id,
+            chain_id=source,
+            token=token,
+            wanted_raw=int(calldata.deposit_amount_raw(leg.usd, token)),
+            bridge_to_chain_id=request.chain_id,
+        )
+        available[source] = int(available[source] or 0) - bridged.wanted_raw
+        routed.append(bridged)
+        notes.append(_bridge_note(bridged, leg.usd, config, pinned=False))
+    return routed, notes
+
+
+def _bridge_note(
+    request: Any,
+    usd: float,
+    config: object | None,
+    *,
+    pinned: bool,
+) -> str:
+    from open_allocator.exec import bridge
+
+    return bridge.route_note(
+        request.index,
+        request.instrument_id,
+        source_chain_id=request.chain_id,
+        destination_chain_id=request.bridge_to_chain_id,
+        amount_usdc=usd,
+        fast=bool(_config_value(config, "fast_transfer")),
+        pinned=pinned,
+    )
+
+
+def _execute_calldata_deposits(
+    client: object,
+    signer: Signer,
+    fitted: DepositFit,
+    allocation: Allocation,
+    vaults_by_id: Mapping[str, Vault],
+    policy_result: policy_core.PolicyResult,
+    config: object | None,
+    idempotency_store: object | None,
+) -> ExecutionReport:
+    """Submit a calldata deposit plan, then advance every bridged leg.
+
+    Same-chain deposits and CCTP burns go out one wallet operation per chain
+    run, refused before anything is sent when the Safe does not hold what they
+    require plus each operation's paymaster charge. A burn's leg is recorded as
+    submitted before its completion is marked; that leg and any leg an earlier
+    run left bridging are then taken as far as they can go now.
+    """
+    from open_allocator.exec import bridge, bridge_state, bundle_execution
+
+    def token_for(chain_id: int) -> calldata.DepositToken:
+        return calldata.deposit_token(chain_id, vaults_by_id.values(), config)
+
+    planned: dict[str, BridgeState] = {}
+    for bundle in fitted.plan.bundles:
+        if bundle.action != "bridge":
+            continue
+        assert bundle.bridge is not None
+        leg = allocation.legs[bundle.leg_index]
+        destination = token_for(bundle.bridge.to_chain_id)
+        steps = [fitted.plan.steps[index] for index in bundle.step_indexes]
+        state = bridge.planned_state(
+            bundle,
+            source_token_messenger=steps[-1].to,
+            wanted_deposit_raw=int(calldata.deposit_amount_raw(leg.usd, destination)),
+        )
+        bridge_state.save(idempotency_store, state)
+        planned[bundle.bundle_id] = state
+
+    def on_submitted(
+        item: PlannedBundle,
+        operation: Any,
+        receipt: Receipt | None,
+    ) -> None:
+        state = planned.get(item.bundle.bundle_id)
+        if state is not None:
+            bridge_state.save(
+                idempotency_store,
+                bridge.submitted_state(state, item, operation, receipt),
+            )
+
+    result = bundle_execution.execute_plan(
+        client,
+        signer,
+        fitted.plan,
+        stage="execute",
+        policy_result=policy_result,
+        completion_key=lambda bundle: (
+            bridge.burn_completion_key(bundle)
+            if bundle.action == "bridge"
+            else _leg_key(bundle.leg_index, bundle.instrument_id)
+        ),
+        log=lambda bundle, _receipt: (
+            None
+            if bundle.action == "bridge"
+            else bundle_execution.BundleLog(
+                action_type="buy",
+                usd=fitted.deposit_usd.get(bundle.leg_index),
+            )
+        ),
+        config=config,
+        idempotency_store=idempotency_store,
+        on_submitted=on_submitted,
+    )
+
+    states = bridge.load_states(
+        idempotency_store,
+        [(index, leg.instrument_id) for index, leg in enumerate(allocation.legs)],
+    )
+    runner = bridge.BridgeRunner(
+        client=client,
+        signer=signer,
+        store=idempotency_store,
+        token_for=token_for,
+        policy_result=policy_result,
+        config=config,
+    )
+    progress = runner.advance(
+        [
+            state
+            for state in states.values()
+            if state.active and state.state not in ("completed", "failed")
+        ]
+    )
+    # Legs finished by an earlier run were never planned, but they are still
+    # complete; the checkpoint is a snapshot of the whole allocation.
+    done = {*result.completed_keys, *progress.completed_keys}
+    earlier = tuple(
+        _leg_key(index, leg.instrument_id)
+        for index, leg in enumerate(allocation.legs)
+        if _leg_key(index, leg.instrument_id) not in done
+        and _store_completed(idempotency_store, _leg_key(index, leg.instrument_id))
+    )
+    in_progress = result.in_progress or progress.in_progress
+    # A leg that failed after burning stays failed until someone looks at it.
+    stuck = [
+        state for state in states.values() if state.state == "failed" and state.active
+    ]
+    stuck_messages = tuple(
+        f"bridged {state.leg_id} failed and is not redeemed automatically: "
+        f"{state.last_error}; its burn is {state.source_transaction_hash} on "
+        f"{chains.chain_name(state.source_chain_id)}"
+        for state in stuck
+    )
+    if idempotency_store is None:
+        bridges = tuple(progress.states)
+    else:
+        bridges = tuple(
+            bridge.load_states(
+                idempotency_store,
+                [(state.leg_index, state.instrument_id) for state in states.values()],
+            ).values()
+        )
+    if progress.failed or stuck:
+        status: Literal["success", "in_progress", "failed"] = "failed"
+    else:
+        status = "in_progress" if in_progress else "success"
+    report = ExecutionReport(
+        status=status,
+        policy_result=policy_result,
+        plan=result.plan,
+        steps=(*result.steps, *progress.steps),
+        receipts=(*result.receipts, *progress.receipts),
+        gas_checks=result.gas_checks,
+        preparations=(*result.preparations, *progress.preparations),
+        funding=(*result.funding, *progress.funding),
+        in_progress=in_progress,
+        messages=(
+            *fitted.messages,
+            *result.messages,
+            *progress.messages,
+            *stuck_messages,
+        ),
+        bridges=bridges,
+    )
+    _write_checkpoint(
+        config,
+        "execute",
+        report,
+        completed_keys=(*earlier, *result.completed_keys, *progress.completed_keys),
+    )
+    return report
+
+
+def _pinned_source_chain_id(
+    allocation: Allocation,
+    config: object | None,
+) -> int | None:
+    configured = _config_value(config, "source_chain_id")
+    if configured is not None:
+        return int(configured)  # type: ignore[call-overload]
+    for key in ("source_chain_id", "sourceChainId"):
+        value = allocation.metadata.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -511,14 +997,9 @@ def _source_chain_id(
     leg_usd: float | None,
     balances_by_chain: Mapping[int, float] | None,
 ) -> int | None:
-    configured = _config_value(config, "source_chain_id")
-    if configured is not None:
-        return int(configured)
-
-    for key in ("source_chain_id", "sourceChainId"):
-        value = allocation.metadata.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
+    pinned = _pinned_source_chain_id(allocation, config)
+    if pinned is not None:
+        return pinned
 
     # Balance-aware default: source USDC from the chain the wallet is actually
     # funded on. 1Tx (SwapDepositRouter + CCTP) bridges from that source chain
@@ -580,6 +1061,12 @@ class FundingLedger:
         if chain not in self._available:
             self._available[chain] = -self._reserve
         self._available[chain] = self._available.get(chain, 0.0) + float(usd)
+
+    def debit(self, chain: int, usd: float) -> None:
+        """Spend from a chain the planner already chose to source a buy from."""
+        if usd <= 0:
+            return
+        self._available[chain] = self._available.get(chain, 0.0) - float(usd)
 
     def plan_sources(
         self,
@@ -1127,6 +1614,8 @@ __all__ = [
     "IdempotencyStore",
     "PolicyCheckFailed",
     "TransactionPlanError",
+    "WalletPreparation",
     "execute_allocation",
     "pending_receipt_messages",
+    "plan_calldata_allocation",
 ]

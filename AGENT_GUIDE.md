@@ -101,6 +101,8 @@ Full surface and the known limits of every metric: [docs/capabilities.md](docs/c
 2. Build deltas only; do not redeploy unchanged positions.
 3. Run scoring, simulation, and `check-policy` for the proposed deltas.
 4. Announce the exact exits, deposits, chains, amounts, risks, and expected transactions.
+   For a calldata plan, announce the deposit amounts the dry run actually built —
+   a buy may be sized down to what its chain holds after its sells — not the target's.
 5. Wait for approval, then run `rebalance --confirm`.
 
 ## Withdraw Loop
@@ -109,12 +111,13 @@ Full surface and the known limits of every metric: [docs/capabilities.md](docs/c
 2. Check liquidity, withdrawal constraints, gas, and any cross-chain timing. A gasless
    exit funds itself from the redeem and needs nothing pre-positioned on the chain,
    but its proceeds must exceed its gas.
-3. Announce the share amount, expected destination asset, chain, risks, and transactions.
-4. Wait for approval, then run `withdraw --confirm`.
+3. Dry-run it: `withdraw --position <id> [--amount <usd>]` without `--confirm` builds the plan and sends nothing.
+4. Announce the share amount, expected destination asset, chain, risks, and transactions.
+5. Wait for approval, then run `withdraw --confirm`.
 
 ## Confirmation Discipline
 
-Announce before execute. A valid execution announcement includes the wallet, source and destination chains, instruments, amounts, calldata source, policy result, expected gas assets, and failure modes.
+Announce before execute. A valid execution announcement includes the wallet, source and destination chains, instruments, amounts, calldata source, policy result, expected gas assets, and failure modes. For a calldata plan it also includes the dry run's `funding` rows — each token the plan spends, the balance held, and any shortfall, including the paymaster's maximum USDC charge. A calldata leg that bridges (a `bridge` bundle) is announced as such: source and destination chain, burned amount, and that its deposit is sized only after Circle attests; rerun the same `execute --confirm` until its `bridges` state is `completed`.
 
 `--unsafe` and `--autonomous` are not shortcuts. Use them only when the policy and task explicitly require them and the bounds are documented before execution.
 

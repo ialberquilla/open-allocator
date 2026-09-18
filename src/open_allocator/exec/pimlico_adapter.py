@@ -10,6 +10,7 @@ from web3 import Web3
 from open_allocator.exec import (
     chains,
     erc20,
+    paymaster_charge,
     paymaster_registry,
     safe_4337_signature,
     safe_deployment,
@@ -18,11 +19,17 @@ from open_allocator.exec import (
     entry_point as entry_point_reads,
 )
 from open_allocator.exec.paymaster_types import (
+    AssumedBalance,
     PaymasterConfigurationError,
     PaymasterError,
+    PaymasterTokenQuote,
     PaymasterUnsupportedChain,
     PaymasterUserOperationRequest,
     PaymasterUserOperationSubmission,
+    PreparedUserOperation,
+    UserOperationGas,
+    UserOperationReverted,
+    UserOperationSimulationReverted,
 )
 from open_allocator.exec.pimlico import (
     DEFAULT_FEE_TIER,
@@ -30,6 +37,8 @@ from open_allocator.exec.pimlico import (
     FeeTier,
     PimlicoClient,
     PimlicoPaymasterAdapter,
+    PimlicoRpcError,
+    TokenQuote,
 )
 from open_allocator.exec.safe_deployment import SafeSeed
 from open_allocator.exec.user_operation import (
@@ -45,6 +54,15 @@ from open_allocator.exec.user_operation import (
 # This is the piece that makes PAYMASTER_PROVIDER=pimlico reachable from the CLI.
 # The lower-level modules (pimlico, user_operation, safe_4337_signature) were each
 # usable on their own; nothing connected them to signer_from_config.
+
+# JSON-RPC codes the bundler answers with when its simulation of the operation
+# reverts: -32500 in validation (including a paymaster postOp, AA50), -32521 in
+# execution.
+_SIMULATION_REVERT_CODES = frozenset({-32500, -32521})
+
+# Gas-token headroom added to assumed balances so the paymaster's postOp pull
+# succeeds; below the high bits some tokens use for flags.
+_ASSUMED_GAS_TOKEN_HEADROOM_RAW = 2**64
 
 _GAS_LIMIT_PLACEHOLDERS = {
     "callGasLimit": "0x0",
@@ -154,10 +172,95 @@ class PimlicoUserOperationAdapter:
             "be derived; set RPC_URL_<chain id> for at least one chain"
         )
 
+    def prepare_user_operation(
+        self,
+        request: PaymasterUserOperationRequest,
+        *,
+        assumed_balances: Mapping[str, int] | None = None,
+    ) -> PreparedUserOperation:
+        """Build and estimate the complete operation; sign and send nothing.
+
+        Covers Safe deployment, paymaster approval, and every call in order.
+        ``assumed_balances`` (token -> raw amount) estimates as if the Safe held
+        at least those amounts, plus gas headroom in the gas token.
+        """
+        try:
+            prepared, _pimlico = self._prepare(
+                request,
+                assumed_balances=assumed_balances,
+            )
+        except PimlicoRpcError as error:
+            if error.code in _SIMULATION_REVERT_CODES:
+                raise UserOperationSimulationReverted(str(error)) from error
+            raise
+        return prepared
+
     def submit_user_operation(
         self,
         request: PaymasterUserOperationRequest,
     ) -> PaymasterUserOperationSubmission:
+        # Prepared afresh here, never taken from a dry run: the nonce, fees,
+        # paymaster quote, and estimate are only good at the moment of signing.
+        prepared, pimlico = self._prepare(request)
+        chain_id = prepared.chain_id
+
+        # Sponsor before signing: paymasterAndData is inside the SafeOp hash, so
+        # signing first would produce a signature for a different operation.
+        sponsored = pimlico.sponsor(
+            prepared.user_operation,
+            token=request.gas_token_address,
+        )
+        signed = safe_4337_signature.sign_user_operation(
+            sponsored,
+            private_keys=self._owner_keys,
+            chain_id=chain_id,
+            module=self._module,
+            entry_point=pimlico.entry_point,
+        )
+
+        user_op_hash = pimlico.send(signed)
+        message = (
+            f"user operation submitted via Pimlico on "
+            f"{chains.chain_name(chain_id)}, gas paid in USDC"
+            + ("" if prepared.deployed else "; deploys the Safe in this operation")
+        )
+
+        # The next operation reads nonce and deployment from the chain, which are
+        # stale until this one is mined (AA10 otherwise).
+        included = self._await_inclusion(pimlico, user_op_hash)
+        if included is None:
+            return PaymasterUserOperationSubmission(
+                user_op_hash=user_op_hash,
+                status="submitted",
+                message=f"{message}; still pending after "
+                f"{self._inclusion_timeout_s:.0f}s",
+            )
+        return _submission_from_receipt(user_op_hash, included, message)
+
+    def user_operation_receipt(
+        self,
+        chain_id: int,
+        user_op_hash: str,
+    ) -> PaymasterUserOperationSubmission | None:
+        """An earlier operation's inclusion, or None while it is still pending.
+
+        Raises ``PaymasterError`` when it was included and reverted.
+        """
+        included = self._paymaster(chain_id).receipt(user_op_hash)
+        if included is None:
+            return None
+        return _submission_from_receipt(
+            user_op_hash,
+            included,
+            f"user operation included on {chains.chain_name(chain_id)}",
+        )
+
+    def _prepare(
+        self,
+        request: PaymasterUserOperationRequest,
+        *,
+        assumed_balances: Mapping[str, int] | None = None,
+    ) -> tuple[PreparedUserOperation, PimlicoPaymasterAdapter]:
         chain_id = request.chain_id
         if not paymaster_registry.is_gas_payable(chain_id, provider="pimlico"):
             raise PaymasterUnsupportedChain(chain_id)
@@ -181,15 +284,16 @@ class PimlicoUserOperationAdapter:
         actions = [
             Call(to=call.to, data=call.data, value=call.value) for call in request.calls
         ]
+        approved = self._paymaster_already_approved(
+            w3,
+            token,
+            owner=sender,
+            spender=quote.paymaster,
+            deployed=deployed,
+        )
         calls = (
             tuple(actions)
-            if self._paymaster_already_approved(
-                w3,
-                token,
-                owner=sender,
-                spender=quote.paymaster,
-                deployed=deployed,
-            )
+            if approved
             else paymaster_calls(actions, token=token, paymaster=quote.paymaster)
         )
 
@@ -201,47 +305,72 @@ class PimlicoUserOperationAdapter:
             deployed=deployed,
             signature=safe_4337_signature.dummy_signature(len(self._owner_keys)),
         )
-        user_op.update(_hex_values(pimlico.gas_price(self._fee_tier)))
+        fees = pimlico.gas_price(self._fee_tier)
+        user_op.update(_hex_values(fees))
         # pm_getPaymasterStubData rejects a userOp whose gas limits are absent,
         # but the limits come from an estimate that needs the stub first. Seed
         # zeros to break the cycle — the estimate below overwrites all three.
         user_op.update(_GAS_LIMIT_PLACEHOLDERS)
-        user_op.update(
-            _hex_values(pimlico.estimate_gas(pimlico.stub_data(user_op, token=token)))
-        )
-
-        # Sponsor before signing: paymasterAndData is inside the SafeOp hash, so
-        # signing first would produce a signature for a different operation.
-        sponsored = pimlico.sponsor(user_op, token=token)
-        signed = safe_4337_signature.sign_user_operation(
-            sponsored,
-            private_keys=self._owner_keys,
-            chain_id=chain_id,
-            module=self._module,
-            entry_point=pimlico.entry_point,
-        )
-
-        user_op_hash = pimlico.send(signed)
-        message = (
-            f"user operation submitted via Pimlico on "
-            f"{chains.chain_name(chain_id)}, gas paid in USDC"
-            + ("" if deployed else "; deploys the Safe in this operation")
-        )
-
-        # Wait for it: the next operation from this Safe reads the nonce and the
-        # deployment status from the chain, and both are wrong until this one is
-        # mined — the second op re-sends the factory and the EntryPoint rejects
-        # it with AA10. Ops from one sender are sequential whether we like it or
-        # not.
-        included = self._await_inclusion(pimlico, user_op_hash)
-        if included is None:
-            return PaymasterUserOperationSubmission(
-                user_op_hash=user_op_hash,
-                status="submitted",
-                message=f"{message}; still pending after "
-                f"{self._inclusion_timeout_s:.0f}s",
+        stubbed = pimlico.stub_data(user_op, token=token)
+        state_override: dict[str, Any] = {}
+        assumed: tuple[AssumedBalance, ...] = ()
+        unassumed: tuple[str, ...] = ()
+        if assumed_balances is not None:
+            state_override, assumed, unassumed = _balance_overrides(
+                w3,
+                sender,
+                {
+                    **assumed_balances,
+                    token: _amount_for(assumed_balances, token)
+                    + _ASSUMED_GAS_TOKEN_HEADROOM_RAW,
+                },
             )
-        return _submission_from_receipt(user_op_hash, included, message)
+        try:
+            estimate = pimlico.estimate_gas(stubbed, state_override or None)
+        except PimlicoRpcError as error:
+            if unassumed and error.code in _SIMULATION_REVERT_CODES:
+                raise UserOperationSimulationReverted(
+                    f"{error}; not assumed: {'; '.join(unassumed)}"
+                ) from error
+            raise
+        user_op.update(_hex_values(estimate))
+        gas = UserOperationGas(
+            call_gas_limit=_estimate_field(estimate, "callGasLimit"),
+            verification_gas_limit=_estimate_field(estimate, "verificationGasLimit"),
+            pre_verification_gas=_estimate_field(estimate, "preVerificationGas"),
+            paymaster_verification_gas_limit=estimate.get(
+                "paymasterVerificationGasLimit"
+            ),
+            paymaster_post_op_gas_limit=estimate.get("paymasterPostOpGasLimit"),
+            max_fee_per_gas=fees["maxFeePerGas"],
+            max_priority_fee_per_gas=fees["maxPriorityFeePerGas"],
+        )
+
+        prepared = PreparedUserOperation(
+            sender=sender,
+            chain_id=chain_id,
+            entry_point=pimlico.entry_point,
+            user_operation=user_op,
+            deployed=deployed,
+            factory=user_op.get("factory"),
+            factory_data=user_op.get("factoryData"),
+            gas=gas,
+            paymaster=PaymasterTokenQuote(
+                paymaster=quote.paymaster,
+                token=token,
+                exchange_rate=quote.exchange_rate,
+                post_op_gas=quote.post_op_gas,
+                approval_included=not approved,
+            ),
+            max_gas_token_charge_raw=_max_gas_token_charge(
+                gas,
+                quote=quote,
+                stub=stubbed,
+                token=token,
+            ),
+            assumed_balances=assumed,
+        )
+        return prepared, pimlico
 
     def _await_inclusion(
         self,
@@ -372,7 +501,7 @@ def _submission_from_receipt(
         # Included and reverted still costs the user gas, so it must not read as
         # a success anywhere downstream.
         reason = receipt.get("reason") or "no reason given"
-        raise PaymasterError(
+        raise UserOperationReverted(
             f"user operation {user_op_hash} reverted on chain: {reason}"
         )
     return PaymasterUserOperationSubmission(
@@ -385,6 +514,95 @@ def _submission_from_receipt(
         ),
         message=message,
     )
+
+
+def _max_gas_token_charge(
+    gas: UserOperationGas,
+    *,
+    quote: TokenQuote,
+    stub: Mapping[str, Any],
+    token: str,
+) -> str | None:
+    """The bounded USDC charge, from the stub's paymaster config and the quote.
+
+    None when the stub does not parse or is for another token. Where the stub
+    and the estimate or quote both give a value, the larger one is used.
+    """
+    config = paymaster_charge.parse_erc20_paymaster_data(stub.get("paymasterData"))
+    if config is None or config.token.casefold() != token.casefold():
+        return None
+    bounded = gas.model_copy(
+        update={
+            field: _larger(getattr(gas, field), stub.get(key))
+            for field, key in (
+                ("paymaster_verification_gas_limit", "paymasterVerificationGasLimit"),
+                ("paymaster_post_op_gas_limit", "paymasterPostOpGasLimit"),
+            )
+        }
+    )
+    charge = paymaster_charge.max_token_charge(
+        bounded,
+        post_op_gas=max(config.post_op_gas, quote.post_op_gas),
+        exchange_rate=max(config.exchange_rate, quote.exchange_rate),
+        constant_fee=config.constant_fee,
+    )
+    return None if charge is None else str(charge)
+
+
+def _balance_overrides(
+    w3: Web3,
+    owner: str,
+    wanted: Mapping[str, int],
+) -> tuple[dict[str, Any], tuple[AssumedBalance, ...], tuple[str, ...]]:
+    """State overrides raising ``owner``'s balances to ``wanted`` where short.
+
+    A balance already at least as large is left as the chain has it. A token
+    whose balance slot cannot be found is left too, and why is returned: the
+    estimate may still revert, and that revert is the honest answer.
+    """
+    override: dict[str, Any] = {}
+    assumed: list[AssumedBalance] = []
+    unassumed: list[str] = []
+    merged: dict[str, tuple[str, int]] = {}
+    for token, amount in wanted.items():
+        _name, total = merged.get(token.casefold(), (token, 0))
+        merged[token.casefold()] = (token, max(total, int(amount)))
+    for token, amount in merged.values():
+        try:
+            if erc20.balance_of(w3, token, owner=owner) >= amount:
+                continue
+        except erc20.BalanceReadError:
+            pass
+        try:
+            override.update(
+                erc20.balance_state_override(w3, token, owner=owner, balance=amount)
+            )
+        except erc20.BalanceOverrideUnavailable as error:
+            unassumed.append(str(error))
+            continue
+        assumed.append(AssumedBalance(token=token, balance_raw=str(amount)))
+    return override, tuple(assumed), tuple(unassumed)
+
+
+def _amount_for(amounts: Mapping[str, int], token: str) -> int:
+    wanted = token.casefold()
+    return max(
+        (int(amount) for key, amount in amounts.items() if key.casefold() == wanted),
+        default=0,
+    )
+
+
+def _larger(estimated: int | None, stubbed: object) -> int | None:
+    if stubbed is None:
+        return estimated
+    value = _optional_hex_int(stubbed)
+    return value if estimated is None else max(estimated, value)
+
+
+def _estimate_field(estimate: Mapping[str, int], key: str) -> int:
+    if key not in estimate:
+        raise PaymasterError(f"user operation gas estimate is missing {key}")
+    return estimate[key]
 
 
 def _optional_str(value: object) -> str | None:

@@ -177,13 +177,20 @@ blocks.
   the allocation is still valid, but a blanket floor applied to every tier can
   produce a riskier book than setting no floor at all. Size floors against the
   shelf you have, not uniformly.
-- **The allocation log cannot price a buy.** A buy records the dollars it spent
-  and nothing else: the build endpoint neither takes nor returns a share amount
-  and the receipt carries no logs, so the shares bought are unknown until the
-  position is next read. Those entries carry `basis: "unresolved"` and cannot
-  contribute a per-share cost basis. Sells and withdrawals do carry a price —
-  quoted where the plan knew it, derived from dollars ÷ shares otherwise — and
-  say which in the same field. **There is no backfill**: an amount missing from
+- **A build response cannot price a buy.** Neither 1Tx API takes or returns a
+  share amount, and the receipt carries no logs, so a rebalance buy reads the
+  settled position and logs the exact share delta. What happens before that
+  delta is observable depends on `ONE_TX_TRANSACTION_API`:
+  - `legacy` — no row is appended and the rebalance stays `in_progress`; a
+    rerun retries the read without rebroadcasting.
+  - `calldata` — the row is appended at once with the USDC the deposit spent
+    and no shares (`basis: "unresolved"`), and the report says the cost basis
+    is not yet observable. The leg is complete, so a rerun does not retry.
+
+  Unresolved buy entries, including every calldata deposit made outside a
+  rebalance, cannot contribute a per-share cost basis. Sells and withdrawals
+  carry a price — quoted where the plan knew it, derived from dollars ÷ shares
+  otherwise — and say which in the same field. **There is no backfill**: an amount missing from
   the log stays missing.
 - **`--max-positions` truncates after tier allocation.** Combined with
   `sleeves`, the cut can collapse the book toward the top tier rather than

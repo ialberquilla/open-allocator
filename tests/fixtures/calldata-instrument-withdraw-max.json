@@ -1,0 +1,47 @@
+{
+  "instrumentId": "0xabababababababababababababababababababababababababababababababab",
+  "chainId": 8453,
+  "account": "0x1111111111111111111111111111111111111111",
+  "action": "withdraw",
+  "tokenIn": {
+    "address": "0x3333333333333333333333333333333333333333",
+    "symbol": "vUSDC",
+    "decimals": 18
+  },
+  "tokenOut": {
+    "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "symbol": "USDC",
+    "decimals": 6
+  },
+  "amountIn": "max",
+  "depositAmount": null,
+  "expectedOut": "50001234",
+  "minOut": null,
+  "expiresAt": null,
+  "quoteBlock": 35123460,
+  "requires": [
+    {
+      "token": "0x3333333333333333333333333333333333333333",
+      "amount": "49000000000000000000"
+    }
+  ],
+  "leftovers": [],
+  "calls": [
+    {
+      "to": "0x3333333333333333333333333333333333333333",
+      "data": "0xba087652000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "value": "0",
+      "chainId": 8453,
+      "type": "withdraw"
+    }
+  ],
+  "simulation": {
+    "ok": true,
+    "scope": "protocol_bundle",
+    "engine": "wallet_neutral_atomic",
+    "gasUsed": "98765",
+    "quoteBlock": 35123460,
+    "tokenOutDelta": "50001234",
+    "assumedBalances": true
+  }
+}

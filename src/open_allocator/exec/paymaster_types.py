@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Literal, Protocol, runtime_checkable
+from collections.abc import Mapping
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
 
@@ -20,6 +21,23 @@ class PaymasterConfigurationError(PaymasterError):
 
 class PaymasterRejected(PaymasterError):
     pass
+
+
+class UserOperationReverted(PaymasterError):
+    """A submitted operation was included and reverted; none of its calls stuck."""
+
+
+class PaymasterPreparationUnavailable(PaymasterError):
+    """The adapter can submit an operation but cannot prepare one unsent."""
+
+
+class UserOperationSimulationReverted(PaymasterError):
+    """The bundler simulated the prepared operation and it reverted.
+
+    Raised by preparation only. An account that does not yet hold what the
+    calls spend or the paymaster charges reverts this way, so a caller may
+    prepare again with those balances assumed.
+    """
 
 
 class PaymasterUnsupportedChain(PaymasterError):
@@ -63,6 +81,67 @@ class PaymasterUserOperationSubmission(FrozenModel):
     message: str | None = None
 
 
+class UserOperationGas(FrozenModel):
+    """The wallet gas of one complete operation, as the bundler estimated it."""
+
+    call_gas_limit: int = Field(ge=0)
+    verification_gas_limit: int = Field(ge=0)
+    pre_verification_gas: int = Field(ge=0)
+    paymaster_verification_gas_limit: int | None = Field(default=None, ge=0)
+    paymaster_post_op_gas_limit: int | None = Field(default=None, ge=0)
+    max_fee_per_gas: int = Field(ge=0)
+    max_priority_fee_per_gas: int = Field(ge=0)
+
+
+class PaymasterTokenQuote(FrozenModel):
+    """The paymaster and gas-token rate the operation was estimated against."""
+
+    paymaster: str
+    token: str
+    exchange_rate: int | None = Field(default=None, ge=0)
+    post_op_gas: int | None = Field(default=None, ge=0)
+    # Whether the paymaster's token approval rides in front of the calls.
+    approval_included: bool
+
+
+class AssumedBalance(FrozenModel):
+    """A token balance the estimate assumed in place of the one on chain."""
+
+    token: str
+    balance_raw: str = Field(pattern=r"^\d+$")
+
+
+class PreparedUserOperation(FrozenModel):
+    """A complete operation built and estimated, but neither signed nor sent.
+
+    Everything in it — nonce, fees, paymaster data, the estimate — goes stale,
+    so it is for reporting and validation only. Submission prepares afresh
+    immediately before signing rather than sending one of these.
+    """
+
+    sender: str
+    chain_id: int = Field(ge=1)
+    entry_point: str
+    # The unsigned operation, carrying a stub signature and stub paymaster data.
+    user_operation: dict[str, Any]
+    deployed: bool
+    factory: str | None = None
+    factory_data: str | None = None
+    gas: UserOperationGas
+    paymaster: PaymasterTokenQuote
+    # The most gas token the operation can be charged. None when the adapter
+    # cannot bound it defensibly: such an operation may still spend a funded
+    # balance, but must not be the one a bridged mint has to pay for.
+    max_gas_token_charge_raw: str | None = Field(default=None, pattern=r"^\d+$")
+    # Balances the estimate overrode because the account does not hold them.
+    # Empty means it ran against the chain as it is.
+    assumed_balances: tuple[AssumedBalance, ...] = ()
+
+    @property
+    def includes_deployment(self) -> bool:
+        return not self.deployed
+
+
 @runtime_checkable
 class PaymasterUserOperationAdapter(Protocol):
     def address(self) -> str: ...
@@ -71,3 +150,15 @@ class PaymasterUserOperationAdapter(Protocol):
         self,
         request: PaymasterUserOperationRequest,
     ) -> PaymasterUserOperationSubmission: ...
+
+
+@runtime_checkable
+class PreparingPaymasterUserOperationAdapter(PaymasterUserOperationAdapter, Protocol):
+    """An adapter that can build and estimate an operation without sending it."""
+
+    def prepare_user_operation(
+        self,
+        request: PaymasterUserOperationRequest,
+        *,
+        assumed_balances: Mapping[str, int] | None = None,
+    ) -> PreparedUserOperation: ...

@@ -119,6 +119,18 @@ def _to_vault(instrument: object) -> Vault:
         protocol=str(_required(instrument, "protocol")),
         chain_id=int(_required(instrument, "chain_id", "chainId")),
         asset=str(_required(instrument, "asset", "token_symbol", "tokenSymbol")),
+        token_address=_optional_text(instrument, "token_address", "tokenAddress"),
+        token_decimals=_optional_int(instrument, "token_decimals", "tokenDecimals"),
+        yield_token_address=_optional_text(
+            instrument,
+            "yield_token_address",
+            "yieldTokenAddress",
+        ),
+        yield_token_decimals=_optional_int(
+            instrument,
+            "yield_token_decimals",
+            "yieldTokenDecimals",
+        ),
         asset_category=_optional_text(instrument, "asset_category", "assetCategory"),
         sector=_optional_text(instrument, "sector"),
         is_stablecoin=_optional_bool(instrument, "is_stablecoin", "isStablecoin"),
@@ -172,6 +184,15 @@ def _optional_bool(value: object, *names: str) -> bool | None:
     if found is _MISSING or found is None:
         return None
     return bool(found)
+
+
+def _optional_int(value: object, *names: str) -> int | None:
+    found = _value(value, *names)
+    if found is _MISSING or found is None:
+        return None
+    if isinstance(found, bool) or not isinstance(found, int | str):
+        raise TypeError(f"{names[0]} must be an integer")
+    return int(found)
 
 
 def _optional_float(value: object, *names: str) -> float | None:

@@ -41,8 +41,11 @@ from open_allocator.core.types import (
 )
 from open_allocator.exec import chains, safe_deployment
 from open_allocator.exec import gas as gas_module
+from open_allocator.exec.bundle_execution import PlanPreparation
+from open_allocator.exec.calldata import uses_calldata_api
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
+from open_allocator.exec.execute import TransactionPlanError, plan_calldata_allocation
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonObject = dict[str, Any]
@@ -80,33 +83,14 @@ def _write_json(payload: JsonValue, *, err: bool = False) -> None:
     typer.echo(json.dumps(payload, separators=(",", ":")), err=err)
 
 
-def _execution_plan(command_name: str) -> JsonObject:
-    return {
-        "status": "plan_required",
-        "command": command_name,
-        "requires": "--confirm or explicit --unsafe/--autonomous",
-    }
-
-
 def json_command(
     func: Callable[P, R] | None = None,
-    *,
-    execution_command: bool = False,
-    command_name: str | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, None]] | Callable[P, None]:
     def decorator(inner: Callable[P, R]) -> Callable[P, None]:
         @wraps(inner)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
             try:
-                if execution_command and not (
-                    kwargs.get("confirm")
-                    or kwargs.get("unsafe")
-                    or kwargs.get("autonomous")
-                ):
-                    name = command_name or inner.__name__.replace("_", "-")
-                    result = _execution_plan(name)
-                else:
-                    result = inner(*args, **kwargs)
+                result = inner(*args, **kwargs)
                 _write_json(result)
             except Exception as error:
                 _write_json({"error": str(error)}, err=True)
@@ -277,6 +261,8 @@ def _execution_report(
     status: str,
     policy_result: object,
     plan: TxPlan,
+    preparations: tuple[object, ...] = (),
+    funding: tuple[object, ...] = (),
     messages: tuple[str, ...] = (),
 ) -> object:
     from open_allocator.exec.execute import ExecutionReport
@@ -285,6 +271,8 @@ def _execution_report(
         status=status,
         policy_result=policy_result,
         plan=plan,
+        preparations=preparations,
+        funding=funding,
         messages=messages,
     )
 
@@ -384,7 +372,7 @@ def _withdraw_scope(
 def _build_execution_plan(
     allocation_path: Path,
     policy_path: Path,
-) -> tuple[Allocation, Policy, TxPlan, list[Vault]]:
+) -> tuple[Allocation, Policy, TxPlan, list[Vault], PlanPreparation | None]:
     allocation = _read_allocation(allocation_path)
     policy = load_policy(policy_path)
     config = AllocatorConfig()
@@ -392,6 +380,23 @@ def _build_execution_plan(
 
     with OneTxClient(config) as client:
         known_instruments = _discover_vaults_from_client(client, enrich=True)
+        if uses_calldata_api(config):
+            # Planned and prepared in one pass: deposits are sized against the
+            # same preparation the dry run reports.
+            fitted = plan_calldata_allocation(
+                client,
+                signer,
+                allocation,
+                policy,
+                known_instruments=known_instruments,
+                config=config,
+                # Read only: legs already sent or bridging are not planned again.
+                idempotency_store=_execution_idempotency_store(config, allocation),
+            )
+            preparation = fitted.preparation.model_copy(
+                update={"messages": (*fitted.messages, *fitted.preparation.messages)}
+            )
+            return allocation, policy, fitted.plan, known_instruments, preparation
         plan = execute_allocation(
             client,
             signer,
@@ -404,7 +409,7 @@ def _build_execution_plan(
 
     if not isinstance(plan, TxPlan):
         raise TypeError("execute_allocation(confirm=False) did not return a TxPlan")
-    return allocation, policy, plan, known_instruments
+    return allocation, policy, plan, known_instruments, None
 
 
 def _execute_allocation_from_cli(
@@ -414,16 +419,21 @@ def _execute_allocation_from_cli(
     confirm: bool,
 ) -> JsonObject:
     if not confirm:
-        allocation, policy, plan, known_instruments = _build_execution_plan(
-            allocation_path,
-            policy_path,
+        allocation, policy, plan, known_instruments, preparation = (
+            _build_execution_plan(allocation_path, policy_path)
         )
         policy_result = policy_core.check(allocation, policy, known_instruments)
         report = _execution_report(
             status="planned",
             policy_result=policy_result,
             plan=plan,
-            messages=("dry-run only; no transactions broadcast",),
+            preparations=() if preparation is None else preparation.preparations,
+            funding=() if preparation is None else preparation.funding,
+            messages=(
+                "dry-run only; no transactions broadcast",
+                *(() if preparation is None else preparation.messages),
+                *(() if preparation is None else preparation.blockers),
+            ),
         )
         return _model_payload(report)
 
@@ -499,10 +509,8 @@ def _withdraw_from_cli(
     amount: float | None,
     confirm: bool,
 ) -> JsonObject:
-    if not confirm:
-        return _execution_plan("withdraw")
     if position is None:
-        raise ValueError("--position is required with --confirm")
+        raise ValueError("--position is required")
 
     policy = load_policy(policy_path)
     config = AllocatorConfig()
@@ -521,12 +529,13 @@ def _withdraw_from_cli(
             holding,
             policy,
             amount=amount,
-            confirm=True,
+            confirm=confirm,
             config=config,
-            idempotency_store=_withdraw_idempotency_store(
-                config,
-                holding,
-                amount=amount,
+            # A dry run reads no completion state, as for rebalance.
+            idempotency_store=(
+                _withdraw_idempotency_store(config, holding, amount=amount)
+                if confirm
+                else None
             ),
         )
 
@@ -1525,10 +1534,12 @@ def build_tx(
         typer.Option("--policy", dir_okay=False, readable=True),
     ] = DEFAULT_POLICY_PATH,
 ) -> JsonObject:
-    _allocation, _policy, plan, _known_instruments = _build_execution_plan(
-        allocation_path,
-        policy_path,
+    _allocation, _policy, plan, _known_instruments, preparation = _build_execution_plan(
+        allocation_path, policy_path
     )
+    # The plan is the output, so blockers are an error rather than a note.
+    if preparation is not None and preparation.blockers:
+        raise TransactionPlanError("; ".join(preparation.blockers))
     payload = plan.model_dump(mode="json")
     validate(payload, "tx-plan")
     return payload
@@ -1619,7 +1630,7 @@ def rebalance(
 
 
 @app.command("withdraw")
-@json_command(execution_command=True, command_name="withdraw")
+@json_command
 def withdraw(
     position: Annotated[str | None, typer.Option("--position")] = None,
     amount: Annotated[float | None, typer.Option("--amount", min=0)] = None,
@@ -1641,8 +1652,6 @@ def withdraw(
     ] = DEFAULT_POLICY_PATH,
 ) -> JsonObject:
     _ = (unsafe, autonomous)
-    if not confirm:
-        return _execution_plan("withdraw")
     return _withdraw_executor(
         position,
         positions_path,
