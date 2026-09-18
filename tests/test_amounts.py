@@ -125,13 +125,29 @@ def test_underlying_withdraw_amount_is_unknown_without_raw_balance_or_decimals(
     )
 
 
-def test_underlying_withdraw_amount_rejects_zero_units() -> None:
-    with pytest.raises(ValueError, match="zero underlying-asset units"):
+def test_underlying_withdraw_amount_is_unknown_when_it_rounds_to_zero_units() -> None:
+    # Underivable, not an error: a legacy plan plans through here too and sells
+    # shares, so it must not fail on an amount only a calldata request reads.
+    assert (
         underlying_withdraw_amount(
             (holding(balance="100", balance_raw="100"),),
             requested_usd=Decimal("0.5"),
             current_usd=Decimal("100"),
         )
+        is None
+    )
+
+
+def test_underlying_withdraw_amount_is_unknown_for_a_zero_raw_balance() -> None:
+    # A venue reporting no raw balance against a live usd_value.
+    assert (
+        underlying_withdraw_amount(
+            (holding(balance="100", balance_raw="0"),),
+            requested_usd=Decimal("50"),
+            current_usd=Decimal("100"),
+        )
+        is None
+    )
 
 
 def test_underlying_withdraw_amount_rejects_malformed_raw_balance() -> None:

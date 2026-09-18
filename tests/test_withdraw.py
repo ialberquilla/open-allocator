@@ -489,6 +489,27 @@ def test_partial_exit_without_raw_underlying_fails_closed(
     )
 
 
+def test_partial_exit_plans_against_a_zero_raw_balance() -> None:
+    # Planning runs before either transaction API is chosen: a venue reporting
+    # balance_raw as "0" against a live usd_value must still produce a legacy
+    # plan, which redeems shares and never reads calldata_amount.
+    position = recipe_holding(
+        balance="3",
+        balance_raw="0",
+        decimals=6,
+        share_balance="3",
+        share_balance_raw="3000000",
+        share_decimals=6,
+    )
+
+    plan = plan_withdraw(position, permissive_policy(), amount="1")
+
+    assert plan.yield_token_amount == "1"
+    assert plan.calldata_amount is None
+    with pytest.raises(ValueError, match="share amount must never be sent"):
+        calldata_withdraw_amount(plan)
+
+
 @dataclass
 class PendingWithdrawSigner:
     """A Safe below its threshold: the exit is proposed, never broadcast."""

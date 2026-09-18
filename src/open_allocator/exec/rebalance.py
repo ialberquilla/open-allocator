@@ -438,9 +438,11 @@ def _calldata_rebalance_plan(
             )
         if trade.calldata_amount is None:
             raise calldata.CalldataAmountError(
-                f"cannot build a partial withdrawal of {trade.instrument_id}: the "
-                "position has no raw underlying balance or decimals, and a share "
-                "amount must never be sent as the calldata amount"
+                f"cannot build a partial withdrawal of {trade.instrument_id}: no "
+                "positive raw underlying amount could be derived from the position "
+                "(missing balance_raw or decimals, or an amount that rounds down to "
+                "zero units), and a share amount must never be sent as the calldata "
+                "amount"
             )
         steps, bundle = calldata.request_bundle(
             client,

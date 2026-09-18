@@ -82,10 +82,15 @@ def underlying_withdraw_amount(
 
     Uses the positions API's ``balance_raw`` (underlying units), never the share
     balance: the calldata withdraw is ``withdraw(assets)``, not
-    ``redeem(shares)``. Returns None when a holding lacks ``balance_raw`` or
-    ``decimals``, or holdings disagree on decimals — the amount cannot be derived
-    and a calldata request for it must fail closed. Raises when the exit rounds
-    to zero units.
+    ``redeem(shares)``. Returns None when no positive raw amount can be derived —
+    a holding lacks ``balance_raw`` or ``decimals``, holdings disagree on
+    decimals, or the exit rounds down to zero units — so a calldata request for
+    it fails closed at the point one is actually built.
+
+    It never raises for an underivable amount, because both transaction APIs
+    plan through here: a venue reporting ``balance_raw`` as "0" against a live
+    ``usd_value`` must not fail a legacy plan, which sells shares and never
+    reads this.
     """
     if not holdings:
         raise ValueError("cannot withdraw from no holdings")
@@ -100,7 +105,7 @@ def underlying_withdraw_amount(
     )
     raw = proportional_raw_units(balance_raw, requested_usd, current_usd)
     if raw <= 0:
-        raise ValueError("amount rounds down to zero underlying-asset units")
+        return None
     return str(raw)
 
 

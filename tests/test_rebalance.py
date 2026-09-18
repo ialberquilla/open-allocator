@@ -483,6 +483,26 @@ def test_plan_rebalance_partial_sell_without_raw_balance_has_no_calldata_amount(
     assert sell.calldata_amount is None
 
 
+def test_plan_rebalance_survives_a_zero_raw_balance_against_a_live_value() -> None:
+    # Planning runs before either transaction API is chosen, so a venue that
+    # reports balance_raw as "0" against a live usd_value must not fail the
+    # plan: a legacy rebalance sells shares and never reads calldata_amount.
+    zero_raw = holding("vault-a", "80").model_copy(update={"balance_raw": "0"})
+    current = positions_snapshot(zero_raw, holding("vault-b", "20"))
+
+    plan = plan_rebalance(
+        current,
+        allocation(("vault-a", 0.5), ("vault-b", 0.5)),
+        policy(),
+        known_instruments=known("vault-a", "vault-b"),
+    )
+
+    sell = plan.trades[0]
+    assert (sell.action, sell.instrument_id) == ("sell", "vault-a")
+    assert sell.yield_token_amount == "30"
+    assert sell.calldata_amount is None
+
+
 def test_plan_rebalance_orders_sells_before_buys() -> None:
     current = positions_snapshot(holding("vault-a", "80"), holding("vault-b", "20"))
 
