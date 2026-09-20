@@ -35,9 +35,14 @@ The model is intentionally simple and conservative, not a gas oracle:
 - **Bridge fee** applies only to legs whose destination chain differs from the
   source chain: 1Tx routes those over CCTP fast-transfer, whose fee is a few
   basis points of the bridged notional.
-- **Slippage** is the swap tolerance (``slippageBps``); it is a *max adverse*
-  bound, not an expected cost, so it is reported separately and kept out of the
-  net-APY figure.
+- **Spread** is what a swap gives up between quote and fill, in bps of the
+  notional actually swapped. An *expected* cost, so it is charged. On a small
+  book it is the larger half of execution — measured, $0.133 of $0.142 across
+  two trades — and a payback figure that omits it is roughly 2x too optimistic.
+- **Slippage** is the swap *tolerance* (``slippageBps``): a max adverse bound,
+  not an expected cost, so it is reported and never charged. Both are published
+  and they answer different questions — ``max_slippage_usd`` is the worst case
+  the bundle will accept, ``spread_cost_usd`` is what it is expected to pay.
 """
 
 from __future__ import annotations
@@ -54,6 +59,14 @@ DEFAULT_L2_GAS_USD_PER_TX = 0.006
 DEFAULT_L1_GAS_USD_PER_TX = 0.08
 # Chains priced at the L1 rate. Ethereum mainnet today; extend as needed.
 DEFAULT_L1_CHAIN_IDS = frozenset({1})
+
+# ⚠️ ONE MEASUREMENT, NOT A CALIBRATION. 8.5 bps is what leaked beyond gas on
+# the 2026-08-24 cross-chain hop — $0.020782 on $24.378099 traded — the only
+# execution this codebase family has measured spread on directly. Pass a
+# measured value whenever the number matters. It also carries ~1bp of CCTP fee
+# on a bridged leg, which is charged again separately; overstating cost is the
+# direction this module leans everywhere.
+DEFAULT_EXPECTED_SPREAD_BPS = 8.5
 
 # Gas units for one signed deposit-side tx. Measured 2026-07-30 on a real Base
 # ERC-4626 call (186,751 gas, tx 0x4640d9b1...a245) and rounded up. Deliberately
@@ -104,7 +117,10 @@ class CostParams:
     l1_chain_ids: frozenset[int] = DEFAULT_L1_CHAIN_IDS
     # Live pricing when available; None falls back to the constants above.
     gas: GasPricing | None = None
-    # A deposit is approve + buy; two signed txs per leg on the source chain.
+    # Signed txs for one entry when the leg does not declare its own: a plain
+    # deposit is approve + buy. The count belongs to the LEG, not the book — a
+    # 4337 or Safe bundle signs once for work that would otherwise be 2n txs —
+    # so legs that know better override via ``LegInput.txs`` / ``MoveInput.txs``.
     txs_per_leg: int = 2
     # An exit is one redeem. Kept separate from ``txs_per_leg`` because a
     # rebalance pays both and they are not the same number: charging a sell two
@@ -120,8 +136,11 @@ class CostParams:
     uneconomic_payback_days: float = 365.0
     # Circle CCTP v2 fast-transfer fee on bridged notional (always fast mode).
     cctp_fast_fee_bps: float = 1.0
-    # Max adverse swap slippage tolerance; reported, not counted as expected cost.
+    # The bound the bundle will accept. Reported, never charged.
     slippage_bps: float = 50.0
+    # What the swap is expected to pay. Charged, and the reason no payback
+    # figure here is derived from gas alone.
+    expected_spread_bps: float = DEFAULT_EXPECTED_SPREAD_BPS
     # One-time cost as a share of deploy: above marginal -> "marginal";
     # above uneconomic -> "uneconomic".
     marginal_cost_pct: float = 1.0
@@ -142,6 +161,19 @@ class CostParams:
         """Whether ``chain_id``'s gas came from a live read, not the fallback."""
         return self.gas is not None and self.gas.usd_per_tx(chain_id) is not None
 
+    def txs_for(self, declared: int | None, *, default: int) -> int:
+        """Signed txs for one leg: what it declares, else ``default``.
+
+        A declared ``0`` is honoured — a leg folded into another leg's
+        operation signs nothing of its own — but a negative count is clamped
+        rather than credited as negative gas.
+        """
+        return max(declared, 0) if declared is not None else default
+
+    def spread_usd(self, traded_usd: float) -> float:
+        """Expected spread on ``traded_usd`` of swapped notional."""
+        return max(traded_usd, 0.0) * self.expected_spread_bps / 10_000
+
 
 @dataclass(frozen=True)
 class LegInput:
@@ -154,6 +186,12 @@ class LegInput:
     # default to treating their sole rate as accruing.
     base_apy_pct: float | None = None
     base_apy_known: bool = True
+    # Signed txs this leg costs; None uses ``CostParams.txs_per_leg``. A
+    # batched leg — one 4337 user-op, a Safe multicall, a levered loop of n
+    # turns — is one tx however many calls it contains.
+    txs: int | None = None
+    # False for a leg entered in the asset already held: gas, but no spread.
+    swaps: bool = True
 
 
 @dataclass(frozen=True)
@@ -162,6 +200,7 @@ class CostEstimate:
     deploy_usd: float
     gas_cost_usd: float
     bridge_fee_usd: float
+    spread_cost_usd: float
     total_expected_cost_usd: float
     max_slippage_usd: float
     cost_pct_of_deploy: float
@@ -188,6 +227,7 @@ class CostEstimate:
             "gas_cost_usd": self.gas_cost_usd,
             "gas_priced_live": self.gas_priced_live,
             "bridge_fee_usd": self.bridge_fee_usd,
+            "spread_cost_usd": self.spread_cost_usd,
             "total_expected_cost_usd": self.total_expected_cost_usd,
             "max_slippage_usd": self.max_slippage_usd,
             "cost_pct_of_deploy": self.cost_pct_of_deploy,
@@ -218,6 +258,7 @@ def min_economic_leg_usd(
     *,
     params: CostParams | None = None,
     max_gas_pct_of_leg: float = 0.10,
+    txs: int | None = None,
 ) -> float:
     """Smallest leg size on ``chain_id`` whose gas stays under a share of it.
 
@@ -229,9 +270,16 @@ def min_economic_leg_usd(
     Expressed as a *share of the leg* rather than an absolute so it scales with
     gas instead of needing recalibration. The default 0.10% is deliberately
     loose — this is a floor to stop absurd legs, not an optimiser.
+
+    Gas-only on purpose: spread is proportional to the leg, so it is the same
+    percentage at every size and cannot produce a minimum. Only a fixed cost
+    can, which is also why ``txs`` moves the floor — a batched entry has less
+    fixed cost, not a cheaper swap.
     """
     params = params or CostParams()
-    leg_gas = params.txs_per_leg * params.gas_usd_per_tx(chain_id)
+    leg_gas = params.txs_for(txs, default=params.txs_per_leg) * params.gas_usd_per_tx(
+        chain_id
+    )
     if max_gas_pct_of_leg <= 0:
         raise ValueError("max_gas_pct_of_leg must be positive")
     return leg_gas / (max_gas_pct_of_leg / 100)
@@ -274,14 +322,24 @@ def estimate(
     )
     deploy_usd = sum(leg.usd for leg in priced)
 
-    # Every deposit signs on the source chain (approve + buy).
-    gas_cost = len(priced) * params.txs_per_leg * params.gas_usd_per_tx(source)
+    # Every deposit signs on the source chain (approve + buy), unless the leg
+    # declares its own count.
+    gas_usd_per_tx = params.gas_usd_per_tx(source)
+    gas_cost = sum(
+        params.txs_for(leg.txs, default=params.txs_per_leg) * gas_usd_per_tx
+        for leg in priced
+    )
 
     bridged = [leg for leg in priced if leg.chain_id != source]
     bridged_usd = sum(leg.usd for leg in bridged)
     bridge_fee = bridged_usd * params.cctp_fast_fee_bps / 10_000
 
-    total_cost = gas_cost + bridge_fee
+    # Deposits arrive in USDC and are swapped into the leg's asset, so the
+    # swapped notional is the deploy less any leg that needs no swap.
+    swapped_usd = sum(leg.usd for leg in priced if leg.swaps)
+    spread_cost = params.spread_usd(swapped_usd)
+
+    total_cost = gas_cost + bridge_fee + spread_cost
     max_slippage = deploy_usd * params.slippage_bps / 10_000
 
     cost_pct = total_cost / deploy_usd * 100 if deploy_usd > 0 else 0.0
@@ -330,6 +388,7 @@ def estimate(
         deploy_usd=round(deploy_usd, 2),
         gas_cost_usd=round(gas_cost, 4),
         bridge_fee_usd=round(bridge_fee, 4),
+        spread_cost_usd=round(spread_cost, 4),
         total_expected_cost_usd=round(total_cost, 4),
         max_slippage_usd=round(max_slippage, 4),
         cost_pct_of_deploy=round(cost_pct, 3),
@@ -357,6 +416,7 @@ def estimate_from_allocation_legs(
     chain_by_instrument: Mapping[str, int],
     apy_by_instrument: Mapping[str, float],
     base_apy_by_instrument: Mapping[str, float | None] | None = None,
+    txs_by_instrument: Mapping[str, int] | None = None,
     source_chain_id: int | None = None,
     params: CostParams | None = None,
 ) -> CostEstimate | None:
@@ -366,6 +426,10 @@ def estimate_from_allocation_legs(
     a missing APY is treated as 0 so the leg still carries its execution cost.
     When a base map is supplied, missing/null values stay unknown and make
     whole-book income and breakeven unavailable.
+
+    ``txs_by_instrument`` carries the executed shape per instrument — a batched
+    or levered leg is one signed operation, not one per call inside it. An
+    instrument absent from the map keeps the default.
     """
     inputs: list[LegInput] = []
     for leg in legs:
@@ -387,6 +451,11 @@ def estimate_from_allocation_legs(
                 base_apy_known=(
                     base_apy_by_instrument is None
                     or base_apy_by_instrument.get(instrument_id) is not None
+                ),
+                txs=(
+                    txs_by_instrument.get(instrument_id)
+                    if txs_by_instrument is not None
+                    else None
                 ),
             )
         )
@@ -414,6 +483,11 @@ class MoveInput:
     apy_pct: float
     base_apy_pct: float | None = None
     base_apy_known: bool = True
+    # Signed txs for this move in whichever direction it goes; None uses
+    # ``txs_per_leg`` for a buy and ``txs_per_exit`` for a sell.
+    txs: int | None = None
+    # False for a move that stays in the asset already held: gas, no spread.
+    swaps: bool = True
 
     @property
     def delta_usd(self) -> float:
@@ -446,6 +520,7 @@ class RebalanceEstimate:
     # What it costs
     gas_cost_usd: float
     bridge_fee_usd: float
+    spread_cost_usd: float
     total_expected_cost_usd: float
     max_slippage_usd: float
 
@@ -482,6 +557,7 @@ class RebalanceEstimate:
             "tx_count": self.tx_count,
             "gas_cost_usd": self.gas_cost_usd,
             "bridge_fee_usd": self.bridge_fee_usd,
+            "spread_cost_usd": self.spread_cost_usd,
             "total_expected_cost_usd": self.total_expected_cost_usd,
             "max_slippage_usd": self.max_slippage_usd,
             "bridged_usd": self.bridged_usd,
@@ -556,7 +632,8 @@ def estimate_rebalance(
     gas_cost = 0.0
     tx_count = 0
     for move in moved:
-        txs = params.txs_per_leg if move.delta_usd > 0 else params.txs_per_exit
+        default = params.txs_per_leg if move.delta_usd > 0 else params.txs_per_exit
+        txs = params.txs_for(move.txs, default=default)
         tx_count += txs
         gas_cost += txs * params.gas_usd_per_tx(move.chain_id)
 
@@ -589,7 +666,11 @@ def estimate_rebalance(
     bridge_fee = bridged_usd * params.cctp_fast_fee_bps / 10_000
 
     turnover = buy_usd + sell_usd
-    total_cost = gas_cost + bridge_fee
+    # Charged on turnover, so a switch pays it twice: once selling out of one
+    # asset and once buying into the other.
+    swapped_usd = sum(abs(m.delta_usd) for m in moved if m.swaps)
+    spread_cost = params.spread_usd(swapped_usd)
+    total_cost = gas_cost + bridge_fee + spread_cost
     max_slippage = turnover * params.slippage_bps / 10_000
 
     # Blended yield on both sides, over the WHOLE book each time. The target
@@ -700,6 +781,7 @@ def estimate_rebalance(
         tx_count=tx_count,
         gas_cost_usd=round(gas_cost, 4),
         bridge_fee_usd=round(bridge_fee, 4),
+        spread_cost_usd=round(spread_cost, 4),
         total_expected_cost_usd=round(total_cost, 4),
         max_slippage_usd=round(max_slippage, 4),
         bridged_usd=round(bridged_usd, 4),
@@ -738,6 +820,7 @@ def estimate_rebalance_from_holdings(
     chain_by_instrument: Mapping[str, int],
     apy_by_instrument: Mapping[str, float],
     base_apy_by_instrument: Mapping[str, float | None] | None = None,
+    txs_by_instrument: Mapping[str, int] | None = None,
     params: CostParams | None = None,
     min_trade_usd: float = 0.0,
     idle_usd_by_chain: Mapping[int, float] | None = None,
@@ -773,6 +856,11 @@ def estimate_rebalance_from_holdings(
                     base_apy_by_instrument is None
                     or base_apy_by_instrument.get(instrument_id) is not None
                 ),
+                txs=(
+                    txs_by_instrument.get(instrument_id)
+                    if txs_by_instrument is not None
+                    else None
+                ),
             )
         )
     return estimate_rebalance(
@@ -784,6 +872,7 @@ def estimate_rebalance_from_holdings(
 
 
 __all__ = [
+    "DEFAULT_EXPECTED_SPREAD_BPS",
     "DEFAULT_GAS_UNITS_PER_TX",
     "CostEstimate",
     "CostParams",

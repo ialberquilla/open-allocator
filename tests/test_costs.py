@@ -369,3 +369,136 @@ def test_rebalance_with_unknown_base_rate_does_not_publish_mixed_payback() -> No
 
 def test_rebalance_returns_none_on_an_empty_book() -> None:
     assert costs.estimate_rebalance([]) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spread is charged, and a leg's tx count is the leg's own
+
+
+def test_spread_is_charged_not_merely_reported() -> None:
+    """🔑 A tolerance and an expectation, and only one of them is a cost.
+
+    ``max_slippage_usd`` stays out of the net figure; ``spread_cost_usd`` is
+    inside the total, so no cost, verdict or breakeven is gas alone.
+    """
+    est = costs.estimate(_legs())
+    assert est is not None
+    assert est.spread_cost_usd == round(
+        100.0 * costs.DEFAULT_EXPECTED_SPREAD_BPS / 10_000, 4
+    )
+    assert est.total_expected_cost_usd == round(
+        est.gas_cost_usd + est.bridge_fee_usd + est.spread_cost_usd, 4
+    )
+    # The tolerance is still published, still larger, and still not charged.
+    assert est.max_slippage_usd > est.spread_cost_usd
+    assert est.max_slippage_usd not in (
+        est.total_expected_cost_usd,
+        est.total_expected_cost_usd - est.gas_cost_usd,
+    )
+    assert est.as_metadata()["spread_cost_usd"] == est.spread_cost_usd
+
+
+def test_charging_spread_lengthens_every_breakeven() -> None:
+    """Spread only ever makes a trade take longer to repay."""
+    priced = costs.estimate(_legs())
+    gas_only = costs.estimate(_legs(), params=costs.CostParams(expected_spread_bps=0.0))
+    assert priced is not None and gas_only is not None
+    assert priced.total_expected_cost_usd > gas_only.total_expected_cost_usd
+    assert priced.breakeven_days > gas_only.breakeven_days
+    assert priced.net_apy_pct_year1 < gas_only.net_apy_pct_year1
+
+
+def test_a_leg_that_needs_no_swap_pays_gas_but_not_spread() -> None:
+    no_swap = [costs.LegInput("usdc-vault", 8453, 100.0, 4.0, swaps=False)]
+    est = costs.estimate(no_swap)
+    assert est is not None
+    assert est.spread_cost_usd == 0.0
+    assert est.gas_cost_usd > 0.0
+
+
+def test_a_batched_leg_signs_once_not_twice() -> None:
+    """A loop, a multicall or a 4337 bundle is ONE user-op, not 2n.
+
+    Charging ``txs_per_leg`` per inner call prices a transaction shape this
+    executor does not submit, and the error grows with the number of turns.
+    """
+    plain = costs.estimate([costs.LegInput("a", 8453, 100.0, 4.0)])
+    bundled = costs.estimate([costs.LegInput("a", 8453, 100.0, 4.0, txs=1)])
+    assert plain is not None and bundled is not None
+    assert plain.gas_cost_usd == round(2 * costs.DEFAULT_L2_GAS_USD_PER_TX, 4)
+    assert bundled.gas_cost_usd == round(costs.DEFAULT_L2_GAS_USD_PER_TX, 4)
+    # ...and the swap it still performs is still charged.
+    assert bundled.spread_cost_usd == plain.spread_cost_usd
+
+
+def test_a_declared_zero_tx_leg_is_honoured_and_a_negative_one_is_not() -> None:
+    params = costs.CostParams()
+    assert params.txs_for(0, default=2) == 0
+    assert params.txs_for(None, default=2) == 2
+    # A negative count would credit the book with gas it never earned.
+    assert params.txs_for(-5, default=2) == 0
+
+
+def test_per_instrument_tx_counts_travel_through_the_allocation_helper() -> None:
+    est = costs.estimate_from_allocation_legs(
+        [
+            {"instrument_id": "bundled", "usd": 50.0},
+            {"instrument_id": "plain", "usd": 50.0},
+        ],
+        chain_by_instrument={"bundled": 8453, "plain": 8453},
+        apy_by_instrument={"bundled": 4.0, "plain": 4.0},
+        txs_by_instrument={"bundled": 1},
+    )
+    assert est is not None
+    assert est.gas_cost_usd == round(3 * costs.DEFAULT_L2_GAS_USD_PER_TX, 4)
+
+
+def test_rebalance_charges_spread_on_turnover() -> None:
+    est = costs.estimate_rebalance(_book())
+    assert est is not None
+    # $10 sold and $10 bought: both crossings pay.
+    assert est.spread_cost_usd == round(
+        20.0 * costs.DEFAULT_EXPECTED_SPREAD_BPS / 10_000, 4
+    )
+    assert est.total_expected_cost_usd == round(
+        est.gas_cost_usd + est.bridge_fee_usd + est.spread_cost_usd, 4
+    )
+    gas_only = costs.estimate_rebalance(
+        _book(), params=costs.CostParams(expected_spread_bps=0.0)
+    )
+    assert gas_only is not None
+    assert est.payback_days > gas_only.payback_days
+
+
+def test_rebalance_honours_a_per_move_tx_count() -> None:
+    moves = [
+        costs.MoveInput("keep", 8453, 50.0, 40.0, 4.0, txs=0),
+        costs.MoveInput("grow", 8453, 50.0, 60.0, 8.0, txs=1),
+    ]
+    est = costs.estimate_rebalance(moves)
+    assert est is not None
+    # One batched operation covering both legs, rather than 2 + 1.
+    assert est.tx_count == 1
+
+
+def test_drift_and_rebalance_price_the_same_switch_the_same_way() -> None:
+    """The two modules must not disagree about what a round trip costs.
+
+    ``core.drift`` pins its gas convention to ``CostParams``; spread travels the
+    same way, or the gate fires switches this module then calls uneconomic.
+    """
+    from open_allocator.core import drift
+
+    params = costs.CostParams()
+    position_usd = 1_000.0
+    est = costs.estimate_rebalance(
+        [
+            costs.MoveInput("out", 8453, position_usd, 0.0, 5.0),
+            costs.MoveInput("in", 8453, 0.0, position_usd, 9.0),
+        ],
+        params=params,
+    )
+    assert est is not None
+    assert est.spread_cost_usd == round(
+        params.spread_usd(drift._SWITCH_CROSSINGS * position_usd), 4
+    )

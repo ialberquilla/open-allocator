@@ -132,9 +132,22 @@ answers "am I actually holding more than one bet". Neither subsumes the other.
 - `sector_concentration.effective_sectors` / `unclassified_weight_bps` — the
   label view, kept for visibility.
 
-`build-allocation` attaches `metadata.cost_estimate` (gas, bridge fee, slippage,
-`net_apy_pct_year1`, `breakeven_days`, `verdict`) and `metadata.warnings`, which
-name every cap that clamped, every policy exclusion, and every empty sleeve.
+`build-allocation` attaches `metadata.cost_estimate` (gas, bridge fee, spread,
+slippage, `net_apy_pct_year1`, `breakeven_days`, `verdict`) and
+`metadata.warnings`, which name every cap that clamped, every policy exclusion,
+and every empty sleeve.
+
+Two of those describe the same swap and only one is charged. `spread_cost_usd`
+is the **expected** cost of crossing, so it sits inside `total_expected_cost_usd`
+and therefore inside `breakeven_days`, `net_apy_pct_year1` and the drift gate's
+`payback_days`. `max_slippage_usd` is the **tolerance** the bundle will accept
+before it reverts — reported, never counted. The first is what the trade costs;
+the second is how bad it is allowed to get.
+
+Spread is not a rounding term: measured across two trades it was $0.133 of the
+$0.142 of realized execution cost. The default is 8.5 bps of traded notional and
+is **one measurement, not a calibration** — pass
+`CostParams(expected_spread_bps=...)` when you have a better one.
 
 Gas in that block is priced from **live** chain state — the source chain's gas
 price and an on-chain Chainlink ETH/USD feed — and `cost_estimate.gas_priced_live`
