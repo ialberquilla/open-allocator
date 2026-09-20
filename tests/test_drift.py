@@ -797,7 +797,73 @@ def test_opportunity_evaluates_l1_when_gas_is_priced_live() -> None:
     found = reasons_of(report, "opportunity")
     assert len(found) == 1
     # 190k gas * 15 gwei * $3000/ETH = ~$8.55/tx, three txs for a round trip.
-    assert found[0].round_trip_cost_usd == pytest.approx(25.65, rel=1e-3)
+    assert found[0].round_trip_gas_usd == pytest.approx(25.65, rel=1e-3)
+    # ...plus the spread, crossed twice on a $100k position.
+    expected_spread = 2 * 100_000 * costs.DEFAULT_EXPECTED_SPREAD_BPS / 10_000
+    assert found[0].round_trip_spread_usd == pytest.approx(expected_spread, rel=1e-3)
+    assert found[0].round_trip_cost_usd == pytest.approx(
+        25.65 + expected_spread, rel=1e-3
+    )
+
+
+def test_a_switch_is_never_priced_from_gas_alone() -> None:
+    """Free gas does not make a switch free.
+
+    The round trip still crosses the spread twice, and on a book this size that
+    term is what decides whether the uplift repays.
+    """
+    free_gas = costs.CostParams(
+        gas=costs.GasPricing(gas_price_wei={8453: 0}, native_usd={8453: 3_000.0}),
+    )
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 10_000)),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=5.0),
+            vault("vault-b", apy=9.0),
+        ],
+        cost_params=free_gas,
+    )
+
+    found = reasons_of(report, "opportunity")
+    assert len(found) == 1
+    assert found[0].round_trip_gas_usd == 0.0
+    assert found[0].round_trip_spread_usd > 0.0
+    assert found[0].round_trip_cost_usd == found[0].round_trip_spread_usd
+
+
+def test_spread_can_veto_a_switch_that_gas_alone_would_have_waved_through() -> None:
+    """Spread decides the verdict, not just the size of the number.
+
+    A 60 bps uplift clears the mandate band and repays its gas in under a day.
+    It does not repay two crossings of the spread inside the year.
+    """
+    params = costs.CostParams(expected_spread_bps=50.0)
+    args = dict(
+        policy=policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[
+            vault("vault-a", apy=5.0),
+            vault("vault-b", apy=5.6),
+        ],
+    )
+    gas_only = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000)),
+        cost_params=costs.CostParams(expected_spread_bps=0.0),
+        **args,
+    )
+    with_spread = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("vault-a", 1_000)),
+        cost_params=params,
+        **args,
+    )
+
+    assert len(reasons_of(gas_only, "opportunity")) == 1
+    assert reasons_of(with_spread, "opportunity") == []
 
 
 def test_a_book_with_no_better_candidate_stays_quiet() -> None:

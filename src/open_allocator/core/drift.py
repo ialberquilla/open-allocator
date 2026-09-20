@@ -68,6 +68,9 @@ _BPS = 10_000
 # needs no approval. Deliberately the heavier reading, matching the
 # over-rather-than-under-state convention in :mod:`open_allocator.core.costs`.
 _EXIT_TXS_PER_SWITCH = 1
+# A switch crosses the spread twice: once selling the held asset, once buying
+# the candidate. Turnover, not notional.
+_SWITCH_CROSSINGS = 2
 # Horizon the switch must repay within. Not a new knob: it is the same year-1
 # window ``costs.CostEstimate.net_apy_pct_year1`` already reports against.
 _PAYBACK_HORIZON_DAYS = 365.0
@@ -126,6 +129,10 @@ class OpportunityReason(FrozenModel):
     band_bps: int
     position_usd: float
     round_trip_cost_usd: float
+    # Split out because the halves scale differently: a bigger position dilutes
+    # the gas and not the spread, so only the split says which one is binding.
+    round_trip_gas_usd: float
+    round_trip_spread_usd: float
     payback_days: float
 
 
@@ -384,6 +391,12 @@ def _opportunity_reasons(
     The mandate knob alone would not be enough. A flat bps threshold is a claim
     about *rate* and execution cost is a claim about *dollars*, so the same 50
     bps is worth taking on a $5,000 position and worth nothing on a $50 one.
+
+    ⚠️ THE ROUND TRIP IS NOT PRICED FROM GAS ALONE. A switch sells one asset
+    and buys another, and each crossing gives up the spread — measured, $0.133
+    of $0.142 of realized execution cost. Gas alone makes every switch look
+    about twice as repayable as it is, which biases the gate toward churn in
+    exactly the size range this book lives in.
     """
     tiers = _tiers(mandate)
     if not tiers or not held:
@@ -474,9 +487,13 @@ def _opportunity_reasons(
             continue
 
         position_usd = usd_by_id.get(instrument_id, 0.0)
-        round_trip_usd = params.txs_per_leg * params.gas_usd_per_tx(
+        round_trip_gas_usd = params.txs_per_leg * params.gas_usd_per_tx(
             best.chain_id
         ) + _EXIT_TXS_PER_SWITCH * params.gas_usd_per_tx(current.chain_id)
+        # Turnover is 2x the position — out of the held asset and into the
+        # candidate — matching what ``costs.estimate_rebalance`` charges.
+        round_trip_spread_usd = params.spread_usd(_SWITCH_CROSSINGS * position_usd)
+        round_trip_usd = round_trip_gas_usd + round_trip_spread_usd
         annual_gain_usd = position_usd * (best.apy_base - current.apy_base) / 100
         if annual_gain_usd <= 0:
             continue
@@ -495,6 +512,8 @@ def _opportunity_reasons(
                 band_bps=band,
                 position_usd=round(position_usd, 2),
                 round_trip_cost_usd=round(round_trip_usd, 4),
+                round_trip_gas_usd=round(round_trip_gas_usd, 4),
+                round_trip_spread_usd=round(round_trip_spread_usd, 4),
                 payback_days=round(payback_days, 2),
             )
         )
