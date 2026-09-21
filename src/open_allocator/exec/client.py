@@ -39,6 +39,7 @@ class Instrument(OneTxModel):
     token_address: str | None = Field(default=None, alias="tokenAddress")
     token_symbol: str | None = Field(default=None, alias="tokenSymbol")
     token_decimals: int | None = Field(default=None, alias="tokenDecimals", ge=0)
+    protocol_address: str | None = Field(default=None, alias="protocolAddress")
     yield_token_address: str | None = Field(default=None, alias="yieldTokenAddress")
     yield_token_symbol: str | None = Field(default=None, alias="yieldTokenSymbol")
     yield_token_decimals: int | None = Field(
@@ -55,6 +56,72 @@ class Instrument(OneTxModel):
     is_active: bool = Field(alias="isActive")
     is_stablecoin: bool = Field(alias="isStablecoin")
     asset_category: str | None = Field(default=None, alias="assetCategory")
+
+
+class LoopCollateralLeg(OneTxModel):
+    instrument_id: str = Field(alias="instrumentId")
+    symbol: str
+    token_address: str = Field(alias="tokenAddress")
+    apy_base: float | None = Field(default=None, alias="apyBase")
+    apy_reward: float | None = Field(default=None, alias="apyReward")
+    total_supply_usd: float | None = Field(default=None, alias="totalSupplyUsd")
+    tvl_usd: float | None = Field(default=None, alias="tvlUsd")
+
+
+class LoopDebtLeg(OneTxModel):
+    instrument_id: str = Field(alias="instrumentId")
+    symbol: str
+    token_address: str = Field(alias="tokenAddress")
+    apy_base_borrow: float | None = Field(default=None, alias="apyBaseBorrow")
+    apy_reward_borrow: float | None = Field(default=None, alias="apyRewardBorrow")
+    total_supply_usd: float | None = Field(default=None, alias="totalSupplyUsd")
+    total_borrow_usd: float | None = Field(default=None, alias="totalBorrowUsd")
+    debt_ceiling_usd: float | None = Field(default=None, alias="debtCeilingUsd")
+    borrowable: bool | None = None
+
+
+class LoopScreenLeverage(OneTxModel):
+    # The pool default the screen read, not this pair's effective figure.
+    ltv: float | None = None
+    max_leverage: float | None = Field(default=None, alias="maxLeverage")
+    basis: str | None = None
+
+
+class LoopRewardToken(OneTxModel):
+    address: str
+    symbol: str | None = None
+    legs: tuple[str, ...] = ()
+    price_usd: float | None = Field(default=None, alias="priceUsd")
+    price_source: str | None = Field(default=None, alias="priceSource")
+    liquidity_usd: float | None = Field(default=None, alias="liquidityUsd")
+
+
+class LoopReward(OneTxModel):
+    basis: str | None = None
+    tokens: tuple[LoopRewardToken, ...] = ()
+    liquidity_usd: float | None = Field(default=None, alias="liquidityUsd")
+    emission_usd_per_day: float | None = Field(default=None, alias="emissionUsdPerDay")
+
+
+class LoopRow(OneTxModel):
+    """One loopable pair from ``GET /loops``: the screen, cached, no chain reads."""
+
+    loop_id: str = Field(alias="loopId")
+    chain_id: int = Field(alias="chainId")
+    pool: str
+    protocol: str
+    same_asset: bool = Field(alias="sameAsset")
+    collateral: LoopCollateralLeg
+    debt: LoopDebtLeg
+    leverage: LoopScreenLeverage
+    reward: LoopReward | None = None
+    last_synced_at: str | None = Field(default=None, alias="lastSyncedAt")
+
+
+class LoopsListResponse(OneTxModel):
+    data: tuple[LoopRow, ...]
+    count: int | None = None
+    as_of: str | None = Field(default=None, alias="asOf")
 
 
 class InstrumentsListResponse(OneTxModel):
@@ -375,7 +442,20 @@ BlockNumber = Annotated[int, Field(strict=True, ge=0)]
 
 CalldataAction = Literal["deposit", "withdraw"]
 CalldataCallType = Literal[
-    "approve", "swap", "deposit", "withdraw", "bridge_burn", "fee"
+    "approve",
+    "swap",
+    "deposit",
+    "withdraw",
+    "bridge_burn",
+    "fee",
+    "borrow",
+    "repay",
+    "set_account_config",
+]
+LoopAction = Literal["open", "close", "adjust"]
+# At most four decimal places, as the endpoint accepts it.
+LoopLeverageParam = Annotated[
+    str, StringConstraints(pattern=r"^[0-9]{1,3}(?:\.[0-9]{1,4})?$")
 ]
 
 
@@ -530,6 +610,140 @@ class BridgeCalldataResponse(OneTxExecutionModel):
                 f"minFinalityThreshold {self.min_finality_threshold} does not "
                 f"match fast={self.fast}"
             )
+        return self
+
+
+class LoopCalldataQuery(OneTxExecutionModel):
+    action: LoopAction
+    account: EvmAddress
+    leverage: LoopLeverageParam | None = None
+    amount: PositiveRawUint | None = None
+    e_mode: str | None = Field(
+        default=None, alias="eMode", pattern=r"^(auto|none|[1-9][0-9]{0,2})$"
+    )
+    slippage_bps: int | None = Field(
+        default=None, alias="slippageBps", strict=True, ge=0, le=10_000
+    )
+    max_price_impact_bps: int | None = Field(
+        default=None, alias="maxPriceImpactBps", strict=True, ge=0, le=10_000
+    )
+
+    @model_validator(mode="after")
+    def _parameters_match_action(self) -> Self:
+        # Every amount in a loop is hard-coded at the quote block, so there is
+        # no ``max``; ``close`` names neither a target nor an amount.
+        if self.action == "open" and (self.leverage is None or self.amount is None):
+            raise ValueError("a loop open needs both leverage and amount")
+        if self.action == "adjust" and (
+            self.leverage is None or self.amount is not None
+        ):
+            raise ValueError("a loop adjust needs leverage and takes no amount")
+        if self.action == "close" and (
+            self.leverage is not None or self.amount is not None
+        ):
+            raise ValueError("a loop close takes neither leverage nor amount")
+        return self
+
+
+class LoopOracleSource(OneTxExecutionModel):
+    oracle: EvmAddress
+    collateral: EvmAddress
+    debt: EvmAddress
+
+
+class LoopAccountConfig(OneTxExecutionModel):
+    kind: Literal["aave-emode"]
+    current: int = Field(strict=True, ge=0)
+    target: int = Field(strict=True, ge=0)
+
+
+class LoopLeverageBlock(OneTxExecutionModel):
+    """The pair's EFFECTIVE parameters, as the pool applies them to this account."""
+
+    collateral_instrument_id: str = Field(alias="collateralInstrumentId", min_length=1)
+    debt_instrument_id: str = Field(alias="debtInstrumentId", min_length=1)
+    pool: EvmAddress
+    ltv: float = Field(gt=0, lt=1)
+    liquidation_threshold: float = Field(alias="liquidationThreshold", gt=0, le=1)
+    max_leverage: float = Field(alias="maxLeverage", ge=1)
+    params_basis: str = Field(alias="paramsBasis", min_length=1)
+    oracle_source: LoopOracleSource = Field(alias="oracleSource")
+    requires_account_config: bool = Field(alias="requiresAccountConfig", strict=True)
+    account_config: LoopAccountConfig = Field(alias="accountConfig")
+    requested_leverage: float | None = Field(alias="requestedLeverage")
+
+    @model_validator(mode="after")
+    def _threshold_not_below_ltv(self) -> Self:
+        if self.liquidation_threshold < self.ltv:
+            raise ValueError(
+                f"liquidationThreshold {self.liquidation_threshold} is below "
+                f"ltv {self.ltv}"
+            )
+        return self
+
+
+class LoopSimulatedBlock(OneTxExecutionModel):
+    """The position 1Tx's simulator read back after the batch ran."""
+
+    collateral: RawUint
+    debt: RawUint
+    total_collateral_base: RawUint = Field(alias="totalCollateralBase")
+    total_debt_base: RawUint = Field(alias="totalDebtBase")
+    leverage: float | None
+    health_factor: float | None = Field(alias="healthFactor")
+    depeg_buffer_bps: int | None = Field(alias="depegBufferBps")
+    ltv: float = Field(ge=0, le=1)
+    liquidation_threshold: float = Field(alias="liquidationThreshold", ge=0, le=1)
+    e_mode_category: int = Field(alias="eModeCategory", strict=True, ge=0)
+    gas_used: RawUint = Field(alias="gasUsed")
+
+
+class LoopTurn(OneTxExecutionModel):
+    borrow: RawUint | None = None
+    supply: RawUint | None = None
+    withdraw: RawUint | None = None
+    repay: RawUint | None = None
+    repay_all: bool | None = Field(default=None, alias="repayAll")
+
+
+class LoopSwap(OneTxExecutionModel):
+    venue: str = Field(min_length=1)
+    fee: int = Field(strict=True, ge=0)
+
+
+class LoopCalldataResponse(OneTxExecutionModel):
+    loop_id: str = Field(alias="loopId", min_length=1)
+    chain_id: ChainId = Field(alias="chainId")
+    account: EvmAddress
+    action: LoopAction
+    recipe: str = Field(min_length=1)
+    token_in: CalldataTokenInfo = Field(alias="tokenIn")
+    token_out: CalldataTokenInfo = Field(alias="tokenOut")
+    amount_in: PositiveRawUint | None = Field(alias="amountIn")
+    expected_out: RawUint | None = Field(alias="expectedOut")
+    min_out: RawUint | None = Field(alias="minOut")
+    expires_at: int | None = Field(alias="expiresAt", strict=True, ge=0)
+    quote_block: BlockNumber = Field(alias="quoteBlock")
+    requires: tuple[CalldataBalanceRequirement, ...]
+    leftovers: tuple[CalldataLeftover, ...]
+    calls: tuple[CalldataCall, ...] = Field(min_length=1)
+    simulation: BundleSimulation
+    leverage: LoopLeverageBlock
+    simulated: LoopSimulatedBlock
+    turns: tuple[LoopTurn, ...]
+    swap: LoopSwap | None
+
+    @model_validator(mode="after")
+    def _consistent_bundle(self) -> Self:
+        _check_bundle_chain(
+            self.calls, self.chain_id, self.simulation, self.quote_block
+        )
+        if (self.action == "open") != (self.amount_in is not None):
+            raise ValueError("amountIn is set for an open and only for an open")
+        if (self.action == "close") != (self.leverage.requested_leverage is None):
+            raise ValueError("requestedLeverage is null for a close and only a close")
+        if self.swap is not None and self.expires_at is None:
+            raise ValueError("a loop that swaps must carry its quote's expiry")
         return self
 
 
@@ -695,6 +909,25 @@ class OneTxClient:
             query=request.model_dump(by_alias=True, exclude_none=True),
         )
         return _parse_execution_response(BridgeCalldataResponse, payload, path)
+
+    def loops(self, **filters: object) -> LoopsListResponse:
+        payload = self._request_json("GET", "/loops", query=_aliases(filters))
+        return LoopsListResponse.model_validate(payload)
+
+    def loop_calldata(
+        self,
+        loop_id: str,
+        query: LoopCalldataQuery | Mapping[str, object],
+    ) -> LoopCalldataResponse:
+        request = _execution_query(LoopCalldataQuery, query)
+        escaped_id = quote(loop_id, safe="")
+        path = f"/loops/{escaped_id}/calldata"
+        payload = self._request_json(
+            "GET",
+            path,
+            query=request.model_dump(by_alias=True, exclude_none=True),
+        )
+        return _parse_execution_response(LoopCalldataResponse, payload, path)
 
     def cctp_config(self) -> CctpConfigResponse:
         payload = self._request_json("GET", "/cctp/config")

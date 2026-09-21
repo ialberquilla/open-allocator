@@ -475,6 +475,10 @@ def refresh_bundle(
     Keeps the bundle ID with a new digest, so completion recorded for the old
     calls never applies. Step indexes start at zero.
     """
+    if bundle.is_loop:
+        from open_allocator.exec import loops
+
+        return loops.refresh_loop_bundle(client, bundle, config=config, now=now)
     if bundle.action not in ("deposit", "withdraw"):
         # Bridge burns and composed receives carry no expiring quote.
         raise CalldataValidationError(

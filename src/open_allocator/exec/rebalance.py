@@ -88,6 +88,41 @@ class _StepRef(FrozenModel):
     action_type: str
 
 
+def _refuse_levered_trades(
+    positions: object,
+    trades: Iterable[object],
+    known: Sequence[Vault | Mapping[str, object]],
+) -> None:
+    """Rebalance trades plain deposits and withdrawals, never a loop.
+
+    A loop is opened by ``execute`` as one bundle to a chosen leverage and
+    unwound by a loop close; a rebalance sell of its collateral would fail the
+    pool's health check, and a buy would deposit unlevered into a levered id.
+    A levered position the rebalance leaves alone is no obstacle.
+    """
+    levered = {
+        vault.instrument_id
+        for vault in (
+            item if isinstance(item, Vault) else Vault.model_validate(item)
+            for item in known
+        )
+        if vault.is_levered
+    }
+    levered.update(
+        str(getattr(holding, "instrument_id", ""))
+        for holding in getattr(positions, "holdings", ()) or ()
+        if getattr(holding, "levered", None) is not None
+    )
+    touched = sorted(
+        {str(getattr(trade, "instrument_id", "")) for trade in trades} & levered
+    )
+    if touched:
+        raise TransactionPlanError(
+            f"levered positions {', '.join(touched)} are not traded by rebalance: "
+            "a loop is opened by `execute` and unwound by a loop close"
+        )
+
+
 def execute_rebalance(
     client: object,
     signer: Signer,
@@ -110,6 +145,7 @@ def execute_rebalance(
         known_instruments=known,
         min_trade_usd=min_trade_usd,
     )
+    _refuse_levered_trades(positions, rebalance_plan.trades, known)
     should_execute = confirm or autonomous
     if autonomous and not confirm:
         _require_autonomous_rebalance(rebalance_plan, policy)

@@ -231,6 +231,7 @@ def _prepare(
         return PlanPreparation(), ()
 
     blockers = [
+        *_loop_blockers(signer, bundles),
         *_submission_mode_blockers(signer, bundles),
         *_deployment_blockers(signer, bundles, config),
     ]
@@ -519,6 +520,29 @@ def execute_plan(
         in_progress=bool(unconfirmed),
         messages=(*messages, *unconfirmed),
         completed_keys=tuple(completed),
+    )
+
+
+def _loop_blockers(
+    signer: object,
+    bundles: Sequence[PlannedBundle],
+) -> Iterable[str]:
+    """A loop goes out as one operation or not at all.
+
+    Sent call by call, a loop that fails part-way leaves collateral supplied
+    and debt drawn with nothing re-supplied: an unhedged levered position. The
+    batch is what makes that state unreachable, so a signer that cannot batch
+    cannot carry a loop.
+    """
+    if supports_batching(signer):
+        return ()
+    loops = [item.bundle.bundle_id for item in bundles if item.bundle.is_loop]
+    if not loops:
+        return ()
+    return (
+        f"loop bundles {', '.join(loops)} must be sent as one atomic operation, "
+        "and this signer sends calls one at a time; use a smart-account signer "
+        "(SIGNER_ACCOUNT=safe)",
     )
 
 

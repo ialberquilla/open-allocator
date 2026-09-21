@@ -144,6 +144,14 @@ class Vault(FrozenModel):
     # on a reward-driven position binds on the reward token's exit liquidity.
     # ``None`` = unmeasured, which is never zero and never a pass.
     reward_liquidity_usd: float | None = Field(default=None, ge=0)
+    # The contract a protocol call targets (an Aave pool, a vault). Discovered,
+    # never assumed; it is how positions sharing one pool's account-wide state
+    # are recognised.
+    protocol_address: str | None = None
+    # A levered row's two legs, as 1Tx instrument ids. A loop row's own
+    # ``instrument_id`` is its loop id; these name the pair it was built from.
+    collateral_instrument_id: str | None = None
+    debt_instrument_id: str | None = None
 
     @model_validator(mode="after")
     def _levered_rows_declare_their_ceiling(self) -> "Vault":
@@ -151,7 +159,13 @@ class Vault(FrozenModel):
             raise ValueError(
                 f"{self.instrument_id}: a levered row must declare max_leverage"
             )
-        for name in ("max_leverage", "liquidation_threshold", "debt_asset"):
+        for name in (
+            "max_leverage",
+            "liquidation_threshold",
+            "debt_asset",
+            "collateral_instrument_id",
+            "debt_instrument_id",
+        ):
             if not self.is_levered and getattr(self, name) is not None:
                 raise ValueError(
                     f"{self.instrument_id}: {name} belongs to levered rows only"
@@ -273,6 +287,10 @@ TxStepKind: TypeAlias = Literal[
     "bridge_burn",
     "cctp_receive",
     "fee",
+    # Levered loops. Supply stays ``deposit``, as 1Tx returns it.
+    "borrow",
+    "repay",
+    "set_account_config",
     "buy",
     "sell",
 ]
@@ -324,7 +342,56 @@ class BundleBridge(FrozenModel):
     fast: bool
 
 
-BundleAction: TypeAlias = Literal["deposit", "withdraw", "bridge", "cctp_receive"]
+class BundleLoop(FrozenModel):
+    """What a loop bundle commits the account to, and what 1Tx measured.
+
+    The venue's effective pair parameters and the post-bundle position the
+    simulator read back, next to the health factor open-allocator modelled
+    for the same leverage. Bound into the bundle digest, so a rebuilt bundle
+    that measures differently is a different bundle.
+    """
+
+    loop_id: str = Field(min_length=1)
+    recipe: str = Field(min_length=1)
+    pool: str
+    collateral_instrument_id: str = Field(min_length=1)
+    debt_instrument_id: str = Field(min_length=1)
+    debt_token: BundleToken | None = None
+    same_asset: bool
+    # None for a close, which names no target.
+    requested_leverage: float | None = Field(default=None, gt=1)
+    ltv: float = Field(gt=0, lt=1)
+    liquidation_threshold: float = Field(gt=0, le=1)
+    params_basis: str
+    oracle: str
+    # Account-wide pool state the bundle changes (Aave's e-mode category).
+    requires_account_config: bool
+    account_config_current: int = Field(ge=0)
+    account_config_target: int = Field(ge=0)
+    # Measured by 1Tx after the batch ran, raw units of each leg's token.
+    simulated_collateral: str = Field(pattern=r"^\d+$")
+    simulated_debt: str = Field(pattern=r"^\d+$")
+    simulated_leverage: float | None = None
+    simulated_health_factor: float | None = None
+    simulated_depeg_buffer_bps: int | None = None
+    # Modelled here from ``requested_leverage`` and the effective threshold.
+    modelled_health_factor: float | None = None
+    modelled_depeg_buffer_bps: int | None = None
+    turns: int = Field(ge=0)
+
+
+BundleAction: TypeAlias = Literal[
+    "deposit",
+    "withdraw",
+    "bridge",
+    "cctp_receive",
+    "loop_open",
+    "loop_adjust",
+    "loop_close",
+]
+LOOP_BUNDLE_ACTIONS: frozenset[str] = frozenset(
+    {"loop_open", "loop_adjust", "loop_close"}
+)
 
 
 class TxBundle(FrozenModel):
@@ -353,7 +420,9 @@ class TxBundle(FrozenModel):
     step_indexes: tuple[int, ...] = Field(min_length=1)
     source: Literal["1tx-calldata", "open-allocator"] = "1tx-calldata"
     endpoint: str = Field(min_length=1)
-    # Raw units of ``token_in``, or ``max`` for a full withdrawal.
+    # Raw units of ``token_in``, or ``max`` for a full withdrawal. A loop
+    # adjust or close acts on the whole position the account holds on its
+    # pair, and is ``max``.
     amount: str = Field(pattern=r"^(?:max|[1-9]\d*)$")
     token_in: BundleToken
     token_out: BundleToken
@@ -374,6 +443,7 @@ class TxBundle(FrozenModel):
     simulation_scope: Literal["protocol_bundle"] | None = "protocol_bundle"
     simulation_engine: Literal["wallet_neutral_atomic"] | None = "wallet_neutral_atomic"
     bridge: BundleBridge | None = None
+    loop: BundleLoop | None = None
 
     @model_validator(mode="after")
     def _source_matches_kind(self) -> "TxBundle":
@@ -398,7 +468,15 @@ class TxBundle(FrozenModel):
                 f"bundle {self.bundle_id}: bridge metadata belongs to bridge "
                 "bundles only"
             )
+        if (self.action in LOOP_BUNDLE_ACTIONS) != (self.loop is not None):
+            raise ValueError(
+                f"bundle {self.bundle_id}: loop metadata belongs to loop bundles only"
+            )
         return self
+
+    @property
+    def is_loop(self) -> bool:
+        return self.loop is not None
 
 
 def bundle_digest(
@@ -412,13 +490,15 @@ def bundle_digest(
     quote_block: int,
     expires_at: int | None,
     bridge: BundleBridge | None = None,
+    loop: BundleLoop | None = None,
 ) -> str:
     """SHA-256 over what a bundle commits the account to, in call order.
 
     Covers the instrument, action, account, chain, amount, every call's target,
-    data, value, and type, the quote block and expiry, and a bridge bundle's
-    CCTP transfer. Addresses and hex are case-folded so a re-encoded but
-    identical bundle keeps its digest.
+    data, value, and type, the quote block and expiry, a bridge bundle's CCTP
+    transfer, and a loop bundle's pair parameters and measured position.
+    Addresses and hex are case-folded so a re-encoded but identical bundle
+    keeps its digest.
     """
     payload: dict[str, object] = {
         "instrument_id": instrument_id.casefold(),
@@ -442,6 +522,8 @@ def bundle_digest(
         # Absent otherwise, so digests of deposit and withdraw bundles are the
         # ones earlier plans recorded.
         payload["bridge"] = bridge.model_dump(mode="json")
+    if loop is not None:
+        payload["loop"] = loop.model_dump(mode="json")
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -504,6 +586,7 @@ class TxPlan(FrozenModel):
                 quote_block=bundle.quote_block,
                 expires_at=bundle.expires_at,
                 bridge=bundle.bridge,
+                loop=bundle.loop,
             )
             if digest != bundle.digest:
                 raise ValueError(

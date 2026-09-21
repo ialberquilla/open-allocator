@@ -1,0 +1,130 @@
+{
+  "data": [
+    {
+      "loopId": "0x0000008f8cd11c51638c07c1edaadb662438c0d22453d5b5e8a646b9e404ec92",
+      "chainId": 143,
+      "pool": "0x80F00661b13CC5F6ccd3885bE7b4C9c67545D585",
+      "protocol": "Neverland",
+      "sameAsset": true,
+      "collateral": {
+        "instrumentId": "0x0000008f4ebefd380701541f3c3b8714bd828824fa2842de58ba96eea9758a3f",
+        "symbol": "USDC",
+        "tokenAddress": "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
+        "apyBase": 2.1237,
+        "apyReward": 8.109,
+        "totalSupplyUsd": 2076573,
+        "tvlUsd": 1054331
+      },
+      "debt": {
+        "instrumentId": "0x0000008f4ebefd380701541f3c3b8714bd828824fa2842de58ba96eea9758a3f",
+        "symbol": "USDC",
+        "tokenAddress": "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
+        "apyBaseBorrow": 7.1884,
+        "apyRewardBorrow": 2.7299,
+        "totalSupplyUsd": 2076573,
+        "totalBorrowUsd": 1022703,
+        "debtCeilingUsd": null,
+        "borrowable": true
+      },
+      "leverage": {
+        "ltv": 0.85,
+        "maxLeverage": 6.6667,
+        "basis": "defillama-pool-default"
+      },
+      "reward": {
+        "basis": "emission",
+        "tokens": [
+          {
+            "address": "0xd0fd2cf7f6ceff4f96b1161f5e995d5843326154",
+            "symbol": null,
+            "legs": [
+              "supply",
+              "borrow"
+            ],
+            "priceUsd": null,
+            "priceSource": "unknown",
+            "liquidityUsd": null
+          },
+          {
+            "address": "0xad96c3dffcd6374294e2573a7fbba96097cc8d7c",
+            "symbol": "DUST",
+            "legs": [
+              "supply",
+              "borrow"
+            ],
+            "priceUsd": 0.02999,
+            "priceSource": "dex-pair",
+            "liquidityUsd": 802.99
+          }
+        ],
+        "liquidityUsd": null,
+        "emissionUsdPerDay": 537.83
+      },
+      "lastSyncedAt": "2026-09-21T11:27:01.890Z"
+    },
+    {
+      "loopId": "0x0000008feb2e28c4aea6972122672ddb25db4d3df4af7e83e7ffcf3ad8fb5adb",
+      "chainId": 143,
+      "pool": "0x80F00661b13CC5F6ccd3885bE7b4C9c67545D585",
+      "protocol": "Neverland",
+      "sameAsset": false,
+      "collateral": {
+        "instrumentId": "0x0000008f4ebefd380701541f3c3b8714bd828824fa2842de58ba96eea9758a3f",
+        "symbol": "USDC",
+        "tokenAddress": "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
+        "apyBase": 2.1237,
+        "apyReward": 8.109,
+        "totalSupplyUsd": 2076573,
+        "tvlUsd": 1054331
+      },
+      "debt": {
+        "instrumentId": "0x0000008f8b183cc36cd7ab674e79e56a05bc89cd6a733a92f3ca89ac84bc0266",
+        "symbol": "AUSD",
+        "tokenAddress": "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a",
+        "apyBaseBorrow": 8.479,
+        "apyRewardBorrow": 5.6644,
+        "totalSupplyUsd": 1384784,
+        "totalBorrowUsd": 1084348,
+        "debtCeilingUsd": null,
+        "borrowable": true
+      },
+      "leverage": {
+        "ltv": 0.85,
+        "maxLeverage": 6.6667,
+        "basis": "defillama-pool-default"
+      },
+      "reward": {
+        "basis": "emission",
+        "tokens": [
+          {
+            "address": "0xd0fd2cf7f6ceff4f96b1161f5e995d5843326154",
+            "symbol": null,
+            "legs": [
+              "supply",
+              "borrow"
+            ],
+            "priceUsd": null,
+            "priceSource": "unknown",
+            "liquidityUsd": null
+          },
+          {
+            "address": "0xad96c3dffcd6374294e2573a7fbba96097cc8d7c",
+            "symbol": "DUST",
+            "legs": [
+              "supply",
+              "borrow"
+            ],
+            "priceUsd": 0.02999,
+            "priceSource": "dex-pair",
+            "liquidityUsd": 802.99
+          }
+        ],
+        "liquidityUsd": null,
+        "emissionUsdPerDay": 629.62
+      },
+      "lastSyncedAt": "2026-09-21T11:27:01.890Z"
+    }
+  ],
+  "count": 2,
+  "asOf": "2026-09-21T11:27:01.890Z"
+}

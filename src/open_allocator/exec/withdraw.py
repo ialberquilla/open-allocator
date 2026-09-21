@@ -14,6 +14,7 @@ from open_allocator.exec.execute import (
     ExecutionReport,
     ExecutionStepReport,
     GasCheck,
+    TransactionPlanError,
     WalletPreparation,
     _append_allocation_log,
     _completed_keys,
@@ -85,6 +86,7 @@ def withdraw(
     config: object | None = None,
     idempotency_store: object | None = None,
 ) -> WithdrawExecutionReport:
+    _refuse_levered(position)
     withdraw_plan = withdraw_core.plan_withdraw(position, policy, amount=amount)
     address = signer.address()
     if calldata.uses_calldata_api(config):
@@ -231,6 +233,26 @@ def withdraw(
         completed_keys=_completed_keys(step_refs, execution_steps),
     )
     return report
+
+
+def _refuse_levered(position: object) -> None:
+    """A loop is not withdrawn: its collateral is pledged against its debt."""
+    levered = (
+        position.get("levered")
+        if isinstance(position, Mapping)
+        else getattr(position, "levered", None)
+    )
+    if levered is not None:
+        instrument_id = (
+            position.get("instrument_id")
+            if isinstance(position, Mapping)
+            else getattr(position, "instrument_id", None)
+        )
+        raise TransactionPlanError(
+            f"{instrument_id} is a levered loop; withdrawing its collateral would "
+            "fail the pool's health check. It is unwound by a loop close, which "
+            "this command does not build"
+        )
 
 
 def _build_tx_plan(

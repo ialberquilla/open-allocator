@@ -50,6 +50,9 @@
             "bridge_burn",
             "cctp_receive",
             "fee",
+            "borrow",
+            "repay",
+            "set_account_config",
             "buy",
             "sell"
           ]
@@ -115,6 +118,63 @@
       },
       "required": ["address", "decimals"]
     },
+    "BundleLoop": {
+      "title": "BundleLoop",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "loop_id": { "type": "string", "minLength": 1 },
+        "recipe": { "type": "string", "minLength": 1 },
+        "pool": { "type": "string" },
+        "collateral_instrument_id": { "type": "string", "minLength": 1 },
+        "debt_instrument_id": { "type": "string", "minLength": 1 },
+        "debt_token": {
+          "anyOf": [{ "$ref": "#/$defs/BundleToken" }, { "type": "null" }]
+        },
+        "same_asset": { "type": "boolean" },
+        "requested_leverage": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 1
+        },
+        "ltv": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+        "liquidation_threshold": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "params_basis": { "type": "string" },
+        "oracle": { "type": "string" },
+        "requires_account_config": { "type": "boolean" },
+        "account_config_current": { "type": "integer", "minimum": 0 },
+        "account_config_target": { "type": "integer", "minimum": 0 },
+        "simulated_collateral": { "$ref": "#/$defs/RawUint" },
+        "simulated_debt": { "$ref": "#/$defs/RawUint" },
+        "simulated_leverage": { "type": ["number", "null"] },
+        "simulated_health_factor": { "type": ["number", "null"] },
+        "simulated_depeg_buffer_bps": { "type": ["integer", "null"] },
+        "modelled_health_factor": { "type": ["number", "null"] },
+        "modelled_depeg_buffer_bps": { "type": ["integer", "null"] },
+        "turns": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "loop_id",
+        "recipe",
+        "pool",
+        "collateral_instrument_id",
+        "debt_instrument_id",
+        "same_asset",
+        "ltv",
+        "liquidation_threshold",
+        "params_basis",
+        "oracle",
+        "requires_account_config",
+        "account_config_current",
+        "account_config_target",
+        "simulated_collateral",
+        "simulated_debt",
+        "turns"
+      ]
+    },
     "TxBundle": {
       "title": "TxBundle",
       "type": "object",
@@ -137,7 +197,15 @@
           "minLength": 1
         },
         "action": {
-          "enum": ["deposit", "withdraw", "bridge", "cctp_receive"]
+          "enum": [
+            "deposit",
+            "withdraw",
+            "bridge",
+            "cctp_receive",
+            "loop_open",
+            "loop_adjust",
+            "loop_close"
+          ]
         },
         "account": {
           "type": "string"
@@ -233,6 +301,9 @@
         },
         "bridge": {
           "anyOf": [{ "$ref": "#/$defs/BundleBridge" }, { "type": "null" }]
+        },
+        "loop": {
+          "anyOf": [{ "$ref": "#/$defs/BundleLoop" }, { "type": "null" }]
         }
       },
       "required": [

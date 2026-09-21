@@ -1392,6 +1392,9 @@ def test_positions_command_outputs_holdings_and_idle_balances(
         def __exit__(self, *args: object) -> None:
             pass
 
+        def loops(self) -> Any:
+            return SimpleNamespace(data=())
+
         def balances(self, requested_address: str) -> dict[str, Any]:
             assert requested_address == address
             return {
@@ -1639,6 +1642,8 @@ def _calldata_dry_run(
             TxPlan(steps=(), summary="calldata plan"),
             [],
             preparation,
+            (),
+            None,
         ),
     )
     monkeypatch.setattr(
