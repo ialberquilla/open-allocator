@@ -194,7 +194,7 @@ to misprice. An absent basis is *not* a fourth basis: it reads as not-traded.
 the second reads `Unknown` for every row on an emission basis or with no basis
 reported.
 
-### Leverage is modelled and capped, not yet executable
+### Leverage is modelled, capped, and opened as one bundle
 
 `core.levered` turns a snapshotted loopable pair into `f(L) = L·rs − (L−1)·rb`
 plus a health factor and a depeg budget. **`f(L)` is linear in L**, so the only
@@ -219,6 +219,34 @@ exposure — so the declaration is what the levered caps above read. A levered
 sleeve is a **mandate-level decision**: `validate-mandate` requires a rationale
 entry for `caps.max_weight_levered`, at the value the derived policy ships,
 whenever that policy admits any levered weight. See the limits below.
+
+**Execution.** On the calldata path, `execute`/`build-tx` also discover every
+`GET /loops` pair as a levered row keyed by its loop id, so an allocation leg
+may name one — with the `leverage` it is built to, which a levered leg must
+state. Before policy runs, the loop endpoint is read for the pair's
+**effective** LTV and liquidation threshold (an e-mode category, when one
+admits the pair), and policy judges the leg on those rather than on the
+screen's pool-default lower bound. The leg is then one `loop_open` bundle: its
+inner `borrow`/`swap`/`deposit`/`set_account_config` calls stay in the plan,
+but it is one operation and one idempotency unit, and a signer that cannot
+batch cannot carry it. 1Tx's simulated health factor and leverage must match
+`lt·L/(L−1)` within `HEALTH_FACTOR_TOLERANCE` (0.001) and `LEVERAGE_TOLERANCE`
+(0.1%), or planning stops with `LoopDivergenceError`; the simulated position is
+also held to `min_health_factor` and `min_depeg_buffer_bps`. The report's
+`loops` entry is the levered announcement — collateral, debt, equity, L,
+modelled and simulated HF, depeg buffer, the reward-price kill switch, and,
+when the bundle changes the account's e-mode, every other position held in the
+pool. If the book cannot be read to say which, the operation cannot be
+confirmed. A loop's collateral must be the chain's USDC, and it is never
+bridged.
+
+`positions` reports a loop at its **equity** under its loop id, with a
+`levered` block beside it (collateral, debt, leverage, the pool's health
+factor). Debt is read from the pool's own account data, which is also how a
+held position is attributed to a pair; a pool whose debt cannot be attributed
+to one loop is an error rather than a gross figure. `withdraw` and `rebalance`
+refuse to trade a levered position — it is unwound by a loop close, which
+nothing here builds yet.
 
 Gas in that block is priced from **live** chain state — the source chain's gas
 price and an on-chain Chainlink ETH/USD feed — and `cost_estimate.gas_priced_live`
@@ -286,10 +314,14 @@ blocks.
   `build-allocation` can place a levered row above `max_weight_levered` or at an
   unchosen L; `check-policy` then rejects it. Only a zero ceiling and the
   liquidity floor narrow levered rows out *before* construction.
-- **The health factor is modelled, not measured.** Every HF and depeg figure the
-  policy reads comes from the row's declared parameters — and, with no published
-  liquidation threshold, from a lower bound. The venue's simulated HF is what
-  counts, and nothing compares the two yet.
+- **Outside execution, the health factor is a lower bound.** `check-policy`,
+  `build-allocation`, `rebalance` and `drift` read a levered row's screen
+  parameters, which carry no liquidation threshold, so a loop that `execute`
+  admits on its effective threshold can fail them. Only `execute`/`build-tx`
+  read the venue's parameters and compare its simulated HF with the model.
+- **Nothing services or unwinds a loop yet.** There is no loop close, adjust,
+  claim-and-repay or HF watch in this repository; a held loop is reported, not
+  managed.
 - **A levered quote is rate arithmetic on a snapshot.** It does not model our
   own market impact — borrowing at size moves the rate that was just quoted —
   it has no liquidation mechanics beyond the health factor, and it has no view

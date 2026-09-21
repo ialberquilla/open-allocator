@@ -14,6 +14,61 @@ _USDC_QUANTUM = Decimal("0.000001")
 _EPSILON = Decimal("0.0000005")
 
 
+class LeveredDecomposition(FrozenModel):
+    """What a levered holding is made of, behind the equity it reports.
+
+    The holding's ``usd_value`` is the equity, so every sum over holdings keeps
+    reading net value; this is the gross exposure that value hides. Debt is
+    valued as the pool values it: the collateral's USD value times the pool's
+    own debt/collateral ratio at its oracle.
+    """
+
+    loop_id: str
+    pool: str
+    collateral_instrument_id: str
+    debt_instrument_id: str
+    collateral_usd: float = Field(ge=0)
+    debt_usd: float = Field(ge=0)
+    equity_usd: float = Field(ge=0)
+    # Collateral over equity; None when the equity is gone.
+    leverage: float | None = None
+    # The pool's account-level health factor; None with no debt.
+    health_factor: float | None = None
+    basis: Literal["pool_account_ratio"] = "pool_account_ratio"
+
+
+class PoolAccount(FrozenModel):
+    """One account's standing in one lending pool, as the pool reports it.
+
+    ``total_*_base`` are the pool's own account totals in its base currency;
+    only their ratio is used, so the unit does not matter. Borrowed and
+    collateral assets are token addresses.
+    """
+
+    chain_id: int
+    pool: str
+    total_collateral_base: int = Field(ge=0)
+    total_debt_base: int = Field(ge=0)
+    health_factor: float | None = None
+    borrowed_assets: tuple[str, ...] = ()
+    collateral_assets: tuple[str, ...] = ()
+
+
+class LoopPair(FrozenModel):
+    """A loopable pair as discovery names it; a decomposition is filed under it."""
+
+    loop_id: str
+    chain_id: int
+    pool: str
+    collateral_instrument_id: str
+    debt_instrument_id: str
+    debt_token: str
+
+
+class LeveredPositionError(ValueError):
+    """A pool's debt cannot be attributed to one loop; NAV would be a guess."""
+
+
 class PositionHolding(FrozenModel):
     instrument_id: str
     protocol: str
@@ -30,6 +85,10 @@ class PositionHolding(FrozenModel):
     yield_token_address: str | None = None
     description: str | None = None
     current_apy: float | None = None
+    # Set on a levered holding: ``instrument_id`` is then the loop id and
+    # ``usd_value``/``balance`` are the equity, while the share balance stays
+    # the collateral the account holds.
+    levered: LeveredDecomposition | None = None
 
 
 class IdleBalance(FrozenModel):
@@ -96,6 +155,118 @@ def read_positions(client: object, address: str) -> Positions:
             "total_usdc_usd",
             "totalUsdcUsd",
         ),
+    )
+
+
+def pool_legs(
+    positions: Positions,
+    pairs: Sequence[LoopPair],
+) -> dict[tuple[int, str], tuple[PositionHolding, ...]]:
+    """The holdings that sit in a loopable pool, by ``(chain, pool)``.
+
+    Only these can carry debt a decomposition has to account for; a book with
+    none of them is unlevered by construction and needs no pool read.
+    """
+    legs: dict[tuple[int, str], set[str]] = defaultdict(set)
+    for pair in pairs:
+        key = (pair.chain_id, pair.pool.casefold())
+        legs[key].update(
+            {
+                pair.collateral_instrument_id.casefold(),
+                pair.debt_instrument_id.casefold(),
+            }
+        )
+    found: dict[tuple[int, str], list[PositionHolding]] = defaultdict(list)
+    for holding in positions.holdings:
+        for (chain_id, pool), instruments in legs.items():
+            if (
+                holding.chain_id == chain_id
+                and holding.instrument_id.casefold() in instruments
+            ):
+                found[(chain_id, pool)].append(holding)
+    return {key: tuple(items) for key, items in found.items()}
+
+
+def decompose_levered(
+    positions: Positions,
+    *,
+    pairs: Sequence[LoopPair],
+    accounts: Sequence[PoolAccount],
+) -> Positions:
+    """Positions with each loop's collateral holding replaced by its equity.
+
+    A pool whose account has no debt is left exactly as it was: an unlevered
+    holding's value, and so NAV, does not move. A pool with debt must hold
+    exactly one leg of exactly one loop pair whose debt token is the one
+    borrowed; that holding becomes the loop, valued at equity. Anything else
+    cannot be attributed and raises — reporting the collateral gross would
+    overstate NAV by the debt.
+    """
+    by_pool = pool_legs(positions, pairs)
+    replaced: dict[int, PositionHolding] = {}
+    for account in accounts:
+        if account.total_debt_base <= 0:
+            continue
+        key = (account.chain_id, account.pool.casefold())
+        held = by_pool.get(key, ())
+        label = f"pool {account.pool} on chain {account.chain_id}"
+        if len(held) != 1:
+            raise LeveredPositionError(
+                f"{label} carries debt against {len(held)} held positions; a "
+                "loop's debt can be attributed only when it is the one position "
+                "in its pool"
+            )
+        holding = held[0]
+        borrowed = {asset.casefold() for asset in account.borrowed_assets}
+        matches = [
+            pair
+            for pair in pairs
+            if pair.chain_id == account.chain_id
+            and pair.pool.casefold() == account.pool.casefold()
+            and pair.collateral_instrument_id.casefold()
+            == holding.instrument_id.casefold()
+            and pair.debt_token.casefold() in borrowed
+        ]
+        if len(borrowed) != 1 or len(matches) != 1:
+            raise LeveredPositionError(
+                f"{label}: {holding.instrument_id} borrows "
+                f"{sorted(borrowed) or 'nothing the pool reports'}, which matches "
+                f"{len(matches)} loop pairs; the debt cannot be attributed"
+            )
+        pair = matches[0]
+        collateral = _money_decimal(holding.usd_value, "holding.usd_value")
+        ratio = (
+            Decimal(account.total_debt_base) / Decimal(account.total_collateral_base)
+            if account.total_collateral_base > 0
+            else Decimal(1)
+        )
+        debt = _quantize(collateral * ratio)
+        equity = max(_quantize(collateral - debt), Decimal("0"))
+        replaced[id(holding)] = holding.model_copy(
+            update={
+                "instrument_id": pair.loop_id,
+                "balance": str(equity),
+                "usd_value": _amount(equity),
+                "levered": LeveredDecomposition(
+                    loop_id=pair.loop_id,
+                    pool=pair.pool,
+                    collateral_instrument_id=pair.collateral_instrument_id,
+                    debt_instrument_id=pair.debt_instrument_id,
+                    collateral_usd=_amount(collateral),
+                    debt_usd=_amount(debt),
+                    equity_usd=_amount(equity),
+                    leverage=float(collateral / equity) if equity > 0 else None,
+                    health_factor=account.health_factor,
+                ),
+            }
+        )
+    if not replaced:
+        return positions
+    return _positions(
+        address=positions.address,
+        holdings=[replaced.get(id(holding), holding) for holding in positions.holdings],
+        idle_balances=positions.idle_balances,
+        total_usdc_usd=positions.total_usdc_usd,
     )
 
 
@@ -428,6 +599,12 @@ def _weight(value: Decimal, total: Decimal) -> float:
 
 __all__ = [
     "Diff",
+    "LeveredDecomposition",
+    "LeveredPositionError",
+    "LoopPair",
+    "PoolAccount",
+    "decompose_levered",
+    "pool_legs",
     "held_usd_by_instrument",
     "IdleBalance",
     "PositionDelta",

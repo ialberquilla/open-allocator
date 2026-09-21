@@ -130,7 +130,14 @@ def _discover_vaults_from_client(
     client: object,
     *,
     enrich: bool = False,
+    loops: bool = False,
 ) -> list[Vault]:
+    """The discovered universe; with ``loops``, plus every loopable pair.
+
+    Loop rows are levered synthetic instruments keyed by their loop id. They
+    are added for execution, where an allocation may name one, and are not yet
+    on the scored shelf.
+    """
     vaults, skipped = universe.discover_instruments(client)
     if skipped:
         # stderr, not stdout: every command's stdout is one JSON object and
@@ -144,7 +151,20 @@ def _discover_vaults_from_client(
             err=True,
         )
     if enrich:
-        return enrich_vaults(client, vaults, days=HISTORY_DAYS)
+        vaults = enrich_vaults(client, vaults, days=HISTORY_DAYS)
+    if loops:
+        from open_allocator.exec import loops as loops_exec
+
+        levered, skipped_loops = loops_exec.discover_loop_vaults(client, vaults)
+        if skipped_loops:
+            _write_json(
+                {
+                    "warning": "skipped_loops",
+                    "loops": [s.model_dump() for s in skipped_loops],
+                },
+                err=True,
+            )
+        vaults = [*vaults, *levered]
     return vaults
 
 
@@ -265,6 +285,7 @@ def _execution_report(
     preparations: tuple[object, ...] = (),
     funding: tuple[object, ...] = (),
     messages: tuple[str, ...] = (),
+    loops: tuple[object, ...] = (),
 ) -> object:
     from open_allocator.exec.execute import ExecutionReport
 
@@ -275,6 +296,7 @@ def _execution_report(
         preparations=preparations,
         funding=funding,
         messages=messages,
+        loops=loops,
     )
 
 
@@ -373,14 +395,24 @@ def _withdraw_scope(
 def _build_execution_plan(
     allocation_path: Path,
     policy_path: Path,
-) -> tuple[Allocation, Policy, TxPlan, list[Vault], PlanPreparation | None]:
+) -> tuple[
+    Allocation,
+    Policy,
+    TxPlan,
+    list[Vault],
+    PlanPreparation | None,
+    tuple[Any, ...],
+    policy_core.PolicyResult | None,
+]:
     allocation = _read_allocation(allocation_path)
     policy = load_policy(policy_path)
     config = AllocatorConfig()
     signer = signer_from_config(config)
 
     with OneTxClient(config) as client:
-        known_instruments = _discover_vaults_from_client(client, enrich=True)
+        known_instruments = _discover_vaults_from_client(
+            client, enrich=True, loops=uses_calldata_api(config)
+        )
         if uses_calldata_api(config):
             # Planned and prepared in one pass: deposits are sized against the
             # same preparation the dry run reports.
@@ -397,7 +429,15 @@ def _build_execution_plan(
             preparation = fitted.preparation.model_copy(
                 update={"messages": (*fitted.messages, *fitted.preparation.messages)}
             )
-            return allocation, policy, fitted.plan, known_instruments, preparation
+            return (
+                allocation,
+                policy,
+                fitted.plan,
+                known_instruments,
+                preparation,
+                fitted.loops,
+                fitted.policy_result,
+            )
         plan = execute_allocation(
             client,
             signer,
@@ -410,7 +450,7 @@ def _build_execution_plan(
 
     if not isinstance(plan, TxPlan):
         raise TypeError("execute_allocation(confirm=False) did not return a TxPlan")
-    return allocation, policy, plan, known_instruments, None
+    return allocation, policy, plan, known_instruments, None, (), None
 
 
 def _execute_allocation_from_cli(
@@ -420,16 +460,19 @@ def _execute_allocation_from_cli(
     confirm: bool,
 ) -> JsonObject:
     if not confirm:
-        allocation, policy, plan, known_instruments, preparation = (
+        allocation, policy, plan, known_instruments, preparation, loops, checked = (
             _build_execution_plan(allocation_path, policy_path)
         )
-        policy_result = policy_core.check(allocation, policy, known_instruments)
+        policy_result = checked or policy_core.check(
+            allocation, policy, known_instruments
+        )
         report = _execution_report(
             status="planned",
             policy_result=policy_result,
             plan=plan,
             preparations=() if preparation is None else preparation.preparations,
             funding=() if preparation is None else preparation.funding,
+            loops=loops,
             messages=(
                 "dry-run only; no transactions broadcast",
                 *(() if preparation is None else preparation.messages),
@@ -444,7 +487,9 @@ def _execute_allocation_from_cli(
     signer = signer_from_config(config)
 
     with OneTxClient(config) as client:
-        known_instruments = _discover_vaults_from_client(client, enrich=True)
+        known_instruments = _discover_vaults_from_client(
+            client, enrich=True, loops=uses_calldata_api(config)
+        )
         report = execute_allocation(
             client,
             signer,
@@ -566,7 +611,11 @@ def _withdraw_position_from_cli(
     address_method = getattr(signer, "address", None)
     if not callable(address_method):
         raise TypeError("signer does not implement address()")
-    current = positions_core.read_positions(client, str(address_method()))
+    from open_allocator.exec import loops as loops_exec
+
+    current, warnings = loops_exec.read_book(client, str(address_method()))
+    for warning in warnings:
+        _write_json({"warning": "levered_positions", "message": warning}, err=True)
     return _select_position(current, position)
 
 
@@ -691,8 +740,13 @@ def _positions_payload(address: str | None) -> JsonObject:
     else:
         config = ReadOnlyOneTxConfig()
 
+    from open_allocator.exec import loops as loops_exec
+
     with OneTxClient(config) as client:
-        return positions_core.read_positions(client, address).model_dump(mode="json")
+        book, warnings = loops_exec.read_book(client, address, config)
+    for warning in warnings:
+        _write_json({"warning": "levered_positions", "message": warning}, err=True)
+    return book.model_dump(mode="json")
 
 
 def _rewards_payload(wallet: str, chain_id: int | None) -> JsonObject:
@@ -1549,8 +1603,8 @@ def build_tx(
         typer.Option("--policy", dir_okay=False, readable=True),
     ] = DEFAULT_POLICY_PATH,
 ) -> JsonObject:
-    _allocation, _policy, plan, _known_instruments, preparation = _build_execution_plan(
-        allocation_path, policy_path
+    _allocation, _policy, plan, _known_instruments, preparation, _loops, _checked = (
+        _build_execution_plan(allocation_path, policy_path)
     )
     # The plan is the output, so blockers are an error rather than a note.
     if preparation is not None and preparation.blockers:

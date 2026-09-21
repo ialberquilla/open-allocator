@@ -22,11 +22,12 @@ from open_allocator.core.types import (
     Allocation,
     FrozenModel,
     Policy,
+    PolicyCaps,
     TxPlan,
     TxStep,
     Vault,
 )
-from open_allocator.exec import calldata, chains, funding
+from open_allocator.exec import calldata, chains, funding, loops
 from open_allocator.exec.bridge_state import BridgeState
 from open_allocator.exec.erc4337_paymaster import (
     PaymasterError,
@@ -35,6 +36,7 @@ from open_allocator.exec.erc4337_paymaster import (
     validate_paymaster_preflight,
 )
 from open_allocator.exec.funding import FundingRequirement
+from open_allocator.exec.loops import LoopAnnouncement
 from open_allocator.exec.paymaster_types import AssumedBalance
 from open_allocator.exec.signer import Receipt, Signer
 
@@ -110,6 +112,9 @@ class ExecutionReport(FrozenModel):
     # Bridged legs as this run left them; the idempotency store holds the
     # records a rerun resumes from.
     bridges: tuple[BridgeState, ...] = Field(default_factory=tuple)
+    # One per levered operation: collateral, debt, leverage, modelled and
+    # simulated health factor, kill switch, and what else it re-prices.
+    loops: tuple[LoopAnnouncement, ...] = Field(default_factory=tuple)
 
 
 class ExecutionError(RuntimeError):
@@ -205,12 +210,18 @@ def execute_allocation(
 ) -> ExecutionReport | TxPlan:
     allocation_model = _allocation(allocation)
     policy_model = _policy(policy)
-    known = tuple(known_instruments or ())
+    known: tuple[Vault | Mapping[str, object], ...] = tuple(known_instruments or ())
+    address = signer.address()
+    if calldata.uses_calldata_api(config):
+        known = _with_effective_loop_parameters(
+            client, known, allocation_model, address, config, idempotency_store
+        )
+    else:
+        _refuse_legacy_loops(allocation_model, _vaults_by_id(known))
     policy_result = policy_core.check(allocation_model, policy_model, known)
     if not policy_result.ok:
         raise PolicyCheckFailed(policy_result)
 
-    address = signer.address()
     vaults_by_id = _vaults_by_id(known)
     if calldata.uses_calldata_api(config):
         fitted = _calldata_deposit_plan(
@@ -221,6 +232,7 @@ def execute_allocation(
             vaults_by_id,
             config,
             idempotency_store,
+            caps=policy_model.caps,
         )
         if not confirm:
             return fitted.plan
@@ -397,19 +409,87 @@ def plan_calldata_allocation(
     sizing notes it leaves out, so a dry run need not prepare a second time.
     """
     allocation_model = _allocation(allocation)
-    known = tuple(known_instruments or ())
-    policy_result = policy_core.check(allocation_model, _policy(policy), known)
+    policy_model = _policy(policy)
+    address = signer.address()
+    known = _with_effective_loop_parameters(
+        client,
+        tuple(known_instruments or ()),
+        allocation_model,
+        address,
+        config,
+        idempotency_store,
+    )
+    policy_result = policy_core.check(allocation_model, policy_model, known)
     if not policy_result.ok:
         raise PolicyCheckFailed(policy_result)
-    return _calldata_deposit_plan(
+    fitted = _calldata_deposit_plan(
         client,
         signer,
-        signer.address(),
+        address,
         allocation_model,
         _vaults_by_id(known),
         config,
         idempotency_store,
+        caps=policy_model.caps,
     )
+    return replace(fitted, policy_result=policy_result)
+
+
+def _refuse_legacy_loops(
+    allocation: Allocation,
+    vaults_by_id: Mapping[str, Vault],
+) -> None:
+    levered = [
+        leg.instrument_id
+        for leg in allocation.legs
+        if (vault := vaults_by_id.get(leg.instrument_id)) is not None
+        and vault.is_levered
+    ]
+    if levered:
+        raise TransactionPlanError(
+            f"levered legs {', '.join(levered)} are built only by the calldata "
+            "API (ONE_TX_TRANSACTION_API=calldata)"
+        )
+
+
+def _with_effective_loop_parameters(
+    client: object,
+    known: tuple[Vault | Mapping[str, object], ...],
+    allocation: Allocation,
+    address: str,
+    config: object | None,
+    idempotency_store: object | None,
+) -> tuple[Vault | Mapping[str, object], ...]:
+    """The known instruments, with each levered leg's pair priced by the venue.
+
+    Policy judges a loop's health factor on the pair's effective threshold,
+    which only the loop endpoint reads; the screen's pool default can only
+    bound it from below. Legs already sent are not re-read.
+    """
+    vaults = _vaults_by_id(known)
+    if not any(
+        (vault := vaults.get(leg.instrument_id)) is not None and vault.is_levered
+        for leg in allocation.legs
+    ):
+        return known
+    done = [
+        index
+        for index, leg in enumerate(allocation.legs)
+        if _store_completed(idempotency_store, _leg_key(index, leg.instrument_id))
+    ]
+    try:
+        refined = loops.refine_levered_vaults(
+            client,
+            list(vaults.values()),
+            allocation,
+            account=address,
+            config=config,
+            skip=done,
+            store=idempotency_store,
+        )
+    except (calldata.CalldataValidationError, calldata.CalldataAmountError) as error:
+        raise TransactionPlanError(str(error)) from error
+    return tuple(refined)
 
 
 def _calldata_deposit_plan(
@@ -420,6 +500,8 @@ def _calldata_deposit_plan(
     vaults_by_id: Mapping[str, Vault],
     config: object | None,
     idempotency_store: object | None,
+    *,
+    caps: PolicyCaps | None = None,
 ) -> DepositFit:
     """A deposit plan built from calldata bundles, one per unfinished leg.
 
@@ -429,6 +511,10 @@ def _calldata_deposit_plan(
     leg already bridging is not planned again. Each chain's spends are sized to
     leave the paymaster's maximum charge in the Safe; a chain short by more
     than that keeps full size and is a blocker.
+
+    A levered leg is one loop ``open`` bundle on its own chain, spending its
+    equity in the chain's USDC; it is never bridged, and it is announced with
+    its pool-wide impact.
     """
     from open_allocator.exec import bridge, deposit_sizing
 
@@ -456,6 +542,9 @@ def _calldata_deposit_plan(
                 "its chain and deposit token are unknown"
             )
         token = calldata.deposit_token(vault.chain_id, vaults_by_id.values(), config)
+        if vault.is_levered:
+            deposits.append(_loop_request(leg_index, leg, vault, token, pinned, caps))
+            continue
         request = deposit_sizing.DepositRequest(
             index=leg_index,
             instrument_id=leg.instrument_id,
@@ -511,7 +600,105 @@ def _calldata_deposit_plan(
                 [fitted.plan.steps[index] for index in bundle.step_indexes],
                 routes,
             )
+    announcements = _loop_announcements(
+        client, address, fitted.plan, list(vaults_by_id.values())
+    )
+    if announcements:
+        blockers = [item for loop in announcements for item in loop.blockers]
+        fitted = replace(
+            fitted,
+            loops=announcements,
+            preparation=fitted.preparation.model_copy(
+                update={"blockers": (*fitted.preparation.blockers, *blockers)}
+            ),
+        )
     return replace(fitted, messages=(*notes, *fitted.messages))
+
+
+def _loop_request(
+    leg_index: int,
+    leg: Any,
+    vault: Vault,
+    token: calldata.DepositToken,
+    pinned: int | None,
+    caps: PolicyCaps | None,
+) -> Any:
+    """The deposit request for a levered leg: a same-chain loop open."""
+    from open_allocator.exec import deposit_sizing
+
+    if pinned is not None and pinned != vault.chain_id:
+        raise TransactionPlanError(
+            f"leg {leg_index} ({leg.instrument_id}) is a loop on chain "
+            f"{vault.chain_id} but sources from chain {pinned}; loops are built "
+            "same-chain only"
+        )
+    if leg.leverage is None:
+        raise TransactionPlanError(
+            f"leg {leg_index} ({leg.instrument_id}) is levered but names no leverage"
+        )
+    target = loops.LoopTarget.from_vault(vault)
+    if target.collateral_token.casefold() != token.address.casefold():
+        raise TransactionPlanError(
+            f"loop {leg.instrument_id} supplies {vault.asset} "
+            f"({target.collateral_token}), not the chain's USDC; a loop's equity "
+            "is spent in its collateral token and nothing here swaps into it"
+        )
+    return deposit_sizing.DepositRequest(
+        index=leg_index,
+        instrument_id=leg.instrument_id,
+        chain_id=vault.chain_id,
+        token=token,
+        wanted_raw=int(loops.equity_raw(leg.usd, vault)),
+        loop=deposit_sizing.LoopOpen(target=target, leverage=leg.leverage, caps=caps),
+    )
+
+
+def _loop_announcements(
+    client: object,
+    address: str,
+    plan: TxPlan,
+    vaults: Sequence[Vault],
+) -> tuple[loops.LoopAnnouncement, ...]:
+    """The levered announcement for every loop bundle in the plan.
+
+    The account's positions are read once; when they cannot be, every loop
+    that changes account-wide pool state carries a blocker instead of a guess.
+    """
+    bundles = [bundle for bundle in plan.bundles if bundle.is_loop]
+    if not bundles:
+        return ()
+    from open_allocator.core import positions as positions_core
+
+    try:
+        rows = {row.loop_id.casefold(): row for row in loops.loop_rows(client)}
+    except Exception:  # noqa: BLE001 - the kill switch says it is unavailable
+        rows = {}
+    try:
+        holdings = positions_core.read_positions(client, address).holdings
+    except Exception:  # noqa: BLE001 - an unread book is announced as unknown
+        holdings = None
+    announcements: list[loops.LoopAnnouncement] = []
+    for bundle in bundles:
+        assert bundle.loop is not None
+        in_pool = (
+            None
+            if holdings is None
+            else loops.pool_positions(
+                holdings,
+                pool=bundle.loop.pool,
+                chain_id=bundle.chain_id,
+                vaults=vaults,
+            )
+        )
+        announcements.append(
+            loops.announce(
+                bundle,
+                vaults=vaults,
+                row=rows.get(bundle.loop.loop_id.casefold()),
+                pool_positions=in_pool,
+            )
+        )
+    return tuple(announcements)
 
 
 def _route_short_legs(
@@ -563,6 +750,13 @@ def _route_short_legs(
     notes: list[str] = []
     for request in deposits:
         held = available.get(request.chain_id)
+        if request.loop is not None:
+            # A loop is built same-chain; a short chain is the funding check's
+            # to report.
+            if held is not None:
+                available[request.chain_id] = held - request.wanted_raw
+            routed.append(request)
+            continue
         if held is None or held >= request.wanted_raw:
             if held is not None:
                 available[request.chain_id] = held - request.wanted_raw
@@ -639,6 +833,10 @@ def _execute_calldata_deposits(
     """
     from open_allocator.exec import bridge, bridge_state, bundle_execution
 
+    unconfirmable = [item for loop in fitted.loops for item in loop.blockers]
+    if unconfirmable:
+        raise TransactionPlanError("; ".join(unconfirmable))
+
     def token_for(chain_id: int) -> calldata.DepositToken:
         return calldata.deposit_token(chain_id, vaults_by_id.values(), config)
 
@@ -663,6 +861,7 @@ def _execute_calldata_deposits(
         operation: Any,
         receipt: Receipt | None,
     ) -> None:
+        loops.save_params(idempotency_store, item.bundle)
         state = planned.get(item.bundle.bundle_id)
         if state is not None:
             bridge_state.save(
@@ -763,6 +962,7 @@ def _execute_calldata_deposits(
             *stuck_messages,
         ),
         bridges=bridges,
+        loops=fitted.loops,
     )
     _write_checkpoint(
         config,

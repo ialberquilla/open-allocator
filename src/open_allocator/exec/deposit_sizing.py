@@ -16,10 +16,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from open_allocator.core import amounts
-from open_allocator.core.types import TxPlan
-from open_allocator.exec import bundle_execution, calldata, chains, funding
+from open_allocator.core.types import PolicyCaps, TxPlan
+from open_allocator.exec import bundle_execution, calldata, chains, funding, loops
 
 # Attempts to fit a chain's deposits around the paymaster charge before the
 # shortfall is reported as a blocker.
@@ -39,6 +40,17 @@ class DepositRequest:
     # Set for a bridged leg: ``chain_id`` and ``token`` are then the burn's
     # source chain and its USDC, and this is the chain the leg deposits on.
     bridge_to_chain_id: int | None = None
+    # Set for a levered leg: the deposit is the loop's equity, built as one
+    # ``open`` bundle to this leverage instead of a plain deposit.
+    loop: LoopOpen | None = None
+
+
+@dataclass(frozen=True)
+class LoopOpen:
+    target: loops.LoopTarget
+    leverage: float
+    # Floors the simulated position is held to; see loops.check_measurement.
+    caps: PolicyCaps | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +61,13 @@ class FittedPlan:
     messages: tuple[str, ...]
     # What each planned deposit actually spends, by index.
     deposit_usd: dict[int, float]
+    # One loops.LoopAnnouncement per planned loop bundle, when the caller
+    # announces them.
+    loops: tuple[Any, ...] = ()
+    # The policy result the plan was built under, when the caller checked one:
+    # levered legs are judged on the pair's effective parameters, which a
+    # re-check against the screen's would not see.
+    policy_result: Any | None = None
 
 
 def fit(
@@ -186,6 +205,21 @@ def fit(
             built[(buy.index, size)] = bundle_execution.PlannedBundle(
                 bundle=bundle, steps=steps
             )
+        elif (buy.index, size) not in built and buy.loop is not None:
+            steps, bundle = loops.request_loop_bundle(
+                client,
+                target=buy.loop.target,
+                action="open",
+                account=address,
+                amount=str(size),
+                leverage=buy.loop.leverage,
+                leg_index=buy.index,
+                config=config,
+                caps=buy.loop.caps,
+            )
+            built[(buy.index, size)] = bundle_execution.PlannedBundle(
+                bundle=bundle, steps=steps
+            )
         elif (buy.index, size) not in built:
             steps, bundle = calldata.request_bundle(
                 client,
@@ -286,4 +320,11 @@ def _sized_note(
     )
 
 
-__all__ = ["MAX_PREPARATIONS", "DepositRequest", "FittedPlan", "chain_label", "fit"]
+__all__ = [
+    "MAX_PREPARATIONS",
+    "DepositRequest",
+    "FittedPlan",
+    "LoopOpen",
+    "chain_label",
+    "fit",
+]

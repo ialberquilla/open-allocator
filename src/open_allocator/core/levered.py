@@ -480,6 +480,134 @@ def equity_cap_for_reward_liquidity(
     return quoted.equity_usd * sellable_per_day / income
 
 
+# How far the venue's measurement may sit from the model before execution
+# stops. Judgement, not calibration: both sides compute ``lt * L / (L - 1)`` at
+# the pool oracle, so on a clean position they agree to rounding (the venue
+# truncates its factor to six decimals). Anything wider is the model
+# being wrong about something — another position in the pool, a leverage the
+# planner overshot, a parameter that moved — and that is a stop, not a warning.
+HEALTH_FACTOR_TOLERANCE = 0.001
+LEVERAGE_TOLERANCE = 0.001  # relative
+
+
+class SimulationCheck(FrozenModel):
+    """OA's modelled health factor against the one the venue simulated.
+
+    The model is ``health_factor(requested L, effective threshold)``; the
+    measurement is what 1Tx's simulator read back from the pool after running
+    the batch. ``divergences`` names every way they disagree; an empty tuple is
+    the only passing result.
+    """
+
+    requested_leverage: float | None
+    liquidation_threshold: float
+    same_asset: bool
+    modelled_health_factor: float | None
+    modelled_depeg_buffer_bps: int | None
+    measured_leverage: float | None
+    measured_health_factor: float | None
+    measured_depeg_buffer_bps: int | None
+    divergences: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.divergences
+
+
+def check_simulation(
+    *,
+    requested_leverage: float | None,
+    liquidation_threshold: float,
+    same_asset: bool,
+    measured_leverage: float | None,
+    measured_health_factor: float | None,
+    measured_depeg_buffer_bps: int | None,
+    health_factor_tolerance: float = HEALTH_FACTOR_TOLERANCE,
+    leverage_tolerance: float = LEVERAGE_TOLERANCE,
+) -> SimulationCheck:
+    """Compare the model with the venue's measurement of the same bundle.
+
+    ``requested_leverage`` of ``None`` is a full unwind: the model is then no
+    debt, so no health factor and no leverage. Symmetric on purpose — a
+    measured factor *above* the model is as much a sign that the model does not
+    describe this account as one below it.
+    """
+    _require_fraction(liquidation_threshold, "liquidation_threshold", allow_one=True)
+    if requested_leverage is None:
+        modelled_hf = None
+    else:
+        modelled_hf = health_factor(
+            leverage=requested_leverage,
+            liquidation_threshold=liquidation_threshold,
+        )
+    modelled_buffer = None if same_asset else depeg_buffer_bps(modelled_hf)
+
+    divergences: list[str] = []
+    if modelled_hf is None:
+        if measured_health_factor is not None:
+            divergences.append(
+                f"the model leaves no debt, the simulation a health factor of "
+                f"{measured_health_factor}"
+            )
+    elif measured_health_factor is None:
+        divergences.append(
+            f"the model has a health factor of {modelled_hf:.6f}, the simulation "
+            "reports none"
+        )
+    elif abs(measured_health_factor - modelled_hf) > health_factor_tolerance:
+        divergences.append(
+            f"simulated health factor {measured_health_factor} is "
+            f"{measured_health_factor - modelled_hf:+.6f} from the modelled "
+            f"{modelled_hf:.6f} (tolerance {health_factor_tolerance})"
+        )
+
+    if requested_leverage is None:
+        if measured_leverage is not None:
+            divergences.append(
+                f"a full unwind simulated at leverage {measured_leverage}"
+            )
+    elif measured_leverage is None:
+        divergences.append(
+            f"leverage {requested_leverage} was requested, the simulation reports none"
+        )
+    elif (
+        abs(measured_leverage - requested_leverage) / requested_leverage
+        > leverage_tolerance
+    ):
+        divergences.append(
+            f"simulated leverage {measured_leverage} is not the requested "
+            f"{requested_leverage} (tolerance {leverage_tolerance:.2%})"
+        )
+
+    if same_asset:
+        if measured_depeg_buffer_bps is not None:
+            divergences.append(
+                "a same-asset loop reported a depeg buffer of "
+                f"{measured_depeg_buffer_bps} bps"
+            )
+    elif measured_health_factor is not None:
+        expected = depeg_buffer_bps(measured_health_factor)
+        if measured_depeg_buffer_bps is None or (
+            expected is not None and abs(measured_depeg_buffer_bps - expected) > 1
+        ):
+            divergences.append(
+                f"simulated depeg buffer {measured_depeg_buffer_bps} bps does not "
+                f"follow from its own health factor ({expected} bps)"
+            )
+
+    return SimulationCheck(
+        requested_leverage=requested_leverage,
+        liquidation_threshold=liquidation_threshold,
+        same_asset=same_asset,
+        modelled_health_factor=modelled_hf,
+        modelled_depeg_buffer_bps=modelled_buffer,
+        measured_leverage=measured_leverage,
+        measured_health_factor=measured_health_factor,
+        measured_depeg_buffer_bps=measured_depeg_buffer_bps,
+        divergences=tuple(divergences),
+    )
+
+
 def _require_leverage(leverage: float) -> None:
     if not math.isfinite(leverage) or leverage < 1.0:
         raise ValueError(f"leverage must be at least 1.0, got {leverage}")
@@ -493,9 +621,13 @@ def _require_fraction(value: float, name: str, *, allow_one: bool = False) -> No
 
 
 __all__ = [
+    "HEALTH_FACTOR_TOLERANCE",
+    "LEVERAGE_TOLERANCE",
     "MAX_TURNS",
     "LeveredQuote",
     "LeveredSpec",
+    "SimulationCheck",
+    "check_simulation",
     "depeg_buffer_bps",
     "equity_cap_for_reward_liquidity",
     "gradient_pct",
