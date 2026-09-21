@@ -48,6 +48,40 @@ caps:
   min_effective_positions: 3.0
   min_instrument_tvl_usd: 50_000
   max_reward_dependence: 0.50      # cap emissions-driven APY dependence
+  # --- levered (looped) rows -------------------------------------------------
+  # A levered row is ONE synthetic instrument whose weight is its equity, so
+  # every cap above reads its net value and none reads its gross exposure: 30%
+  # of the book at L=8 passes max_weight_per_instrument and is 240% of the book
+  # in gross exposure. These caps read the leverage back out. Levered rows are
+  # routed to them INSTEAD of max_reward_dependence, which every loop fails by
+  # construction (the base gradient is thin; the reward term carries it).
+  #
+  # A mandate that keeps any levered weight must carry a rationale entry for
+  # max_weight_levered at the value it ships — validate-mandate checks it.
+  # These are ceilings a mandate may narrow, not a recommendation to lever.
+  max_weight_levered: 0.10
+  # Higher leverage is a deliberate widening of this file, not something a
+  # mandate can reach.
+  # A levered leg that names no leverage is charged at its row's declared
+  # max_leverage, so an unchosen L fails this rather than reading as 1.
+  max_gross_leverage: 4.0
+  # sum(weight x L); unlevered legs count at 1. 10% at L=4 is 1.30.
+  max_book_gross_exposure: 1.5
+  # Entry floor, set above the 1.05 servicing trigger so a freshly opened
+  # position does not start inside its own repair band. Without
+  # a published liquidation threshold the HF is a lower bound from the LTV the
+  # row's max_leverage implies.
+  min_health_factor: 1.10
+  # Cross-asset only: liquidation is at a debt/collateral move of HF - 1, so
+  # this IS the depeg budget. 1500 bps clears the largest historical USDC
+  # depeg (12%) with margin. With no published liquidation threshold the HF is
+  # a lower bound from the LTV alone, so a cross-asset loop at L=4 and ltv 0.85
+  # (HF >= 1.133, a 1333 bps buffer) fails it until the threshold is known.
+  min_depeg_buffer_bps: 1500
+  # 24h volume of the reward token. Capacity on a reward-driven loop binds on
+  # selling the reward, not on the pool. Unmeasured volume fails, never
+  # passes.
+  min_reward_liquidity_usd: 50_000
 gates:
   new_instrument_needs_approval: false  # first touch of a pool needs approval
   autonomous_rebalance: true          # opt in explicitly before autonomy

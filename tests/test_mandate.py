@@ -55,7 +55,14 @@ def mandate_doc(**updates: object) -> dict[str, object]:
                 "knob": "strategy",
                 "value": "sleeves",
                 "because": "the mandate asks for declared buckets",
-            }
+            },
+            # The baseline admits a levered sleeve, and a derived policy that
+            # keeps one must say so at the value it ships (check 5).
+            {
+                "knob": "caps.max_weight_levered",
+                "value": 0.10,
+                "because": "the mandate accepts the baseline's levered sleeve",
+            },
         ],
     }
     base.update(updates)
@@ -100,6 +107,7 @@ def test_shipped_mandate_passes_every_check() -> None:
         "policy_schema",
         "policy_hash",
         "can_only_tighten",
+        "levered_sleeve_rationale",
     ]
     assert all(check.ok for check in result.checks)
 
@@ -113,6 +121,7 @@ def test_shipped_derived_policy_reports_the_knobs_it_tightened() -> None:
     )
     assert "caps.min_effective_positions 3.0 -> 3.5" in detail
     assert "caps.max_reward_dependence 0.5 -> 0.4" in detail
+    assert "caps.max_weight_levered 0.1 -> 0.0" in detail
 
 
 def test_shipped_mandate_explains_every_knob_it_moves() -> None:
@@ -211,7 +220,12 @@ def test_rationale_value_may_be_a_tier_ladder(tmp_path: Path) -> None:
             "knob": "strategy_params.tiers",
             "value": [{"name": "core", "min_score": 0.85}],
             "because": "cut where the scores sit",
-        }
+        },
+        {
+            "knob": "caps.max_weight_levered",
+            "value": 0.10,
+            "because": "the baseline's levered sleeve is accepted",
+        },
     ]
     mandate_file = write_pair(tmp_path, mandate_updates={"rationale": rationale})
 
@@ -341,6 +355,12 @@ def rejection(result: object) -> str:
     return check.detail
 
 
+def tighten_detail(result: object) -> str:
+    """The detail of the can_only_tighten check, whatever runs after it."""
+    checks = result.checks  # type: ignore[attr-defined]
+    return next(check.detail for check in checks if check.name == "can_only_tighten")
+
+
 def test_an_unchanged_policy_is_accepted(tmp_path: Path) -> None:
     """Equal is not looser. A mandate may move nothing but the strategy."""
     mandate_file, baseline_file = tighten(tmp_path)
@@ -348,7 +368,7 @@ def test_an_unchanged_policy_is_accepted(tmp_path: Path) -> None:
     result = validate_mandate(mandate_file, baseline_file)
 
     assert result.ok
-    assert "no knob moved" in result.checks[-1].detail
+    assert "no knob moved" in tighten_detail(result)
 
 
 def test_a_raised_ceiling_is_rejected(tmp_path: Path) -> None:
@@ -540,7 +560,7 @@ def test_giving_up_autonomy_is_a_tightening(tmp_path: Path) -> None:
     result = validate_mandate(mandate_file, baseline_file)
 
     assert result.ok
-    assert "gates.autonomous_rebalance True -> False" in result.checks[-1].detail
+    assert "gates.autonomous_rebalance True -> False" in tighten_detail(result)
 
 
 def test_taking_autonomy_is_rejected(tmp_path: Path) -> None:
@@ -675,3 +695,163 @@ def test_result_names_the_baseline_it_compared_against(tmp_path: Path) -> None:
 
     assert result.baseline_path == str(BASELINE_POLICY)
     assert "can_only_tighten" in {check.name for check in result.checks}
+
+
+# --- levered caps: narrowing-only, and a sleeve must be stated --------------
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "knob"),
+    [
+        ("max_gross_leverage: 4.0", "max_gross_leverage: 8.0", "max_gross_leverage"),
+        (
+            "max_book_gross_exposure: 1.5",
+            "max_book_gross_exposure: 3.0",
+            "max_book_gross_exposure",
+        ),
+        ("max_weight_levered: 0.10", "max_weight_levered: 0.30", "max_weight_levered"),
+        ("min_health_factor: 1.10", "min_health_factor: 1.03", "min_health_factor"),
+        (
+            "min_depeg_buffer_bps: 1500",
+            "min_depeg_buffer_bps: 300",
+            "min_depeg_buffer_bps",
+        ),
+        (
+            "min_reward_liquidity_usd: 50_000",
+            "min_reward_liquidity_usd: 500",
+            "min_reward_liquidity_usd",
+        ),
+    ],
+)
+def test_widening_a_levered_cap_is_rejected(
+    tmp_path: Path, old: str, new: str, knob: str
+) -> None:
+    mandate_file, baseline_file = tighten(tmp_path, (old, new))
+
+    result = validate_mandate(mandate_file, baseline_file)
+
+    assert not result.ok
+    assert f"caps.{knob}" in rejection(result)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "max_gross_leverage: 4.0",
+        "max_book_gross_exposure: 1.5",
+        "min_health_factor: 1.10",
+        "min_depeg_buffer_bps: 1500",
+        "min_reward_liquidity_usd: 50_000",
+    ],
+)
+def test_dropping_a_levered_cap_still_reads_as_a_loosening(
+    tmp_path: Path, line: str
+) -> None:
+    """Silence is the widest value: an omitted levered cap is no cap at all."""
+    mandate_file, baseline_file = tighten(tmp_path, (line, "# dropped"))
+
+    result = validate_mandate(mandate_file, baseline_file)
+
+    assert not result.ok
+    assert f"caps.{line.split(':')[0]}" in rejection(result)
+
+
+def test_narrowing_the_levered_caps_is_accepted(tmp_path: Path) -> None:
+    mandate_file, baseline_file = tighten(
+        tmp_path,
+        ("max_gross_leverage: 4.0", "max_gross_leverage: 3.0"),
+        ("min_health_factor: 1.10", "min_health_factor: 1.20"),
+        ("min_reward_liquidity_usd: 50_000", "min_reward_liquidity_usd: 250_000"),
+    )
+
+    result = validate_mandate(mandate_file, baseline_file)
+
+    assert result.ok
+    detail = tighten_detail(result)
+    assert "caps.max_gross_leverage 4.0 -> 3.0" in detail
+    assert "caps.min_health_factor 1.1 -> 1.2" in detail
+
+
+def test_a_levered_sleeve_inherited_without_a_rationale_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Copying the baseline's levered ceiling moves nothing, and still fails.
+
+    Check 4 passes -- equal is not looser -- so this is what catches a mandate
+    that admits leverage by never mentioning it.
+    """
+    mandate_file = write_pair(
+        tmp_path,
+        mandate_updates={
+            "rationale": [
+                {"knob": "strategy", "value": "sleeves", "because": "buckets"}
+            ]
+        },
+    )
+
+    result = validate_mandate(mandate_file, BASELINE_POLICY)
+
+    assert not result.ok
+    check = result.checks[-1]
+    assert check.name == "levered_sleeve_rationale"
+    assert not check.ok
+    assert "caps.max_weight_levered = 0.1" in check.detail
+
+
+def test_a_levered_rationale_must_argue_for_the_value_the_policy_ships(
+    tmp_path: Path,
+) -> None:
+    mandate_file = write_pair(
+        tmp_path,
+        mandate_updates={
+            "rationale": [
+                {
+                    "knob": "caps.max_weight_levered",
+                    "value": 0.05,
+                    "because": "a small sleeve",
+                }
+            ]
+        },
+    )
+
+    result = validate_mandate(mandate_file, BASELINE_POLICY)
+
+    assert not result.ok
+    assert "holds 0.1" in result.checks[-1].detail
+
+
+def test_an_absent_levered_ceiling_admits_everything_and_needs_a_reason(
+    tmp_path: Path,
+) -> None:
+    """Absent is unbounded, never "no sleeve" -- so it must be argued for too."""
+    baseline_text = BASELINE_POLICY.read_text(encoding="utf-8").replace(
+        "max_weight_levered: 0.10", "# no levered ceiling"
+    )
+    mandate_file, baseline_file = tighten(tmp_path, baseline=baseline_text)
+
+    result = validate_mandate(mandate_file, baseline_file)
+
+    assert not result.ok
+    assert "null (unbounded)" in result.checks[-1].detail
+
+
+def test_declining_leverage_needs_no_sleeve_rationale(tmp_path: Path) -> None:
+    mandate_file, baseline_file = tighten(
+        tmp_path, ("max_weight_levered: 0.10", "max_weight_levered: 0.0")
+    )
+
+    result = validate_mandate(mandate_file, baseline_file)
+
+    assert result.ok
+    assert result.checks[-1].detail.endswith("admits no levered weight")
+
+
+def test_the_sleeve_check_does_not_run_on_a_loosened_policy(tmp_path: Path) -> None:
+    """Ordering: a policy that failed check 4 has nothing check 5 can bless."""
+    mandate_file, baseline_file = tighten(
+        tmp_path, ("max_weight_levered: 0.10", "max_weight_levered: 0.50")
+    )
+
+    result = validate_mandate(mandate_file, baseline_file)
+
+    assert "levered_sleeve_rationale" not in {check.name for check in result.checks}

@@ -378,3 +378,37 @@ def test_a_levered_row_with_no_ceiling_is_skipped_not_silently_uncapped() -> Non
     assert vaults == []
     assert [item.instrument_id for item in skipped] == ["uncapped"]
     assert "max_leverage" in skipped[0].reason
+
+
+def test_discovery_carries_the_pair_parameters_the_levered_caps_read() -> None:
+    vault = universe.discover(
+        StubClient(
+            [
+                instrument(
+                    levered=True,
+                    maxLeverage=14.285714,
+                    liquidationThreshold=0.94,
+                    debtAsset="AUSD",
+                    rewardLiquidityUsd=635,
+                )
+            ]
+        )
+    )[0]
+
+    assert vault.liquidation_threshold == 0.94
+    assert vault.debt_asset == "AUSD"
+    assert vault.reward_liquidity_usd == 635
+    assert vault.cross_asset is True
+
+
+def test_pair_parameters_on_an_ordinary_row_are_ignored_not_fatal() -> None:
+    """A stray upstream column describes nothing on an unlevered instrument."""
+    vaults, skipped = universe.discover_instruments(
+        StubClient(
+            [instrument(instrumentId="plain", liquidationThreshold=0.9, debtAsset="X")]
+        )
+    )
+
+    assert skipped == ()
+    assert vaults[0].liquidation_threshold is None
+    assert vaults[0].debt_asset is None

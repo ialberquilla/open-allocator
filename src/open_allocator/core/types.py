@@ -130,6 +130,20 @@ class Vault(FrozenModel):
     # ceiling for anything measuring gross exposure to read.
     is_levered: bool = False
     max_leverage: float | None = Field(default=None, ge=1)
+    # EFFECTIVE liquidation threshold for the pair, when upstream published
+    # one. Optional because discovery does not always carry it; absent, the
+    # health factor is bounded from below by the
+    # LTV that ``max_leverage`` implies, since a threshold is never below the
+    # borrow ceiling. See :func:`levered_ltv_floor`.
+    liquidation_threshold: float | None = Field(default=None, gt=0, le=1)
+    # The borrowed asset. A loop whose debt is a different asset from its
+    # collateral carries a price-ratio axis, and its health factor is then the
+    # depeg budget. ``None`` = not reported, which is read as cross-asset.
+    debt_asset: str | None = None
+    # 24h traded volume of the thinnest reward stream the row pays. Capacity
+    # on a reward-driven position binds on the reward token's exit liquidity.
+    # ``None`` = unmeasured, which is never zero and never a pass.
+    reward_liquidity_usd: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _levered_rows_declare_their_ceiling(self) -> "Vault":
@@ -137,16 +151,56 @@ class Vault(FrozenModel):
             raise ValueError(
                 f"{self.instrument_id}: a levered row must declare max_leverage"
             )
-        if not self.is_levered and self.max_leverage is not None:
+        for name in ("max_leverage", "liquidation_threshold", "debt_asset"):
+            if not self.is_levered and getattr(self, name) is not None:
+                raise ValueError(
+                    f"{self.instrument_id}: {name} belongs to levered rows only"
+                )
+        floor = levered_ltv_floor(self)
+        if (
+            self.liquidation_threshold is not None
+            and floor is not None
+            and self.liquidation_threshold < floor - 1e-9
+        ):
             raise ValueError(
-                f"{self.instrument_id}: max_leverage belongs to levered rows only"
+                f"{self.instrument_id}: liquidation threshold "
+                f"{self.liquidation_threshold} is below the ltv {floor:.6f} its "
+                "max_leverage implies, which would liquidate at open"
             )
         return self
+
+    @property
+    def cross_asset(self) -> bool:
+        """Whether a levered row borrows a different asset than it supplies.
+
+        An unreported debt asset reads as cross-asset: the depeg budget is the
+        axis that fails expensively, so it is assumed present until shown
+        absent.
+        """
+        if not self.is_levered:
+            return False
+        if self.debt_asset is None:
+            return True
+        return self.debt_asset.casefold() != self.asset.casefold()
 
     @property
     def accruing_apy(self) -> float | None:
         """Yield known to accrue into the yield-token share price."""
         return self.apy_base
+
+
+def levered_ltv_floor(vault: Vault) -> float | None:
+    """The LTV a levered row's declared ``max_leverage`` implies.
+
+    ``max_leverage = 1 / (1 - ltv)``, so ``ltv = 1 - 1 / max_leverage``. A
+    liquidation threshold is never below the LTV, so this is a lower bound on
+    the threshold and a health factor computed from it is a lower bound on
+    the real one — the conservative stand-in when no threshold was published.
+    ``None`` for an unlevered row, or one whose ceiling is 1 (it cannot borrow).
+    """
+    if not vault.is_levered or vault.max_leverage is None or vault.max_leverage <= 1:
+        return None
+    return 1.0 - 1.0 / vault.max_leverage
 
 
 class FactorScore(FrozenModel):
@@ -195,6 +249,12 @@ class AllocationLeg(FrozenModel):
     instrument_id: str
     weight: float = Field(ge=0, le=1)
     usd: float = Field(ge=0)
+    # The leverage a levered leg is held at. ``weight`` and ``usd`` stay the
+    # equity, so every existing sum still reads net value; this is what the
+    # gross-exposure caps multiply it by. ``None`` on a levered leg is charged
+    # at the row's declared ``max_leverage`` — an unchosen L is whatever the
+    # venue allows, not 1.
+    leverage: float | None = Field(default=None, ge=1)
 
 
 class Allocation(FrozenModel):
@@ -484,6 +544,31 @@ class PolicyCaps(FrozenModel):
     min_effective_positions: float | None = Field(default=None, ge=0)
     min_instrument_tvl_usd: float = Field(ge=0)
     max_reward_dependence: float = Field(ge=0, le=1)
+    # --- levered rows -------------------------------------------------------
+    # A levered row is ONE synthetic instrument whose weight is its equity, so
+    # every cap above sees its net value and none sees its gross exposure.
+    # These are the caps that do. All optional, and absent = not enforced,
+    # like the sector cap: `validate-mandate` compares an absent one as its
+    # permissive extreme, so dropping one still reads as a loosening.
+    #
+    # Largest leverage any one levered leg may be held at.
+    max_gross_leverage: float | None = Field(default=None, ge=1)
+    # Ceiling on sum(weight x leverage) over the whole book; an unlevered leg
+    # counts at 1, so 1.0 admits no leverage at all.
+    max_book_gross_exposure: float | None = Field(default=None, ge=1)
+    # Ceiling on the summed equity weight of levered legs. 0 admits none.
+    max_weight_levered: float | None = Field(default=None, ge=0, le=1)
+    # Floor on each levered leg's health factor at its leverage. Strictly
+    # above 1: a freshly opened position's HF is never below 1, so a floor at
+    # or under it binds nothing and is a floor set wrong.
+    min_health_factor: float | None = Field(default=None, gt=1)
+    # Floor on the adverse debt/collateral move a CROSS-ASSET levered leg
+    # survives, ``(HF - 1) x 10_000``. Same-asset legs have no price ratio.
+    min_depeg_buffer_bps: float | None = Field(default=None, ge=0)
+    # Floor on a levered row's reward-token 24h volume. Replaces
+    # max_reward_dependence for levered rows, which are reward-driven by
+    # construction; unmeasured volume fails it.
+    min_reward_liquidity_usd: float | None = Field(default=None, ge=0)
 
 
 class PolicyGates(FrozenModel):

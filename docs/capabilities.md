@@ -116,6 +116,27 @@ to score are charged as fully correlated.
 Why both: labels answer "am I over-exposed to a name I can point at", the floor
 answers "am I actually holding more than one bet". Neither subsumes the other.
 
+**Levered caps** — six knobs that read the leverage a synthetic levered row
+hides from every weight cap above. All optional; absent = not enforced, and
+`validate-mandate` compares an absent one as its permissive extreme.
+
+| Knob | Kind | Reads |
+| --- | --- | --- |
+| `max_weight_levered` | ceiling | summed equity weight of levered legs; `0` admits none and narrows levered rows out before construction |
+| `max_gross_leverage` | ceiling | each levered leg's leverage |
+| `max_book_gross_exposure` | ceiling | `sum(weight × L)`, unlevered legs at 1 |
+| `min_health_factor` | floor, must exceed 1 | each levered leg's HF at its L |
+| `min_depeg_buffer_bps` | floor | `(HF − 1) × 10_000`, **cross-asset legs only** |
+| `min_reward_liquidity_usd` | floor | the reward token's 24h volume |
+
+A levered row is routed to these **instead of** `max_reward_dependence`, which
+every loop fails by construction. An `AllocationLeg` carries the `leverage` it
+is held at; a levered leg that names none is charged at its row's declared
+`max_leverage`, never at 1. Without a published `liquidation_threshold` the HF is
+computed from the LTV the ceiling implies — a lower bound, so the check errs
+toward rejecting. An unreported `debt_asset` is budgeted as cross-asset, and
+unmeasured reward liquidity **fails** the liquidity floor.
+
 ## What gets reported
 
 `simulate --allocation <file>` returns, alongside the yield-path simulation:
@@ -173,7 +194,7 @@ to misprice. An absent basis is *not* a fourth basis: it reads as not-traded.
 the second reads `Unknown` for every row on an emission basis or with no basis
 reported.
 
-### Leverage is modelled, not yet capped
+### Leverage is modelled and capped, not yet executable
 
 `core.levered` turns a snapshotted loopable pair into `f(L) = L·rs − (L−1)·rb`
 plus a health factor and a depeg budget. **`f(L)` is linear in L**, so the only
@@ -191,10 +212,13 @@ volume, because capacity on a reward-driven loop binds there and not on the
 lending pool's cash.
 
 `Vault` carries `is_levered` and `max_leverage`, and a levered row is *required*
-to declare its ceiling. A synthetic instrument hides leverage from
+to declare its ceiling; it may also carry `liquidation_threshold`, `debt_asset`
+and `reward_liquidity_usd`. A synthetic instrument hides leverage from
 `max_weight_per_instrument` — 30% of a book at L=8 is 240% of it in gross
-exposure — so the declaration is what anything measuring gross exposure has to
-read. See the limits below.
+exposure — so the declaration is what the levered caps above read. A levered
+sleeve is a **mandate-level decision**: `validate-mandate` requires a rationale
+entry for `caps.max_weight_levered`, at the value the derived policy ships,
+whenever that policy admits any levered weight. See the limits below.
 
 Gas in that block is priced from **live** chain state — the source chain's gas
 price and an on-chain Chainlink ETH/USD feed — and `cost_estimate.gas_priced_live`
@@ -257,12 +281,15 @@ blocks.
   thinning each tier against its budget. The `min_effective_positions` floor
   catches the result, so it fails closed rather than shipping quietly — but the
   interaction is a defect, not a design.
-- **Nothing enforces a leverage cap yet.** `core.levered` models `f(L)`, the
-  health factor and the depeg budget, and `Vault` declares `max_leverage` — but
-  no policy cap reads either. A levered row is admitted, weighted and reported
-  as one instrument holding its equity, and its gross exposure is visible only
-  because the row says so. Do not put a levered candidate in front of the
-  allocator and read a clean `check-policy` as permission.
+- **The allocator does not construct against the levered caps.** Construction
+  never picks L and its caps waterfall has no levered bucket, so
+  `build-allocation` can place a levered row above `max_weight_levered` or at an
+  unchosen L; `check-policy` then rejects it. Only a zero ceiling and the
+  liquidity floor narrow levered rows out *before* construction.
+- **The health factor is modelled, not measured.** Every HF and depeg figure the
+  policy reads comes from the row's declared parameters — and, with no published
+  liquidation threshold, from a lower bound. The venue's simulated HF is what
+  counts, and nothing compares the two yet.
 - **A levered quote is rate arithmetic on a snapshot.** It does not model our
   own market impact — borrowing at size moves the rate that was just quoted —
   it has no liquidation mechanics beyond the health factor, and it has no view

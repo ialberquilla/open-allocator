@@ -2101,6 +2101,8 @@ def test_a_levered_row_round_trips_through_the_allocation_artifacts(
                 tvl=1_000_000,
                 levered=True,
                 maxLeverage=14.285714,
+                # Deep enough for min_reward_liquidity_usd to admit it.
+                rewardLiquidityUsd=5_000_000,
                 curator="curator-a",
             ),
         ],
@@ -2114,6 +2116,7 @@ def test_a_levered_row_round_trips_through_the_allocation_artifacts(
     assert result.exit_code == 0
     allocation = parse_single_stdout_object(result.stdout)
     assert validate(allocation, "allocation") == allocation
+    assert "loop-usdc-ausd" in allocation["metadata"]["candidate_instruments"]
 
     accounting = allocation["metadata"]["apy_accounting"]
     assert isinstance(accounting, dict)
@@ -2123,3 +2126,48 @@ def test_a_levered_row_round_trips_through_the_allocation_artifacts(
         str(warning).startswith("apy_reward_unpriced")
         for warning in allocation["metadata"]["warnings"]
     )
+
+
+def test_an_emission_priced_loop_on_a_thin_reward_token_is_narrowed_out(
+    monkeypatch: pytest.MonkeyPatch,
+    compliant_instruments: list[dict[str, Any]],
+) -> None:
+    """The shipped policy routes a loop past max_reward_dependence and stops it
+    on its reward token's exit liquidity."""
+    set_read_only_env(monkeypatch)
+    install_mock_onetx_client(
+        monkeypatch,
+        [
+            *compliant_instruments,
+            instrument(
+                instrumentId="loop-usdc-ausd",
+                protocol="lender",
+                chainId=8453,
+                tokenSymbol="USDC",
+                currentApy=0.267,
+                apyBase=0.02055,
+                apyReward=0.24645,
+                rewardBasis="emission",
+                rewardDependence=0.92,
+                tvl=2_796_631,
+                levered=True,
+                maxLeverage=14.285714,
+                liquidationThreshold=0.94,
+                debtAsset="AUSD",
+                rewardLiquidityUsd=635,
+                curator="curator-a",
+            ),
+        ],
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["build-allocation", "--risk", "balanced", "--amount", "10000"],
+    )
+
+    assert result.exit_code == 0
+    allocation = parse_single_stdout_object(result.stdout)
+    warnings = allocation["metadata"]["warnings"]
+    assert "policy_excluded:loop-usdc-ausd:min_reward_liquidity_usd" in warnings
+    assert "loop-usdc-ausd" not in allocation["metadata"]["candidate_instruments"]
+    assert all(leg["instrument_id"] != "loop-usdc-ausd" for leg in allocation["legs"])

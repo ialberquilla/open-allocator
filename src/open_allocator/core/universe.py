@@ -122,6 +122,7 @@ def _sequence(value: object) -> Sequence[object]:
 
 
 def _to_vault(instrument: object) -> Vault:
+    is_levered = bool(_optional_bool(instrument, "is_levered", "levered", "isLevered"))
     return Vault(
         instrument_id=str(_required(instrument, "instrument_id", "instrumentId")),
         protocol=str(_required(instrument, "protocol")),
@@ -152,10 +153,24 @@ def _to_vault(instrument: object) -> Vault:
             "rewardTokens",
         ),
         reward_price_basis=_optional_reward_basis(instrument),
-        is_levered=bool(
-            _optional_bool(instrument, "is_levered", "levered", "isLevered")
-        ),
+        is_levered=is_levered,
         max_leverage=_optional_float(instrument, "max_leverage", "maxLeverage"),
+        # Pair parameters are read only for a levered row: on an ordinary
+        # instrument they describe nothing, and a stray upstream column must
+        # not fail a row that is otherwise fine.
+        liquidation_threshold=(
+            _optional_float(instrument, "liquidation_threshold", "liquidationThreshold")
+            if is_levered
+            else None
+        ),
+        debt_asset=(
+            _optional_text(instrument, "debt_asset", "debtAsset")
+            if is_levered
+            else None
+        ),
+        reward_liquidity_usd=_optional_float(
+            instrument, "reward_liquidity_usd", "rewardLiquidityUsd"
+        ),
         curator=_optional_risk(instrument, "curator"),
         reward_dependence=_optional_risk(
             instrument,
