@@ -736,9 +736,13 @@ def test_list_vaults_returns_json_array_with_summaries(
         "advertised_apy": 0.04,
         "base_apy": None,
         "reward_apy": None,
+        "priced_reward_apy": "Unknown",
+        "reward_apy_basis": "unknown",
         "reward_tokens": [],
         "reward_dependence": 0.1,
         "tvl_usd": 10_000_000.0,
+        "levered": False,
+        "max_leverage": None,
         "score": pytest.approx(payload[0]["score"]),
         "risk_metrics": payload[0]["risk_metrics"],
     }
@@ -751,9 +755,13 @@ def test_list_vaults_returns_json_array_with_summaries(
         "advertised_apy",
         "base_apy",
         "reward_apy",
+        "priced_reward_apy",
+        "reward_apy_basis",
         "reward_tokens",
         "reward_dependence",
         "tvl_usd",
+        "levered",
+        "max_leverage",
         "score",
         "risk_metrics",
     }
@@ -2005,3 +2013,113 @@ def test_wallet_status_flags_a_chain_the_paymaster_cannot_price(
     assert unsupported["chain_id"] == 999999
     assert unsupported["executable"] is False
     assert unsupported["not_executable_reasons"] == ["chain_not_gas_payable"]
+
+
+def test_list_vaults_reports_an_emission_priced_reward_as_unpriced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_read_only_env(monkeypatch)
+    install_mock_onetx_client(
+        monkeypatch,
+        [
+            instrument(
+                instrumentId="emission-priced-usdc",
+                protocol="lender",
+                currentApy=9.60,
+                apyBase=2.055,
+                apyReward=7.545,
+                rewardBasis="emission",
+                rewardTokens=("REWARD",),
+            )
+        ],
+    )
+
+    result = runner.invoke(cli.app, ["list-vaults"])
+
+    assert result.exit_code == 0
+    payload = parse_single_stdout_value(result.stdout)
+    assert isinstance(payload, list)
+    row = payload[0]
+    # Still reported — APY is descriptive and hiding it would make the row
+    # harder to check, not safer.
+    assert row["advertised_apy"] == 9.60
+    assert row["reward_apy"] == 7.545
+    # But not counted.
+    assert row["priced_reward_apy"] == "Unknown"
+    assert row["reward_apy_basis"] == "emission"
+
+
+def test_list_vaults_declares_a_levered_row_s_leverage_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_read_only_env(monkeypatch)
+    install_mock_onetx_client(
+        monkeypatch,
+        [
+            instrument(
+                instrumentId="loop-usdc-ausd",
+                protocol="lender",
+                levered=True,
+                maxLeverage=14.285714,
+            )
+        ],
+    )
+
+    result = runner.invoke(cli.app, ["list-vaults"])
+
+    assert result.exit_code == 0
+    payload = parse_single_stdout_value(result.stdout)
+    assert isinstance(payload, list)
+    assert payload[0]["levered"] is True
+    assert payload[0]["max_leverage"] == 14.285714
+
+
+def test_a_levered_row_round_trips_through_the_allocation_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    compliant_instruments: list[dict[str, Any]],
+) -> None:
+    """A levered candidate changes nothing about the artifact's shape.
+
+    It flows through discovery, scoring, construction and the allocation schema
+    as one instrument holding its equity, and its emission-priced reward is
+    reported unpriced on the way through rather than blended into a headline.
+    """
+    set_read_only_env(monkeypatch)
+    install_mock_onetx_client(
+        monkeypatch,
+        [
+            *compliant_instruments,
+            instrument(
+                instrumentId="loop-usdc-ausd",
+                protocol="lender",
+                chainId=8453,
+                tokenSymbol="USDC",
+                currentApy=0.12,
+                apyBase=0.02,
+                apyReward=0.10,
+                rewardBasis="emission",
+                tvl=1_000_000,
+                levered=True,
+                maxLeverage=14.285714,
+                curator="curator-a",
+            ),
+        ],
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["build-allocation", "--risk", "balanced", "--amount", "10000"],
+    )
+
+    assert result.exit_code == 0
+    allocation = parse_single_stdout_object(result.stdout)
+    assert validate(allocation, "allocation") == allocation
+
+    accounting = allocation["metadata"]["apy_accounting"]
+    assert isinstance(accounting, dict)
+    assert accounting["unpriced_reward_weight_bps"] > 0
+    assert accounting["priced_blended_apy_pct"] is None
+    assert any(
+        str(warning).startswith("apy_reward_unpriced")
+        for warning in allocation["metadata"]["warnings"]
+    )

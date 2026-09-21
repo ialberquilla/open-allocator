@@ -221,3 +221,43 @@ def test_known_factor_requires_normalized_value() -> None:
         FactorScore(raw_input=7_500_000, normalized_value=None, weight=1, unknown=False)
 
     assert "known factors require normalized_value" in str(error.value)
+
+
+def test_a_reward_price_basis_is_never_defaulted_to_traded() -> None:
+    """Absent and "we priced this at a quote" are different claims."""
+    assert sample_vault().reward_price_basis is None
+
+
+def test_an_unrecognised_reward_price_basis_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Vault.model_validate(
+            sample_vault().model_dump() | {"reward_price_basis": "spot"}
+        )
+
+
+def test_a_levered_row_must_declare_its_leverage_ceiling() -> None:
+    with pytest.raises(ValidationError) as error:
+        Vault.model_validate(sample_vault().model_dump() | {"is_levered": True})
+
+    assert "must declare max_leverage" in str(error.value)
+
+
+def test_an_unlevered_row_may_not_carry_a_leverage_ceiling() -> None:
+    with pytest.raises(ValidationError) as error:
+        Vault.model_validate(sample_vault().model_dump() | {"max_leverage": 8.0})
+
+    assert "belongs to levered rows only" in str(error.value)
+
+
+def test_a_levered_row_round_trips_unchanged() -> None:
+    levered_vault = Vault.model_validate(
+        sample_vault().model_dump()
+        | {
+            "instrument_id": "loop:usdc/ausd",
+            "is_levered": True,
+            "max_leverage": 14.285714,
+            "reward_price_basis": "emission",
+        }
+    )
+
+    assert Vault.model_validate(levered_vault.model_dump(mode="json")) == levered_vault

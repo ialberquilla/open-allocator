@@ -36,6 +36,7 @@ from open_allocator.core.types import (
     Allocation,
     Policy,
     TxPlan,
+    Unknown,
     Vault,
     VaultScore,
 )
@@ -951,6 +952,12 @@ def _allocation_payload_with_policy_result(
 
 
 def _vault_summary(vault: Vault, score: VaultScore) -> JsonObject:
+    # `reward_apy` stays the advertised number — APY is descriptive here, and
+    # hiding what upstream said would make the row harder to check, not safer.
+    # `priced_reward_apy` is the one this allocator is willing to count, and it
+    # reads Unknown for a reward APY priced at the emission schedule rather
+    # than at a quote something would fill.
+    priced_reward = apy_accounting.priced_reward_apy(vault)
     return {
         "instrument_id": vault.instrument_id,
         "protocol": vault.protocol,
@@ -960,9 +967,17 @@ def _vault_summary(vault: Vault, score: VaultScore) -> JsonObject:
         "advertised_apy": vault.apy,
         "base_apy": vault.apy_base,
         "reward_apy": vault.apy_reward,
+        "priced_reward_apy": (
+            priced_reward if priced_reward is not None else json_safe(Unknown)
+        ),
+        "reward_apy_basis": vault.reward_price_basis or "unknown",
         "reward_tokens": list(vault.reward_tokens),
         "reward_dependence": json_safe(vault.reward_dependence),
         "tvl_usd": vault.tvl_usd,
+        # A levered row's usd value is its equity; its gross exposure is up to
+        # max_leverage times that, which no weight cap can see.
+        "levered": vault.is_levered,
+        "max_leverage": vault.max_leverage,
         "score": score.score,
         "risk_metrics": _risk_metrics(vault),
     }

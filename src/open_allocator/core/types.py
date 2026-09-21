@@ -37,6 +37,21 @@ def curator_bucket(instrument_id: str, curator: TextRiskValue) -> str:
     return str(curator)
 
 
+# How a reward APY was priced by whoever reported it.
+#
+# ``traded`` means the reward token was valued at a quote something would
+# actually fill. ``emission`` means it was valued at the emission schedule,
+# which is what yield aggregators publish and which overstates a thin reward
+# token by whatever the market discounts it. ``none`` means the row pays no
+# reward at all, so there is nothing to price.
+#
+# ``None`` (the field absent) is *not* a fourth basis: it means upstream did not
+# say, and it is treated exactly like ``emission`` — not traded. Reward pricing
+# fails closed, because the optimistic direction is the one that floats
+# reward-heavy rows to the top of a ranking.
+RewardPriceBasis: TypeAlias = Literal["traded", "emission", "none", "unknown"]
+
+
 UNKNOWN_SECTOR = "__unknown_sector__"
 
 
@@ -84,6 +99,10 @@ class Vault(FrozenModel):
     apy_base: float | None = None
     apy_reward: float | None = None
     reward_tokens: tuple[str, ...] = ()
+    # How ``apy_reward`` was priced upstream; see RewardPriceBasis. Never
+    # defaulted to a basis, because absent and "we priced this at a traded
+    # quote" are different claims.
+    reward_price_basis: RewardPriceBasis | None = None
     apy_series: tuple[float, ...] = ()
     tvl_usd_series: tuple[float, ...] = ()
     # The same APY history, resampled to one observation per UTC date and
@@ -102,6 +121,27 @@ class Vault(FrozenModel):
     market_concentration: NumericRiskValue = Unknown
     liquidity: NumericRiskValue = Unknown
     collateral_mix: JsonRiskValue = Unknown
+    # A levered (looped) row: ONE synthetic instrument whose net value is the
+    # equity in it, while its gross exposure is up to ``max_leverage`` times
+    # that. Everything upstream — weights, caps, drift, delivered yield — keeps
+    # reading one instrument with one APY, which is what makes the design
+    # affordable; the cost is that leverage is invisible to
+    # ``max_weight_per_instrument``, so the row is required to *declare* its
+    # ceiling for anything measuring gross exposure to read.
+    is_levered: bool = False
+    max_leverage: float | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _levered_rows_declare_their_ceiling(self) -> "Vault":
+        if self.is_levered and self.max_leverage is None:
+            raise ValueError(
+                f"{self.instrument_id}: a levered row must declare max_leverage"
+            )
+        if not self.is_levered and self.max_leverage is not None:
+            raise ValueError(
+                f"{self.instrument_id}: max_leverage belongs to levered rows only"
+            )
+        return self
 
     @property
     def accruing_apy(self) -> float | None:

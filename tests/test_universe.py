@@ -331,3 +331,50 @@ def test_discover_still_returns_only_vaults() -> None:
     payloads = [instrument(), instrument(instrumentId="b", tvl=None)]
 
     assert len(universe.discover(StubClient(payloads))) == 1
+
+
+def test_discovery_reads_the_reward_price_basis_upstream_reported() -> None:
+    traded, emission, silent = universe.discover(
+        StubClient(
+            [
+                instrument(instrumentId="traded", rewardBasis="traded"),
+                instrument(instrumentId="emission", rewardPriceBasis="emission"),
+                instrument(instrumentId="silent"),
+            ]
+        )
+    )
+
+    assert traded.reward_price_basis == "traded"
+    assert emission.reward_price_basis == "emission"
+    # Never defaulted: absent is not a basis, and downstream reads it as
+    # not-traded rather than as verified.
+    assert silent.reward_price_basis is None
+
+
+def test_an_unrecognised_reward_basis_is_read_down_not_dropped() -> None:
+    """A new enum value upstream must not take a shelf row off the shelf."""
+    vaults, skipped = universe.discover_instruments(
+        StubClient([instrument(instrumentId="novel", rewardBasis="oracle-twap")])
+    )
+
+    assert skipped == ()
+    assert vaults[0].reward_price_basis == "unknown"
+
+
+def test_discovery_carries_the_levered_marker_and_its_ceiling() -> None:
+    vault = universe.discover(
+        StubClient([instrument(levered=True, maxLeverage=14.285714)])
+    )[0]
+
+    assert vault.is_levered is True
+    assert vault.max_leverage == 14.285714
+
+
+def test_a_levered_row_with_no_ceiling_is_skipped_not_silently_uncapped() -> None:
+    vaults, skipped = universe.discover_instruments(
+        StubClient([instrument(instrumentId="uncapped", levered=True)])
+    )
+
+    assert vaults == []
+    assert [item.instrument_id for item in skipped] == ["uncapped"]
+    assert "max_leverage" in skipped[0].reason

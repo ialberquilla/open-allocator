@@ -149,6 +149,53 @@ $0.142 of realized execution cost. The default is 8.5 bps of traded notional and
 is **one measurement, not a calibration** — pass
 `CostParams(expected_spread_bps=...)` when you have a better one.
 
+### A reward APY has to be priced before it counts
+
+`apy_accounting` covers a reward APY only when it is both **reported** and
+**priced at a traded quote**. Upstream feeds price a reward APY at the emission
+schedule — what the programme says it pays — and on a thin reward token that is
+not what the token sells for. The error is directional — it floats
+reward-heavy rows to the top of a ranking rather than scattering them — and
+leverage multiplies it.
+
+So the two ways of missing it are reported separately:
+`unknown_reward_weight_bps` is weight whose reward APY nobody reported, and
+`unpriced_reward_weight_bps` is weight whose reward APY was reported on an
+`emission` (or absent, or unrecognised) basis. `priced_blended_apy_pct` — base
+plus the reward we are willing to count — goes `null` unless **both** coverages
+are complete, exactly as `accruing_apy_pct` already does for base alone.
+`advertised_blended_apy_pct` is untouched: what upstream claims is still
+reported, because hiding it makes a row harder to check, not safer.
+
+A **zero** reward APY is covered whatever basis came with it — there is nothing
+to misprice. An absent basis is *not* a fourth basis: it reads as not-traded.
+`list-vaults` publishes `reward_apy_basis` and `priced_reward_apy` per row, and
+the second reads `Unknown` for every row on an emission basis or with no basis
+reported.
+
+### Leverage is modelled, not yet capped
+
+`core.levered` turns a snapshotted loopable pair into `f(L) = L·rs − (L−1)·rb`
+plus a health factor and a depeg budget. **`f(L)` is linear in L**, so the only
+number that decides whether a loop is worth doing is the per-turn gradient
+`rs − rb`; leverage is a risk budget, not an edge. It is pure and offline: it
+models a stored snapshot, never reads a chain and never picks L.
+
+A `LeveredQuote` counts rewards only when the snapshot priced them at a traded
+quote, by the rule above. `count_rewards=False` answers the separate and often
+much shorter question of whether the loop carries with rewards switched off.
+`kill_switch_reward_price_usd` is the reward price at which the gradient
+reaches zero — a price trigger, not a judgement — and
+`equity_cap_for_reward_liquidity` sizes equity against the reward token's exit
+volume, because capacity on a reward-driven loop binds there and not on the
+lending pool's cash.
+
+`Vault` carries `is_levered` and `max_leverage`, and a levered row is *required*
+to declare its ceiling. A synthetic instrument hides leverage from
+`max_weight_per_instrument` — 30% of a book at L=8 is 240% of it in gross
+exposure — so the declaration is what anything measuring gross exposure has to
+read. See the limits below.
+
 Gas in that block is priced from **live** chain state — the source chain's gas
 price and an on-chain Chainlink ETH/USD feed — and `cost_estimate.gas_priced_live`
 reports whether that succeeded. When it is `false` the estimate fell back to a
@@ -210,6 +257,21 @@ blocks.
   thinning each tier against its budget. The `min_effective_positions` floor
   catches the result, so it fails closed rather than shipping quietly — but the
   interaction is a defect, not a design.
+- **Nothing enforces a leverage cap yet.** `core.levered` models `f(L)`, the
+  health factor and the depeg budget, and `Vault` declares `max_leverage` — but
+  no policy cap reads either. A levered row is admitted, weighted and reported
+  as one instrument holding its equity, and its gross exposure is visible only
+  because the row says so. Do not put a levered candidate in front of the
+  allocator and read a clean `check-policy` as permission.
+- **A levered quote is rate arithmetic on a snapshot.** It does not model our
+  own market impact — borrowing at size moves the rate that was just quoted —
+  it has no liquidation mechanics beyond the health factor, and it has no view
+  on whether anything will unwind the position when a floor breaks. On a
+  cross-asset loop the health factor **is** the depeg budget, not only a
+  liquidation guard, and at high leverage that budget is a few percent.
+- **Unmeasured reward liquidity is not zero and is not a pass.**
+  `equity_cap_for_reward_liquidity` returns `None` when the reward token's
+  volume is unmeasured, and any cap reading that `None` has to fail closed.
 - **`max_weight_per_curator` does not bind.** `curator` arrives `Unknown` from
   discovery and each unknown gets its own bucket.
 - **`max_weight_per_sector` is deliberately unbinding** while the shelf holds
