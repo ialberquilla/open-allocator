@@ -53,7 +53,7 @@ shelf churns daily. Re-derive, every time.
 8. **Hash and bind.** Write the derived policy's `sha256:` into the mandate's
    `policy_hash`, with `policy_path` relative to the mandate.
 9. **Validate:** `open-allocator validate-mandate --mandate mandate.yaml
-   --baseline policy.yaml`. Fix and re-derive until all four checks pass.
+   --baseline policy.yaml`. Fix and re-derive until all five checks pass.
 
 ## Cut Bands Where the Scores Sit
 
@@ -118,8 +118,8 @@ validation time.
 
 | Kind | Tighter means | Knobs |
 | --- | --- | --- |
-| Ceilings | **lower** | every `caps.max_weight_per_*`, `caps.max_reward_dependence`, `gates.max_deploy_per_cycle_usd` |
-| Floors | **higher** | `caps.min_effective_positions`, `caps.min_instrument_tvl_usd` |
+| Ceilings | **lower** | every `caps.max_weight_per_*`, `caps.max_reward_dependence`, `caps.max_gross_leverage`, `caps.max_book_gross_exposure`, `caps.max_weight_levered`, `gates.max_deploy_per_cycle_usd` |
+| Floors | **higher** | `caps.min_effective_positions`, `caps.min_instrument_tvl_usd`, `caps.min_health_factor`, `caps.min_depeg_buffer_bps`, `caps.min_reward_liquidity_usd` |
 | Allowlists | a **subset** | every `allowed.*` list |
 | Flags | the restricting value, **named per flag** | `allowed.stablecoin_only` and `gates.new_instrument_needs_approval` tighten on `true`; `gates.autonomous_rebalance` tightens on `false` |
 | Fixed | **not an axis at all** | `version`, `wallet.mode`, `wallet.signer` — changing the signer is not a tightening, it is changing the subject |
@@ -142,6 +142,17 @@ Two floors deserve a live check rather than a confident guess:
   `max_reward_dependence` from 0.50 to 0.40 cost one instrument and no yield on
   that shelf. That is cheap insurance against a shelf that turns reward-heavy —
   say so, rather than writing it up as though it were doing work.
+
+### A levered sleeve is stated, never inherited
+
+Check 5 is about what the derived policy **admits**, not what moved. If
+`caps.max_weight_levered` is above zero — or absent, which admits everything —
+the mandate must carry a rationale entry for `caps.max_weight_levered` whose
+`value` is the number the derived policy holds. Copying the baseline's ceiling
+unchanged moves nothing and passes check 4, and it still fails here: a levered
+sleeve multiplies every exposure the book holds, so it is argued for or it is
+set to `0`. A mandate whose text does not ask for leverage sets it to `0`, with a
+rationale saying so (the worked example does).
 
 ## The Rationale Is the Product
 
@@ -168,8 +179,8 @@ not a restatement of the value.
 
 ## Quality Bar
 
-- `validate-mandate` returns `ok: true` with all four checks passing.
-- 🔴 **Read the `ok` field, not the exit code.** All four checks *report*; the CLI
+- `validate-mandate` returns `ok: true` with all five checks passing.
+- 🔴 **Read the `ok` field, not the exit code.** All five checks *report*; the CLI
   still exits 0 on a rejection, same convention as `check-policy`.
 - Every band cut, weight, floor and cap traces to a number observed on the live
   shelf during this derivation.
@@ -197,7 +208,7 @@ not a restatement of the value.
   [`mandate.schema.json`](../schemas/mandate.schema.json).
 - A derived policy file, validating against `policy.schema.json` and tightening
   the baseline only.
-- The `validate-mandate` result JSON, with all four checks visible.
+- The `validate-mandate` result JSON, with all five checks visible.
 - The score distribution the bands were cut from, with counts per band.
 
 ## Safety Gates

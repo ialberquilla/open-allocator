@@ -120,6 +120,37 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1
+        },
+        "max_gross_leverage": {
+          "description": "Largest leverage any one levered leg may be held at. A leg with no chosen leverage is charged at its row's declared max_leverage. Null or absent = not enforced.",
+          "type": ["number", "null"],
+          "minimum": 1
+        },
+        "max_book_gross_exposure": {
+          "description": "Ceiling on sum(weight x leverage) over the book; unlevered legs count at 1, so 1.0 admits no leverage. Null or absent = not enforced.",
+          "type": ["number", "null"],
+          "minimum": 1
+        },
+        "max_weight_levered": {
+          "description": "Ceiling on the summed equity weight of levered legs; 0 admits none. Null or absent = not enforced. A derived policy that admits levered weight must carry a rationale entry for it.",
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "min_health_factor": {
+          "description": "Floor on each levered leg's health factor at its leverage. Must exceed 1: an opened position's health factor is never below 1, so a floor at or under it binds nothing. Null or absent = not enforced.",
+          "type": ["number", "null"],
+          "exclusiveMinimum": 1
+        },
+        "min_depeg_buffer_bps": {
+          "description": "Floor on the adverse debt/collateral move a cross-asset levered leg survives, (HF - 1) x 10000. Same-asset legs are exempt. Null or absent = not enforced.",
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "min_reward_liquidity_usd": {
+          "description": "Floor on a levered row's reward-token 24h volume; replaces max_reward_dependence for levered rows. Unmeasured volume fails it. Null or absent = not enforced.",
+          "type": ["number", "null"],
+          "minimum": 0
         }
       },
       "required": [

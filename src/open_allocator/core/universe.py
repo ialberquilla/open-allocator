@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from typing import cast, get_args
 
 from pydantic import BaseModel
 
 from open_allocator.core import eligibility
-from open_allocator.core.types import FrozenModel, Policy, Unknown, Vault
+from open_allocator.core.types import (
+    FrozenModel,
+    Policy,
+    RewardPriceBasis,
+    Unknown,
+    Vault,
+)
 
 _MISSING = object()
+_REWARD_PRICE_BASES: frozenset[str] = frozenset(get_args(RewardPriceBasis))
 
 
 class SkippedInstrument(FrozenModel):
@@ -114,6 +122,7 @@ def _sequence(value: object) -> Sequence[object]:
 
 
 def _to_vault(instrument: object) -> Vault:
+    is_levered = bool(_optional_bool(instrument, "is_levered", "levered", "isLevered"))
     return Vault(
         instrument_id=str(_required(instrument, "instrument_id", "instrumentId")),
         protocol=str(_required(instrument, "protocol")),
@@ -142,6 +151,25 @@ def _to_vault(instrument: object) -> Vault:
             instrument,
             "reward_tokens",
             "rewardTokens",
+        ),
+        reward_price_basis=_optional_reward_basis(instrument),
+        is_levered=is_levered,
+        max_leverage=_optional_float(instrument, "max_leverage", "maxLeverage"),
+        # Pair parameters are read only for a levered row: on an ordinary
+        # instrument they describe nothing, and a stray upstream column must
+        # not fail a row that is otherwise fine.
+        liquidation_threshold=(
+            _optional_float(instrument, "liquidation_threshold", "liquidationThreshold")
+            if is_levered
+            else None
+        ),
+        debt_asset=(
+            _optional_text(instrument, "debt_asset", "debtAsset")
+            if is_levered
+            else None
+        ),
+        reward_liquidity_usd=_optional_float(
+            instrument, "reward_liquidity_usd", "rewardLiquidityUsd"
         ),
         curator=_optional_risk(instrument, "curator"),
         reward_dependence=_optional_risk(
@@ -177,6 +205,26 @@ def _optional_text(value: object, *names: str) -> str | None:
     if found is _MISSING or found is None:
         return None
     return str(found)
+
+
+def _optional_reward_basis(value: object) -> RewardPriceBasis | None:
+    """Read how upstream priced the reward APY, degrading rather than dropping.
+
+    A basis this build does not recognise reads as ``"unknown"``, not as a
+    parse failure: the row is still a perfectly good instrument, and every
+    basis but ``"traded"`` lands in the same place downstream anyway — not
+    counted. Losing a whole shelf row to a new enum value upstream would be a
+    far worse trade than reading its reward APY conservatively.
+    """
+    found = _optional_text(
+        value, "reward_price_basis", "rewardPriceBasis", "rewardBasis"
+    )
+    if found is None:
+        return None
+    basis = found.casefold()
+    if basis in _REWARD_PRICE_BASES:
+        return cast(RewardPriceBasis, basis)
+    return "unknown"
 
 
 def _optional_bool(value: object, *names: str) -> bool | None:

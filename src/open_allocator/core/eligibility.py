@@ -109,11 +109,55 @@ def _min_tvl(vault: Vault, caps: PolicyCaps) -> Finding | None:
 
 
 def _max_reward_dependence(vault: Vault, caps: PolicyCaps) -> Finding | None:
+    # A levered row is routed to the levered caps INSTEAD. Its reward share is
+    # high by construction — leverage multiplies a thin base gradient until the
+    # reward term dominates it — so this cap would reject every loop for being
+    # a loop, and a cap that rejects a class wholesale is one someone widens
+    # book-wide to get one row through. What a levered row is actually exposed
+    # to is the reward token's exit liquidity; `_min_reward_liquidity` gates it.
+    if vault.is_levered:
+        return None
     return _numeric_max(
         "max_reward_dependence",
         caps.max_reward_dependence,
         vault.reward_dependence,
     )
+
+
+def _levered_admitted(vault: Vault, caps: PolicyCaps) -> Finding | None:
+    """A policy whose levered weight ceiling is zero admits no levered row.
+
+    Enforced here as well as in the book-level weight check so a levered row
+    is narrowed out before construction rather than allocated and then
+    refused.
+    """
+    if vault.is_levered and caps.max_weight_levered is not None:
+        if caps.max_weight_levered <= _EPSILON:
+            return Finding("max_weight_levered", caps.max_weight_levered, "levered")
+    return None
+
+
+def _min_reward_liquidity(vault: Vault, caps: PolicyCaps) -> Finding | None:
+    """A levered row's reward token must trade enough to be sold.
+
+    Fails closed: unmeasured volume is ``"Unknown"`` and fails, never passes —
+    reading a missing volume as "no limit" inverts the entire point of the
+    floor. A row that pays no reward has nothing to sell and passes.
+    """
+    floor = caps.min_reward_liquidity_usd
+    if not vault.is_levered or floor is None or _pays_no_reward(vault):
+        return None
+    if vault.reward_liquidity_usd is None:
+        return Finding("min_reward_liquidity_usd", floor, "Unknown")
+    if vault.reward_liquidity_usd < floor - _EPSILON:
+        return Finding("min_reward_liquidity_usd", floor, vault.reward_liquidity_usd)
+    return None
+
+
+def _pays_no_reward(vault: Vault) -> bool:
+    if vault.reward_price_basis == "none":
+        return True
+    return vault.apy_reward is not None and vault.apy_reward <= 0
 
 
 def _allowlist(
@@ -156,6 +200,8 @@ _ALLOWLIST_AXES: tuple[_AllowlistPredicate, ...] = (
 _QUALITY_AXES: tuple[_CapPredicate, ...] = (
     _min_tvl,
     _max_reward_dependence,
+    _levered_admitted,
+    _min_reward_liquidity,
 )
 # Discovery is coarse: allowlists minus curator (undisclosed at discovery time),
 # plus the TVL floor. No reward narrowing before scoring.

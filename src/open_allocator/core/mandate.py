@@ -21,9 +21,15 @@ kind is compared by its own rule:
 
   ceilings   tighter = LOWER    every `caps.max_weight_per_*`,
                                 `caps.max_reward_dependence`,
+                                `caps.max_gross_leverage`,
+                                `caps.max_book_gross_exposure`,
+                                `caps.max_weight_levered`,
                                 `gates.max_deploy_per_cycle_usd`
   floors     tighter = HIGHER   `caps.min_effective_positions`,
-                                `caps.min_instrument_tvl_usd`
+                                `caps.min_instrument_tvl_usd`,
+                                `caps.min_health_factor`,
+                                `caps.min_depeg_buffer_bps`,
+                                `caps.min_reward_liquidity_usd`
   allowlists tighter = SUBSET   every `allowed.*` list
   flags      tighter = the safe value, named per flag: restricting to
                                 stablecoins and requiring approval are tighter;
@@ -38,6 +44,10 @@ an unset allowlist is the whole universe -- so each is compared *as* that
 permissive extreme rather than skipped. A derivation that drops a cap the
 baseline set is therefore rejected as loosening, which is the intent: silence
 is the widest possible value, not the absence of one.
+
+Check 5 -- a levered sleeve carries its own rationale -- runs only on a policy
+that passed check 4. It is about what the policy *admits*, not what moved; see
+`_check_levered_sleeve`.
 
 Note that `docs/capabilities.md` groups `min_instrument_tvl_usd` with the
 ceilings for narrative reasons. That grouping is prose, not this table.
@@ -73,13 +83,25 @@ CEILINGS: tuple[tuple[str, float], ...] = (
     ("caps.max_weight_per_chain", 1.0),
     ("caps.max_weight_per_sector", 1.0),
     ("caps.max_reward_dependence", 1.0),
+    ("caps.max_gross_leverage", math.inf),
+    ("caps.max_book_gross_exposure", math.inf),
+    ("caps.max_weight_levered", 1.0),
     ("gates.max_deploy_per_cycle_usd", math.inf),
 )
 
 FLOORS: tuple[tuple[str, float], ...] = (
     ("caps.min_effective_positions", 0.0),
     ("caps.min_instrument_tvl_usd", 0.0),
+    # Absent reads as 1.0, not 0: every opened position's health factor is at
+    # least 1, so "no floor" and "a floor of 1" admit exactly the same books.
+    ("caps.min_health_factor", 1.0),
+    ("caps.min_depeg_buffer_bps", 0.0),
+    ("caps.min_reward_liquidity_usd", 0.0),
 )
+
+# The knob whose rationale a levered sleeve must carry. See
+# `_check_levered_sleeve`.
+LEVERED_SLEEVE_KNOB = "caps.max_weight_levered"
 
 ALLOWLISTS: tuple[str, ...] = (
     "allowed.protocols",
@@ -215,6 +237,10 @@ def validate_mandate(
 
     baseline = _loaded_baseline(baseline_file)
     _check_can_only_tighten(derived, baseline, derived_file, baseline_file, checks)
+    if not checks[-1].ok:
+        return _result(mandate_file, derived_file, baseline_file, checks)
+
+    _check_levered_sleeve(mandate, derived, derived_file, checks)
 
     return _result(mandate_file, derived_file, baseline_file, checks)
 
@@ -369,6 +395,93 @@ def _check_can_only_tighten(
             ),
         )
     )
+
+
+def _check_levered_sleeve(
+    mandate: Mandate,
+    derived: Policy,
+    derived_file: Path,
+    checks: list[MandateCheck],
+) -> None:
+    """A derived policy that admits levered weight must say why, at that value.
+
+    Check 4 cannot catch this, because admitting leverage is not a loosening:
+    a derivation that copies the baseline's levered ceiling unchanged moved
+    nothing, and a mandate is only asked to justify what moved. But a levered
+    sleeve multiplies every exposure the book holds, and inheriting one by
+    copying a file is exactly the quiet setting this check exists to refuse.
+    So the rule is on the *result*, not the movement: any derived policy whose
+    `caps.max_weight_levered` is above zero -- or absent, which admits
+    everything -- needs a rationale entry for that knob whose `value` is the
+    one the derived policy holds. The policy hash already binds the file; this
+    binds the reason to the number in it.
+
+    A mandate that does not want leverage sets the ceiling to 0, which is a
+    tightening check 4 will then demand a reason for like any other.
+    """
+    ceiling = derived.caps.max_weight_levered
+    if ceiling is not None and ceiling <= 0:
+        checks.append(
+            MandateCheck(
+                name="levered_sleeve_rationale",
+                ok=True,
+                detail=f"{derived_file.name} admits no levered weight",
+            )
+        )
+        return
+
+    shown = "null (unbounded)" if ceiling is None else str(ceiling)
+    entries = [
+        entry for entry in mandate.rationale if entry.knob == LEVERED_SLEEVE_KNOB
+    ]
+    if not entries:
+        checks.append(
+            MandateCheck(
+                name="levered_sleeve_rationale",
+                ok=False,
+                detail=(
+                    f"{derived_file.name} admits levered weight "
+                    f"({LEVERED_SLEEVE_KNOB} = {shown}) and the mandate carries no "
+                    f"rationale for it. A levered sleeve is a mandate-level "
+                    f"decision: state it with a `because`, or set the ceiling to 0."
+                ),
+            )
+        )
+        return
+
+    if not any(_same_value(entry.value, ceiling) for entry in entries):
+        checks.append(
+            MandateCheck(
+                name="levered_sleeve_rationale",
+                ok=False,
+                detail=(
+                    f"the mandate's rationale for {LEVERED_SLEEVE_KNOB} argues for "
+                    f"{[entry.value for entry in entries]}, but {derived_file.name} "
+                    f"holds {shown}. The reason must describe the number it ships "
+                    f"with -- re-derive rather than edit either side."
+                ),
+            )
+        )
+        return
+
+    checks.append(
+        MandateCheck(
+            name="levered_sleeve_rationale",
+            ok=True,
+            detail=(
+                f"{derived_file.name} admits levered weight up to {shown}, and the "
+                f"mandate states why"
+            ),
+        )
+    )
+
+
+def _same_value(claimed: Any, actual: float | None) -> bool:
+    if actual is None or claimed is None:
+        return claimed is None and actual is None
+    if isinstance(claimed, bool) or not isinstance(claimed, int | float):
+        return False
+    return math.isclose(float(claimed), actual, rel_tol=1e-9, abs_tol=1e-12)
 
 
 def _compare_bound(

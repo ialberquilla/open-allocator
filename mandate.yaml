@@ -21,7 +21,7 @@ derived_at: "2026-08-11T11:40:00Z"
 derived_by: "hand-derived (ialberquilla)"
 
 policy_path: policy-derived.yaml
-policy_hash: "sha256:7205b9777512dfe7d6735f4a9c586a3d32037f6405b6437312886bff05f867be"
+policy_hash: "sha256:16cfe52e2895f8ba87b1c7cf36cabc0f46924c8caee72e5cc0b2f9a43a729b87"
 
 strategy: sleeves
 strategy_params:
@@ -111,6 +111,19 @@ rationale:
       weight). Worth stating plainly: this knob barely binds today. It is cheap
       insurance against a shelf that turns reward-heavy, not a live constraint,
       and it should not be described as though it were doing work.
+
+  - knob: caps.max_weight_levered
+    value: 0.0
+    because: >
+      The text asks for buckets, good yield and enough diversification. It
+      does not ask for leverage, and a levered sleeve multiplies every
+      exposure the book holds, so it is a decision the mandate has to state
+      rather than one it inherits by copying the baseline's 0.10 ceiling.
+      Loops on the current shelf lose money on base rates and are carried by
+      thin reward tokens, which "good yield" -- read above as yield that is
+      not an emissions schedule -- excludes. Set to
+      0.0, which also narrows levered rows out before construction. Re-derive
+      with a stated reason to open a sleeve; do not edit this number.
 
   - knob: bands.weight_drift_bps
     value: 100

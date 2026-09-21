@@ -62,6 +62,11 @@
         "usd": {
           "type": "number",
           "minimum": 0
+        },
+        "leverage": {
+          "description": "Leverage a levered leg is held at; weight and usd stay equity. Null or absent on a levered leg is charged at the row's declared max_leverage.",
+          "type": ["number", "null"],
+          "minimum": 1
         }
       },
       "required": ["instrument_id", "weight", "usd"]

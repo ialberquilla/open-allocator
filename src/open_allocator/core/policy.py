@@ -7,7 +7,7 @@ from typing import TypeAlias
 
 from pydantic import Field, model_validator
 
-from open_allocator.core import diversify, eligibility
+from open_allocator.core import diversify, eligibility, levered
 from open_allocator.core.types import (
     Allocation,
     AllocationLeg,
@@ -15,6 +15,7 @@ from open_allocator.core.types import (
     Policy,
     Vault,
     curator_bucket,
+    levered_ltv_floor,
     sector_bucket,
 )
 
@@ -85,6 +86,7 @@ def check(
     }
     _check_allowlists(allocation_model, policy_model, allocated_vaults, violations)
     _check_caps(allocation_model, policy_model, allocated_vaults, violations)
+    _check_leverage(allocation_model, policy_model, allocated_vaults, violations)
     _check_diversification(allocation_model, policy_model, allocated_vaults, violations)
     _check_quality_caps(allocated_vaults, policy_model, violations)
     _check_gates(allocation_model, policy_model, violations)
@@ -195,6 +197,152 @@ def _check_caps(
             sector_weights,
             violations,
         )
+
+
+def _check_leverage(
+    allocation: Allocation,
+    policy: Policy,
+    vault_by_id: Mapping[str, Vault],
+    violations: list[PolicyViolation],
+) -> None:
+    """Gross exposure and health-factor checks on levered legs.
+
+    The enforcement half of the synthetic-instrument design: a levered row's
+    weight is its equity, so every weight cap above reads its net value and
+    none reads its gross exposure. 30% of the book at L=8 passes
+    ``max_weight_per_instrument = 0.30`` and is 240% of the book in gross
+    exposure. These checks are what read the leverage back out.
+
+    A levered leg that names no leverage is charged at its row's declared
+    ``max_leverage``: an L nobody chose is whatever the venue allows, and
+    charging it at 1 is exactly the lie by omission the design admits to.
+
+    Without a published liquidation threshold the health factor is computed
+    from the LTV the row's ceiling implies — a lower bound, so the check can
+    reject a position the venue would accept but never the other way round.
+    """
+    caps = policy.caps
+    levered_weight = 0.0
+    gross_exposure = 0.0
+
+    for leg in allocation.legs:
+        vault = vault_by_id.get(leg.instrument_id)
+        leverage = _leg_leverage(leg, vault)
+        gross_exposure += leg.weight * leverage
+        if vault is None or leg.weight <= 0:
+            continue
+        if not vault.is_levered:
+            if leg.leverage is not None and leg.leverage > 1.0 + _EPSILON:
+                violations.append(
+                    _violation(
+                        "leverage_on_unlevered_instrument",
+                        leg.instrument_id,
+                        1.0,
+                        leg.leverage,
+                    )
+                )
+            continue
+
+        levered_weight += leg.weight
+        ceiling = vault.max_leverage or 1.0
+        if leverage > ceiling + _EPSILON:
+            violations.append(
+                _violation(
+                    "max_leverage_declared", leg.instrument_id, ceiling, leverage
+                )
+            )
+            continue
+        if (
+            caps.max_gross_leverage is not None
+            and leverage > caps.max_gross_leverage + _EPSILON
+        ):
+            violations.append(
+                _violation(
+                    "max_gross_leverage",
+                    leg.instrument_id,
+                    caps.max_gross_leverage,
+                    leverage,
+                )
+            )
+
+        health_factor = leg_health_factor(vault, leverage)
+        if health_factor is None:
+            continue
+        if (
+            caps.min_health_factor is not None
+            and health_factor < caps.min_health_factor - _EPSILON
+        ):
+            violations.append(
+                _violation(
+                    "min_health_factor",
+                    leg.instrument_id,
+                    caps.min_health_factor,
+                    round(health_factor, 6),
+                )
+            )
+        buffer_bps = levered.depeg_buffer_bps(health_factor)
+        if (
+            caps.min_depeg_buffer_bps is not None
+            and vault.cross_asset
+            and buffer_bps is not None
+            and buffer_bps < caps.min_depeg_buffer_bps - _EPSILON
+        ):
+            violations.append(
+                _violation(
+                    "min_depeg_buffer_bps",
+                    leg.instrument_id,
+                    caps.min_depeg_buffer_bps,
+                    buffer_bps,
+                )
+            )
+
+    if (
+        caps.max_weight_levered is not None
+        and levered_weight > caps.max_weight_levered + _EPSILON
+    ):
+        violations.append(
+            _violation(
+                "max_weight_levered",
+                "allocation",
+                caps.max_weight_levered,
+                levered_weight,
+            )
+        )
+    if (
+        caps.max_book_gross_exposure is not None
+        and gross_exposure > caps.max_book_gross_exposure + _EPSILON
+    ):
+        violations.append(
+            _violation(
+                "max_book_gross_exposure",
+                "allocation",
+                caps.max_book_gross_exposure,
+                round(gross_exposure, 9),
+            )
+        )
+
+
+def _leg_leverage(leg: AllocationLeg, vault: Vault | None) -> float:
+    if vault is None or not vault.is_levered:
+        return 1.0
+    if leg.leverage is not None:
+        return leg.leverage
+    return vault.max_leverage or 1.0
+
+
+def leg_health_factor(vault: Vault, leverage: float) -> float | None:
+    """A levered row's health factor at ``leverage``, or ``None`` with no debt.
+
+    Uses the published liquidation threshold when there is one, else the LTV
+    the declared ceiling implies (see :func:`levered_ltv_floor`), which bounds
+    the real health factor from below.
+    """
+    if leverage <= 1.0 + _EPSILON:
+        return None
+    threshold = vault.liquidation_threshold or levered_ltv_floor(vault)
+    if threshold is None:
+        return None
+    return levered.health_factor(leverage=leverage, liquidation_threshold=threshold)
 
 
 def _check_diversification(
@@ -321,12 +469,23 @@ def resulting_book(
     for leg in allocation_model.legs:
         usd[leg.instrument_id] += Decimal(str(leg.usd))
 
+    # A bought leg keeps the leverage it was built at. A top-up of a held
+    # levered position does not: the held leverage is not recorded here, and
+    # a blend of two unknown Ls is unknown, so it falls back to the row's
+    # declared ceiling like any levered leg that names none.
+    leverage = {
+        leg.instrument_id: leg.leverage
+        for leg in allocation_model.legs
+        if not held_usd.get(leg.instrument_id)
+    }
+
     total = sum(usd.values(), Decimal("0"))
     legs = tuple(
         AllocationLeg(
             instrument_id=instrument_id,
             weight=float(amount / total) if total > 0 else 0.0,
             usd=float(amount),
+            leverage=leverage.get(instrument_id),
         )
         for instrument_id, amount in sorted(usd.items())
     )
@@ -397,5 +556,6 @@ __all__ = [
     "PolicyViolation",
     "check",
     "check_incremental",
+    "leg_health_factor",
     "resulting_book",
 ]
