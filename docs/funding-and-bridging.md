@@ -133,6 +133,30 @@ Circle is `CIRCLE_IRIS_API_URL` (production by default); each check is bounded
 by `CIRCLE_HTTP_TIMEOUT_SECONDS` and `CIRCLE_HTTP_MAX_RETRIES`, not by the
 attestation wait.
 
+#### Moving USDC without depositing: `bridge`
+
+`bridge --from <chain id> --to <chain id> --amount <usdc> [--confirm]` moves the
+Safe's own USDC between two CCTP chains and deposits nothing. It exists for what
+`execute` cannot route: a loop is built same-chain only, so its equity must
+already be USDC in the Safe on the loop's chain.
+
+It is the bridged leg above less its deposit. The burn comes from 1Tx's
+`/bridge/calldata`, is checked the same way, and is sized down (never up) to what
+the source chain holds less the paymaster's maximum charge. At
+`destination_ready` the destination operation carries `receiveMessage` alone, and
+the paymaster's charge comes out of the mint. The record is the same
+`BridgeState` with `deposit: false`, kept in a scope derived from the Safe, both
+chains, the amount and `--ref`:
+
+- Rerun the **same** `bridge --confirm` until its `bridges` state is
+  `completed`; it resumes and never burns twice. A dry run reports a transfer
+  under way instead of planning another.
+- Once completed, the same arguments do nothing; pass `--ref <label>` to move
+  the same amount again.
+- `--confirm` refuses to burn without an idempotency store, because a burn with
+  no record could not be redeemed.
+- Fast versus standard transfer follows `ONE_TX_FAST_TRANSFER`, as for `execute`.
+
 ## What a wallet actually needs
 
 For a normal (`local-eoa`) self-custody wallet:

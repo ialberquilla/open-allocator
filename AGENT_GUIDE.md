@@ -35,6 +35,7 @@ The registered CLI commands are exactly:
 - `rewards`
 - `rebalance`
 - `withdraw`
+- `bridge`
 <!-- command-inventory:end -->
 
 Every command must print one JSON object to stdout. Errors must print one JSON object to stderr and exit non-zero. Execution commands must return a plan-required response unless `--confirm`, `--unsafe`, or `--autonomous` is explicitly supplied.
@@ -114,6 +115,21 @@ Full surface and the known limits of every metric: [docs/capabilities.md](docs/c
 3. Dry-run it: `withdraw --position <id> [--amount <usd>]` without `--confirm` builds the plan and sends nothing.
 4. Announce the share amount, expected destination asset, chain, risks, and transactions.
 5. Wait for approval, then run `withdraw --confirm`.
+
+## Bridge Loop
+
+Use this to move the Safe's USDC to another chain without depositing, e.g. to fund a
+loop, which is built same-chain only. Never deposit and withdraw to move funds.
+
+1. Run `wallet-status` and pick the source chain that holds the USDC.
+2. Dry-run it: `bridge --from <chain id> --to <chain id> --amount <usdc>`. The plan's
+   burn amount may be sized down to leave the source paymaster's charge.
+3. Announce the source and destination chains, the burned amount, the `funding` rows,
+   and that what lands is the attested mint less Circle's fee and the destination
+   paymaster's charge.
+4. Wait for approval, then run `bridge --confirm` with the same arguments, and rerun it
+   until its `bridges` state is `completed`. Pass `--ref` only to start a second
+   transfer of the same amount ([docs/funding-and-bridging.md](docs/funding-and-bridging.md)).
 
 ## Confirmation Discipline
 

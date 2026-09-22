@@ -1,4 +1,4 @@
-"""The persisted state of one bridged deposit leg.
+"""The persisted state of one bridged deposit leg, or of a plain transfer.
 
 A leg whose deposit chain is not where its USDC is burns on the source chain,
 waits for Circle to attest the burn, and then redeems and deposits in one
@@ -15,6 +15,10 @@ destination operation reverted, which leaves the CCTP nonce unused:
 
 ``failed`` is terminal: a burn that cannot be identified or whose attestation
 does not match it is never redeemed automatically.
+
+A plain transfer (``deposit`` false) walks the same states; its destination
+operation carries ``receiveMessage`` alone, and ``bridge --confirm`` is what a
+rerun repeats.
 """
 
 from __future__ import annotations
@@ -61,6 +65,9 @@ class BridgeState(FrozenModel):
     fast: bool
     # The leg's full size in destination USDC; the deposit never exceeds it.
     wanted_deposit_raw: str = Field(pattern=_RAW)
+    # False for a plain transfer (the ``bridge`` command): the destination
+    # operation only redeems, and the mint stays in the Safe as USDC.
+    deposit: bool = True
     source_bundle_id: str
     source_bundle_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     # Which of the Safe's burns in its source operation this is, in call order.

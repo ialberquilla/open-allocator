@@ -1730,5 +1730,76 @@ def withdraw(
     )
 
 
+@app.command("bridge")
+@json_command
+def bridge(
+    from_chain: Annotated[int, typer.Option("--from", min=1)],
+    to_chain: Annotated[int, typer.Option("--to", min=1)],
+    amount: Annotated[float, typer.Option("--amount", min=0)],
+    ref: Annotated[str | None, typer.Option("--ref")] = None,
+    confirm: ConfirmOption = False,
+    unsafe: UnsafeOption = False,
+    autonomous: AutonomousOption = False,
+) -> JsonObject:
+    _ = (unsafe, autonomous)
+    return _bridge_from_cli(from_chain, to_chain, amount, ref=ref, confirm=confirm)
+
+
+def _bridge_from_cli(
+    from_chain_id: int,
+    to_chain_id: int,
+    amount: float,
+    *,
+    ref: str | None,
+    confirm: bool,
+) -> JsonObject:
+    from open_allocator.exec.transfer import execute_transfer
+
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    address = str(signer.address())
+
+    with OneTxClient(config) as client:
+        report = execute_transfer(
+            client,
+            signer,
+            from_chain_id=from_chain_id,
+            to_chain_id=to_chain_id,
+            amount_usdc=amount,
+            known_instruments=_discover_vaults_from_client(client),
+            confirm=confirm,
+            config=config,
+            # Read on a dry run too, so a transfer under way is reported, not
+            # planned again.
+            idempotency_store=_idempotency_store(
+                config,
+                _bridge_scope(address, from_chain_id, to_chain_id, amount, ref),
+            ),
+        )
+
+    return _model_payload(report)
+
+
+def _bridge_scope(
+    address: str,
+    from_chain_id: int,
+    to_chain_id: int,
+    amount: float,
+    ref: str | None,
+) -> str:
+    """The same arguments resume the same transfer; --ref starts another."""
+    payload = {
+        "bridge": {
+            "account": address.casefold(),
+            "from": from_chain_id,
+            "to": to_chain_id,
+            "amount": amount,
+            "ref": ref,
+        }
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def main() -> None:
     app()

@@ -303,7 +303,7 @@ def execute_plan(
     signer: object,
     plan: TxPlan,
     *,
-    stage: Literal["execute", "withdraw", "rebalance"],
+    stage: Literal["execute", "withdraw", "rebalance", "bridge"],
     policy_result: policy_core.PolicyResult,
     completion_key: Callable[[TxBundle], str],
     log: Callable[[TxBundle, Receipt], BundleLog | None],
