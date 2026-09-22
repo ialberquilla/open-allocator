@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-allocator.local/schemas/bridge-state.schema.json",
   "title": "BridgeState",
-  "description": "The persisted state of one bridged (CCTP) calldata deposit leg.",
+  "description": "The persisted state of one bridged (CCTP) calldata deposit leg, or of a plain USDC transfer between the Safe's chains.",
   "additionalProperties": false,
   "properties": {
     "version": {
@@ -79,6 +79,9 @@
     "wanted_deposit_raw": {
       "pattern": "^\\d+$",
       "type": "string"
+    },
+    "deposit": {
+      "type": "boolean"
     },
     "source_bundle_id": {
       "type": "string"

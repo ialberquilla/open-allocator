@@ -254,7 +254,7 @@ class BridgeRunner:
                 progress.errors = True
                 progress.messages.append(
                     f"{label} stopped at {state.state}: {_error_text(error)}; "
-                    "rerun `execute --confirm` to resume it"
+                    f"rerun {_rerun(state)} to resume it"
                 )
                 save(self.store, state)
                 break
@@ -448,6 +448,8 @@ class BridgeRunner:
             ),
             steps=(step,),
         )
+        if not state.deposit:
+            return self._redeem(state, receive, progress)
         fitted = deposit_sizing.fit(
             self.client,
             self.signer,
@@ -542,6 +544,77 @@ class BridgeRunner:
             )
         return submitted[-1]
 
+    def _redeem(
+        self,
+        state: BridgeState,
+        receive: bundle_execution.PlannedBundle,
+        progress: BridgeProgress,
+    ) -> BridgeState:
+        """Submit ``receiveMessage`` alone: a transfer's mint stays in the Safe.
+
+        The paymaster's charge is paid out of the mint in the same operation,
+        so it must be bounded before anything is sent, as for a deposit.
+        """
+        tx_plan = bundle_execution.assemble_plan(
+            [receive],
+            f"Redeem the CCTP transfer {state.leg_id} into the Safe on "
+            f"{_chain(state.destination_chain_id)}",
+        )
+        preparation = bundle_execution.prepare_plan(
+            self.signer, tx_plan, self.config, self.store
+        )
+        progress.preparations.extend(preparation.preparations)
+        progress.funding.extend(preparation.funding)
+        charges = [item.max_gas_token_charge_raw for item in preparation.preparations]
+        if not charges or any(charge is None for charge in charges):
+            raise TransactionPlanError(
+                f"the paymaster charge for {state.leg_id}'s destination operation "
+                "could not be bounded, and a bridged transfer pays it out of the mint"
+            )
+        if preparation.blockers:
+            raise TransactionPlanError("; ".join(preparation.blockers))
+
+        submitted: list[BridgeState] = []
+
+        def on_submitted(
+            item: bundle_execution.PlannedBundle,
+            _operation: bundle_execution.Operation,
+            receipt: Receipt | None,
+        ) -> None:
+            operation_hash, transaction_hash = _hashes(receipt)
+            after = state.advanced(
+                "destination_submitted",
+                destination_bundle_digest=item.bundle.digest,
+                destination_operation_hash=operation_hash,
+                destination_transaction_hash=transaction_hash,
+                last_error=None,
+            )
+            save(self.store, after)
+            submitted.append(after)
+
+        result = bundle_execution.execute_plan(
+            self.client,
+            self.signer,
+            tx_plan,
+            stage="bridge",
+            policy_result=self.policy_result,
+            completion_key=lambda bundle: (
+                f"bridge:{state.leg_id}:destination:{bundle.action}"
+            ),
+            log=lambda _bundle, _receipt: None,
+            config=self.config,
+            idempotency_store=self.store,
+            on_submitted=on_submitted,
+        )
+        progress.steps.extend(result.steps)
+        progress.receipts.extend(result.receipts)
+        progress.messages.extend(result.messages)
+        if not submitted:
+            raise TransactionPlanError(
+                f"the destination operation for {state.leg_id} was not submitted"
+            )
+        return submitted[-1]
+
     def _reconcile_destination(
         self, state: BridgeState, progress: BridgeProgress
     ) -> BridgeState:
@@ -595,7 +668,12 @@ class BridgeRunner:
                 if balance is None
                 else f"{balance} raw units of"
             )
-            + " USDC there — check `positions` to see whether it was deposited"
+            + " USDC there"
+            + (
+                " — check `positions` to see whether it was deposited"
+                if state.deposit
+                else ""
+            )
         )
         return state.advanced("completed", last_error=None)
 
@@ -744,7 +822,7 @@ def _waiting_message(state: BridgeState) -> str:
             detail += f", delay: {state.delay_reason}"
         return (
             f"bridged {state.leg_id}: waiting for Circle to attest the burn in "
-            f"{state.source_transaction_hash} ({detail}); rerun `execute --confirm`"
+            f"{state.source_transaction_hash} ({detail}); rerun {_rerun(state)}"
         )
     if state.state == "destination_submitted":
         return (
@@ -762,6 +840,10 @@ _ORDER = (
     "destination_submitted",
     "completed",
 )
+
+
+def _rerun(state: BridgeState) -> str:
+    return "`execute --confirm`" if state.deposit else "`bridge --confirm`"
 
 
 def _furthest(state: BridgeState, stored: BridgeState | None) -> BridgeState:
