@@ -35,6 +35,7 @@ The registered CLI commands are exactly:
 - `rewards`
 - `rebalance`
 - `withdraw`
+- `loop-close`
 - `bridge`
 <!-- command-inventory:end -->
 
@@ -115,6 +116,23 @@ Full surface and the known limits of every metric: [docs/capabilities.md](docs/c
 3. Dry-run it: `withdraw --position <id> [--amount <usd>]` without `--confirm` builds the plan and sends nothing.
 4. Announce the share amount, expected destination asset, chain, risks, and transactions.
 5. Wait for approval, then run `withdraw --confirm`.
+
+## Loop Close Loop
+
+Use this to take one levered loop off. `withdraw` refuses a loop — its collateral is
+pledged against its debt — and `rebalance` reaches a close only as a consequence of a
+target allocation that no longer holds the leg. This closes the loop and nothing else,
+so de-risking does not require first deciding where the proceeds go.
+
+1. Identify the loop id; it must still be listed by the loop screen.
+2. Dry-run it: `loop-close --loop <loop id>` without `--confirm` builds the plan,
+   announces it, and sends nothing.
+3. Announce the announcement's `account_config` and `pool_positions`. A close that
+   switches the account's e-mode re-prices every other position in that pool, and the
+   dry run refuses outright when those positions cannot be read.
+4. Wait for approval, then run `loop-close --confirm`. The bundle goes out as one
+   atomic operation; a signer that cannot batch is refused, because a half-unwound
+   loop is a levered position with its collateral withdrawn.
 
 ## Bridge Loop
 

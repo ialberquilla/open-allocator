@@ -238,7 +238,15 @@ class LoopTarget:
             pool=loop.pool,
             collateral_instrument_id=loop.collateral_instrument_id,
             debt_instrument_id=loop.debt_instrument_id,
-            collateral_token=bundle.token_in.address,
+            # Which side carries the collateral token depends on the action;
+            # see the note in `validate_loop_calldata`. A bundle rebuilt before
+            # signing is re-validated against this target, so the side has to
+            # match the one that check expects.
+            collateral_token=(
+                bundle.token_out.address
+                if bundle.action == "loop_close"
+                else bundle.token_in.address
+            ),
             same_asset=loop.same_asset,
         )
 
@@ -284,9 +292,23 @@ def validate_loop_calldata(
     )
     if target.pool is not None:
         require("pool", block.pool, target.pool, fold=True)
-    require(
-        "tokenIn.address", response.token_in.address, target.collateral_token, fold=True
-    )
+    # The collateral token is what an open takes IN and what a close pays OUT:
+    # a close spends the pool's yield token (the collateral receipt) to get the
+    # collateral back.
+    if action == "close":
+        require(
+            "tokenOut.address",
+            response.token_out.address,
+            target.collateral_token,
+            fold=True,
+        )
+    else:
+        require(
+            "tokenIn.address",
+            response.token_in.address,
+            target.collateral_token,
+            fold=True,
+        )
     # The flag must mean exactly "this bundle changes the account's category".
     require(
         "requiresAccountConfig",

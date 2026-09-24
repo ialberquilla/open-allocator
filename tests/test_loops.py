@@ -17,6 +17,7 @@ import pytest
 
 from open_allocator.core import levered
 from open_allocator.core import policy as policy_core
+from open_allocator.core.checkpoint import allocation_log_totals, read_allocation_log
 from open_allocator.core.positions import (
     IdleBalance,
     LeveredPositionError,
@@ -38,7 +39,7 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
-from open_allocator.exec import loops
+from open_allocator.exec import loop_close, loops
 from open_allocator.exec.bundle_execution import SubmissionModeError
 from open_allocator.exec.client import (
     LoopCalldataQuery,
@@ -167,11 +168,12 @@ class LoopClient:
         self, loop_id: str, query: LoopCalldataQuery
     ) -> LoopCalldataResponse:
         self.requests.append((loop_id, query))
-        name = (
-            "loop-calldata-open-cross.json"
-            if loop_id == CROSS
-            else "loop-calldata-open-same.json"
-        )
+        if query.action == "close":
+            name = "loop-calldata-close-cross.json"
+        elif loop_id == CROSS:
+            name = "loop-calldata-open-cross.json"
+        else:
+            name = "loop-calldata-open-same.json"
         payload = fixture(name)
         payload["account"] = query.account
         payload["amountIn"] = query.amount
@@ -250,6 +252,7 @@ class Config:
     _rpc_overrides: dict[int, str] = field(
         default_factory=lambda: {MONAD: "rpc://monad"}
     )
+    allocation_log_path: Path | None = None
 
 
 # --- the contract -----------------------------------------------------------
@@ -1052,3 +1055,148 @@ def test_a_rebalance_that_leaves_the_loop_alone_is_not_blocked() -> None:
     )
 
     assert report.plan.bundles == ()
+
+
+# --- closing a loop on its own ----------------------------------------------
+
+
+def _close_client() -> LoopClient:
+    """A client whose book holds the cross loop, so its pool can be read."""
+    client = LoopClient()
+    client.holdings = [
+        {
+            "instrumentId": N_USDC,
+            "protocol": "Neverland",
+            "symbol": "USDC",
+            "balance": "67.461173",
+            "shareBalance": "67.461173",
+            "shareBalanceRaw": "67461173",
+            "shareDecimals": 6,
+            "chainId": MONAD,
+        }
+    ]
+    return client
+
+
+def test_a_close_is_planned_without_a_target_allocation() -> None:
+    report = loop_close.close(
+        _close_client(),
+        BatchingSigner(),
+        CROSS,
+        policy=loop_policy(),
+        known_instruments=instruments(),
+        confirm=False,
+        config=Config(),
+    )
+
+    assert report.status == "planned"
+    assert report.loop_id == CROSS
+    assert len(report.plan.steps) == 25
+    assert report.plan.bundles[0].action == "loop_close"
+    # Nothing was sent: a dry run stops at the plan.
+    assert report.receipts == ()
+
+
+def test_a_close_announces_the_emode_it_switches_back() -> None:
+    report = loop_close.close(
+        _close_client(),
+        BatchingSigner(),
+        CROSS,
+        policy=loop_policy(),
+        known_instruments=instruments(),
+        confirm=False,
+        config=Config(),
+    )
+
+    assert report.announcement.requires_account_config
+    assert report.announcement.account_config == "aave e-mode 2 -> 0"
+    assert report.announcement.confirmable
+
+
+def test_a_close_that_cannot_read_its_pool_is_refused() -> None:
+    """An e-mode switch re-prices every other position held in the pool."""
+    client = _close_client()
+    client.positions_fail = True
+
+    with pytest.raises(TransactionPlanError, match="could not be read"):
+        loop_close.close(
+            client,
+            BatchingSigner(),
+            CROSS,
+            policy=loop_policy(),
+            known_instruments=instruments(),
+            confirm=False,
+            config=Config(),
+        )
+
+
+def test_a_confirmed_close_goes_out_as_one_batch() -> None:
+    signer = BatchingSigner()
+    report = loop_close.close(
+        _close_client(),
+        signer,
+        CROSS,
+        policy=loop_policy(),
+        known_instruments=instruments(),
+        confirm=True,
+        config=Config(),
+    )
+
+    assert report.status == "success"
+    assert len(signer.batches) == 1
+    assert len(signer.batches[0]) == 25
+    assert signer.sent == []
+
+
+def test_a_close_refuses_a_signer_that_cannot_batch() -> None:
+    """Half an unwind is a levered position with its collateral withdrawn."""
+    with pytest.raises(SubmissionModeError, match="one atomic operation"):
+        loop_close.close(
+            _close_client(),
+            SequentialSigner(),
+            CROSS,
+            policy=loop_policy(),
+            known_instruments=instruments(),
+            confirm=True,
+            config=Config(),
+        )
+
+
+def test_a_loop_outside_the_screen_cannot_be_closed_here() -> None:
+    with pytest.raises(loops.calldata.CalldataValidationError, match="loop screen"):
+        loop_close.close(
+            _close_client(),
+            BatchingSigner(),
+            "0x" + "ab" * 32,
+            policy=loop_policy(),
+            known_instruments=instruments(),
+            confirm=False,
+            config=Config(),
+        )
+
+
+def test_a_sent_close_is_written_to_the_ledger_as_capital_returned(
+    tmp_path: Path,
+) -> None:
+    """A close has no share amount, so it records its expected output.
+
+    The allocation log needs `usd` or `shares`, and the entry is signed
+    negative because an unwind returns capital.
+    """
+    log_path = tmp_path / "allocation-log.jsonl"
+    report = loop_close.close(
+        _close_client(),
+        BatchingSigner(),
+        CROSS,
+        policy=loop_policy(),
+        known_instruments=instruments(),
+        confirm=True,
+        config=Config(allocation_log_path=log_path),
+    )
+
+    assert report.status == "success"
+    entries = read_allocation_log(log_path=log_path)
+    assert len(entries) == 1
+    assert entries[0].action_type == "loop_close"
+    assert entries[0].usd == pytest.approx(12.455957)
+    assert allocation_log_totals(entries)[CROSS] == pytest.approx(-12.455957)

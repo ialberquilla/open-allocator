@@ -51,6 +51,17 @@ class SubmissionModeError(TransactionPlanError):
     """The configured signer cannot submit this plan safely as it was built."""
 
 
+class BundleRecordError(TransactionPlanError):
+    """Recording a bundle failed AFTER its calls landed on chain.
+
+    Marking completion and writing the ledger entry happen once the operation
+    has been mined, so a failure there is not a failure to send and must not be
+    reported as one: the safe reaction to a failed broadcast is to resend, and
+    resending a settled operation repeats it. This names the transaction that
+    carried the bundle so it can be reconciled instead.
+    """
+
+
 class UnderfundedPlanError(TransactionPlanError):
     """The account does not hold what the plan spends; nothing was sent for it."""
 
@@ -441,7 +452,7 @@ def execute_plan(
                         )
                     offset += len(item.steps)
                     completed.extend(
-                        _complete(
+                        _record(
                             item,
                             receipt,
                             idempotency_store,
@@ -480,7 +491,7 @@ def execute_plan(
                         )
                     offset += len(item.steps)
                     completed.extend(
-                        _complete(
+                        _record(
                             item,
                             last_receipt,
                             idempotency_store,
@@ -492,7 +503,7 @@ def execute_plan(
                     )
         except Exception as error:
             partial = write_partial(operation)
-            if isinstance(error, PaymasterError):
+            if isinstance(error, PaymasterError | BundleRecordError):
                 raise
             raise ExecutionBroadcastError(
                 "transaction broadcast failed",
@@ -728,6 +739,36 @@ def _refreshed(
             rebuilt.append(bundle.bundle_id)
         items.append(item)
     return Operation(operation.chain_id, tuple(items)), tuple(rebuilt)
+
+
+def _record(
+    item: PlannedBundle,
+    receipt: Receipt | None,
+    store: object | None,
+    config: object | None,
+    completion_key: Callable[[TxBundle], str],
+    log: Callable[[TxBundle, Receipt], BundleLog | None],
+    *,
+    on_submitted: Callable[[PlannedBundle, Receipt | None], None] | None = None,
+) -> tuple[str, ...]:
+    """:func:`_complete`, with its failures kept distinct from a failed send."""
+    try:
+        return _complete(
+            item,
+            receipt,
+            store,
+            config,
+            completion_key,
+            log,
+            on_submitted=on_submitted,
+        )
+    except Exception as error:
+        landed = "(hash unknown)" if receipt is None else receipt.transaction_hash
+        raise BundleRecordError(
+            f"bundle {item.bundle.bundle_id} landed in transaction {landed}, "
+            f"but its record could not be written: {error}. The calls are on "
+            "chain; reconcile rather than resend."
+        ) from error
 
 
 def _complete(

@@ -13,6 +13,7 @@ from open_allocator.core.types import TxBundle, TxPlan, TxStep
 from open_allocator.exec import calldata
 from open_allocator.exec.bundle_execution import (
     BundleLog,
+    BundleRecordError,
     PlannedBundle,
     SubmissionModeError,
     UnderfundedPlanError,
@@ -793,3 +794,32 @@ def test_execution_never_proceeds_on_an_assumed_balance_estimate() -> None:
     with pytest.raises(TransactionPlanError, match="although the funding check"):
         run(signer, plan(response("a")), config=funded(10**12))
     assert signer.batches == []
+
+
+def test_a_record_that_fails_after_the_send_is_not_called_a_failed_broadcast(
+    tmp_path: Path,
+) -> None:
+    """A ledger write that fails once the calls have landed is not a resend.
+
+    An entry carrying neither `usd` nor `shares` is refused by the allocation
+    log, which happens after the operation is mined.
+    """
+    signer = BatchingSigner()
+
+    with pytest.raises(BundleRecordError) as raised:
+        execute_plan(
+            RefreshingClient(),
+            signer,
+            plan(response("a")),
+            stage="execute",
+            policy_result=OK,
+            completion_key=leg_key,
+            log=lambda _bundle, _receipt: BundleLog(action_type="buy"),
+            config=Config(allocation_log_path=tmp_path / "allocation-log.jsonl"),
+            idempotency_store=None,
+            clock=lambda: NOW,
+        )
+
+    assert "landed in transaction" in str(raised.value)
+    assert "reconcile rather than resend" in str(raised.value)
+    assert len(signer.batches) == 1

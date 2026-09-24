@@ -518,7 +518,7 @@ def _format_amount(value: Decimal) -> str:
 def _signed_usd(entry: AllocationLogEntry) -> float:
     amount = entry.usd or 0.0
     action = entry.action_type.casefold()
-    if action in {"sell", "withdraw", "exit"}:
+    if action in {"sell", "withdraw", "exit", "loop_close"}:
         return -amount
     return amount
 

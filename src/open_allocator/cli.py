@@ -277,6 +277,12 @@ def execute_withdraw(*args: object, **kwargs: object) -> object:
     return executor(*args, **kwargs)
 
 
+def execute_loop_close(*args: object, **kwargs: object) -> object:
+    from open_allocator.exec.loop_close import close as executor
+
+    return executor(*args, **kwargs)
+
+
 def _execution_report(
     *,
     status: str,
@@ -375,6 +381,20 @@ def _rebalance_scope(
         "target": target.model_dump(mode="json"),
         "min_trade_usd": min_trade_usd,
     }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _loop_close_idempotency_store(
+    config: object,
+    loop_id: str,
+    account: str,
+) -> ScopedIdempotencyStore | None:
+    return _idempotency_store(config, _loop_close_scope(loop_id, account))
+
+
+def _loop_close_scope(loop_id: str, account: str) -> str:
+    payload = {"loop_id": loop_id, "account": account}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -542,6 +562,36 @@ def _rebalance_from_cli(
                 else None
             ),
             min_trade_usd=min_trade_usd,
+        )
+
+    return _model_payload(report)
+
+
+def _loop_close_from_cli(
+    loop_id: str,
+    policy_path: Path,
+    *,
+    confirm: bool,
+) -> JsonObject:
+    policy = load_policy(policy_path)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+
+    with OneTxClient(config) as client:
+        known_instruments = _discover_vaults_from_client(client, enrich=True)
+        report = execute_loop_close(
+            client,
+            signer,
+            loop_id,
+            policy=policy,
+            known_instruments=known_instruments,
+            confirm=confirm,
+            config=config,
+            idempotency_store=(
+                _loop_close_idempotency_store(config, loop_id, str(signer.address()))
+                if confirm
+                else None
+            ),
         )
 
     return _model_payload(report)
@@ -1728,6 +1778,20 @@ def withdraw(
         amount=amount,
         confirm=confirm,
     )
+
+
+@app.command("loop-close")
+@json_command
+def loop_close(
+    loop: Annotated[str, typer.Option("--loop")],
+    confirm: ConfirmOption = False,
+    policy_path: Annotated[
+        Path,
+        typer.Option("--policy", dir_okay=False, readable=True),
+    ] = DEFAULT_POLICY_PATH,
+) -> JsonObject:
+    """Unwind one levered loop, without authoring a target allocation."""
+    return _loop_close_from_cli(loop, policy_path, confirm=confirm)
 
 
 @app.command("bridge")
