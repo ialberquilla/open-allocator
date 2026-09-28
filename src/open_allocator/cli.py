@@ -283,6 +283,12 @@ def execute_loop_close(*args: object, **kwargs: object) -> object:
     return executor(*args, **kwargs)
 
 
+def execute_loop_open(*args: object, **kwargs: object) -> object:
+    from open_allocator.exec.loop_open import open_loop as executor
+
+    return executor(*args, **kwargs)
+
+
 def _execution_report(
     *,
     status: str,
@@ -395,6 +401,20 @@ def _loop_close_idempotency_store(
 
 def _loop_close_scope(loop_id: str, account: str) -> str:
     payload = {"loop_id": loop_id, "account": account}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _loop_open_idempotency_store(
+    config: object,
+    loop_id: str,
+    account: str,
+) -> ScopedIdempotencyStore | None:
+    return _idempotency_store(config, _loop_open_scope(loop_id, account))
+
+
+def _loop_open_scope(loop_id: str, account: str) -> str:
+    payload = {"loop_id": loop_id, "account": account, "action": "open"}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -589,6 +609,40 @@ def _loop_close_from_cli(
             config=config,
             idempotency_store=(
                 _loop_close_idempotency_store(config, loop_id, str(signer.address()))
+                if confirm
+                else None
+            ),
+        )
+
+    return _model_payload(report)
+
+
+def _loop_open_from_cli(
+    loop_id: str,
+    equity_usd: float,
+    leverage: float,
+    policy_path: Path,
+    *,
+    confirm: bool,
+) -> JsonObject:
+    policy = load_policy(policy_path)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+
+    with OneTxClient(config) as client:
+        known_instruments = _discover_vaults_from_client(client, enrich=True)
+        report = execute_loop_open(
+            client,
+            signer,
+            loop_id,
+            equity_usd=equity_usd,
+            leverage=leverage,
+            policy=policy,
+            known_instruments=known_instruments,
+            confirm=confirm,
+            config=config,
+            idempotency_store=(
+                _loop_open_idempotency_store(config, loop_id, str(signer.address()))
                 if confirm
                 else None
             ),
@@ -1792,6 +1846,22 @@ def loop_close(
 ) -> JsonObject:
     """Unwind one levered loop, without authoring a target allocation."""
     return _loop_close_from_cli(loop, policy_path, confirm=confirm)
+
+
+@app.command("loop-open")
+@json_command
+def loop_open(
+    loop: Annotated[str, typer.Option("--loop")],
+    amount: Annotated[float, typer.Option("--amount", min=0)],
+    leverage: Annotated[float, typer.Option("--leverage", min=1)],
+    confirm: ConfirmOption = False,
+    policy_path: Annotated[
+        Path,
+        typer.Option("--policy", dir_okay=False, readable=True),
+    ] = DEFAULT_POLICY_PATH,
+) -> JsonObject:
+    """Open one levered loop from idle USDC, checked against the held book."""
+    return _loop_open_from_cli(loop, amount, leverage, policy_path, confirm=confirm)
 
 
 @app.command("bridge")

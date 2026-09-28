@@ -39,7 +39,7 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
-from open_allocator.exec import loop_close, loops
+from open_allocator.exec import loop_close, loop_open, loops
 from open_allocator.exec.bundle_execution import SubmissionModeError
 from open_allocator.exec.client import (
     LoopCalldataQuery,
@@ -1200,3 +1200,131 @@ def test_a_sent_close_is_written_to_the_ledger_as_capital_returned(
     assert entries[0].action_type == "loop_close"
     assert entries[0].usd == pytest.approx(12.455957)
     assert allocation_log_totals(entries)[CROSS] == pytest.approx(-12.455957)
+
+
+# --- opening a loop on its own ----------------------------------------------
+
+MORPHO_USDC = "0x0000008f3c1527da06166f62265ed8e7750e2b151127103d7c74957cb1849a9d"
+
+
+def _morpho() -> Vault:
+    return Vault(
+        instrument_id=MORPHO_USDC,
+        protocol="Morpho",
+        chain_id=MONAD,
+        asset="USDC",
+        token_address=MONAD_USDC,
+        token_decimals=6,
+        yield_token_address="0x80017bF0f793EBbE9679Cd61ff0e395B62CAbB59",
+        yield_token_decimals=18,
+        apy=10.5,
+        apy_base=10.5,
+        apy_reward=0.0,
+        tvl_usd=7_000_000,
+        curator="August",
+        reward_dependence=0.0,
+    )
+
+
+def _open_client(held_usd: str | None = "30.000000") -> LoopClient:
+    """A client whose book holds a plain USDC vault, off the loop's pool."""
+    client = LoopClient()
+    if held_usd is not None:
+        client.holdings = [
+            {
+                "instrumentId": MORPHO_USDC,
+                "protocol": "Morpho",
+                "symbol": "USDC",
+                "balance": held_usd,
+                "shareBalance": held_usd,
+                "shareBalanceRaw": str(int(float(held_usd) * 10**18)),
+                "shareDecimals": 18,
+                "chainId": MONAD,
+            }
+        ]
+    return client
+
+
+def _open_policy() -> Policy:
+    """Loop caps as usual, with an instrument cap a lone loop cannot meet."""
+    policy = loop_policy()
+    return policy.model_copy(
+        update={
+            "caps": policy.caps.model_copy(update={"max_weight_per_instrument": 0.7})
+        }
+    )
+
+
+def _open(client: LoopClient, **kwargs: Any) -> loop_open.LoopOpenReport:
+    options: dict[str, Any] = {
+        "equity_usd": 20.0,
+        "leverage": 3.0,
+        "policy": _open_policy(),
+        "known_instruments": [*instruments(), _morpho()],
+        "confirm": False,
+        "config": Config(),
+    }
+    options.update(kwargs)
+    signer = options.pop("signer", BatchingSigner())
+    return loop_open.open_loop(client, signer, SAME, **options)
+
+
+def test_an_open_is_scored_against_the_book_it_joins() -> None:
+    """20 next to a held 30 is 40% of the book, under a 70% instrument cap."""
+    client = _open_client()
+    report = _open(client)
+
+    assert report.status == "planned"
+    assert report.policy_result.ok
+    assert report.plan.bundles[0].action == "loop_open"
+    assert len(report.plan.steps) == 9
+    assert report.receipts == ()
+    _loop_id, query = client.requests[0]
+    assert query.action == "open"
+    assert query.amount == "20000000"
+
+
+def test_an_open_that_would_dominate_the_book_is_refused() -> None:
+    """With nothing else held the loop is the whole book, over the 70% cap."""
+    with pytest.raises(PolicyCheckFailed, match="max_weight_per_instrument"):
+        _open(_open_client(held_usd=None))
+
+
+def test_an_open_announces_the_emode_it_switches_on() -> None:
+    report = _open(_open_client())
+
+    assert report.announcement.requires_account_config
+    assert report.announcement.account_config == "aave e-mode 0 -> 2"
+    assert report.announcement.confirmable
+
+
+def test_an_open_is_funded_from_idle_usdc_only() -> None:
+    """The fake wallet holds 50 idle; more would mean selling a position."""
+    with pytest.raises(TransactionPlanError, match="idle on chain 143"):
+        _open(_open_client(), equity_usd=60.0)
+
+
+def test_a_confirmed_open_goes_out_as_one_batch_and_is_logged(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "allocation-log.jsonl"
+    signer = BatchingSigner()
+    report = _open(
+        _open_client(),
+        signer=signer,
+        confirm=True,
+        config=Config(allocation_log_path=log_path),
+    )
+
+    assert report.status == "success"
+    assert len(signer.batches) == 1
+    assert signer.sent == []
+    entries = read_allocation_log(log_path=log_path)
+    assert [entry.action_type for entry in entries] == ["loop_open"]
+    assert allocation_log_totals(entries)[SAME] == pytest.approx(20.0)
+
+
+def test_an_open_refuses_a_signer_that_cannot_batch() -> None:
+    """Half an open is a borrow with nothing to hold it up."""
+    with pytest.raises(SubmissionModeError, match="one atomic operation"):
+        _open(_open_client(), signer=SequentialSigner(), confirm=True)
