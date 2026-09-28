@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 DEFAULT_IRIS_API_URL = "https://iris-api.circle.com"
 
@@ -36,7 +36,7 @@ class CircleModel(BaseModel):
 
 
 class CircleMessage(CircleModel):
-    # "0x" until the message is attested.
+    # "0x" (or null) until the message is attested.
     message: str = "0x"
     # "PENDING" (or absent) until the message is attested.
     attestation: str | None = None
@@ -44,6 +44,13 @@ class CircleMessage(CircleModel):
     cctp_version: int | None = Field(default=None, alias="cctpVersion")
     status: str
     delay_reason: str | None = Field(default=None, alias="delayReason")
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def _unattested_message(cls, value: object) -> object:
+        # Circle sends null rather than "0x" for a message still awaiting
+        # confirmations; both mean the same unready answer.
+        return "0x" if value is None else value
 
     @property
     def complete(self) -> bool:
