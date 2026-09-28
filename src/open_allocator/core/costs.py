@@ -192,6 +192,11 @@ class LegInput:
     txs: int | None = None
     # False for a leg entered in the asset already held: gas, but no spread.
     swaps: bool = True
+    # Days left on a fixed-term leg (a Pendle PT); None for an open-ended one.
+    # A term shorter than the year-1 window is not one entry but several: the
+    # PT redeems at maturity and staying invested means entering its successor,
+    # paying the entry again each time. See ``rollover_cost_usd_year1``.
+    term_days: float | None = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +223,11 @@ class CostEstimate:
     measured_base_apy_pct: float | None = None
     base_apy_coverage_bps: int = 10_000
     accruing_income_available: bool = True
+    # Re-entry cost of fixed-term legs that mature inside year 1, assuming each
+    # is rolled into a like successor. Charged in ``net_apy_pct_year1``, not in
+    # ``total_expected_cost_usd``, which stays what *this* deploy costs.
+    rollover_cost_usd_year1: float = 0.0
+    fixed_term_leg_count: int = 0
 
     def as_metadata(self) -> dict[str, float | int | str | bool | None]:
         """Flat, schema-safe scalar dict for allocation ``metadata``."""
@@ -237,6 +247,8 @@ class CostEstimate:
             "measured_base_apy_pct": self.measured_base_apy_pct,
             "base_apy_coverage_bps": self.base_apy_coverage_bps,
             "accruing_income_available": self.accruing_income_available,
+            "rollover_cost_usd_year1": self.rollover_cost_usd_year1,
+            "fixed_term_leg_count": self.fixed_term_leg_count,
             "bridged_usd": self.bridged_usd,
             "bridged_leg_count": self.bridged_leg_count,
             "leg_count": self.leg_count,
@@ -342,6 +354,20 @@ def estimate(
     total_cost = gas_cost + bridge_fee + spread_cost
     max_slippage = deploy_usd * params.slippage_bps / 10_000
 
+    # 🔑 A fixed-term leg's entry recurs. Year-1 income assumes the book stays
+    # invested for the year, and a PT that matures inside it only does that by
+    # being redeemed and replaced — each replacement an entry like this one.
+    # Redeeming at maturity has no AMM leg, so an exit is not charged; the
+    # re-entry is. The entry is amortized over the term rather than the year,
+    # so a short tenor's headline rate is weighed against its full cost.
+    fixed_term = [leg for leg in priced if leg.term_days is not None]
+    rollover_cost = sum(
+        _leg_entry_cost(leg, source, gas_usd_per_tx, params)
+        * _rollovers_in_year1(leg.term_days)
+        for leg in fixed_term
+        if leg.term_days is not None
+    )
+
     cost_pct = total_cost / deploy_usd * 100 if deploy_usd > 0 else 0.0
     gross_apy = (
         sum(leg.usd * leg.apy_pct for leg in priced) / deploy_usd
@@ -361,8 +387,9 @@ def estimate(
         else None
     )
     accruing_available = base_coverage_bps == 10_000
+    rollover_pct = rollover_cost / deploy_usd * 100 if deploy_usd > 0 else 0.0
     net_apy_year1 = (
-        measured_base - cost_pct
+        measured_base - cost_pct - rollover_pct
         if accruing_available and measured_base is not None
         else None
     )
@@ -407,7 +434,39 @@ def estimate(
         ),
         base_apy_coverage_bps=base_coverage_bps,
         accruing_income_available=accruing_available,
+        rollover_cost_usd_year1=round(rollover_cost, 4),
+        fixed_term_leg_count=len(fixed_term),
     )
+
+
+def _leg_entry_cost(
+    leg: LegInput,
+    source_chain_id: int,
+    gas_usd_per_tx: float,
+    params: CostParams,
+) -> float:
+    """One entry into ``leg``: the same gas, bridge and spread :func:`estimate`
+    charges it, attributed to the leg alone."""
+    gas = params.txs_for(leg.txs, default=params.txs_per_leg) * gas_usd_per_tx
+    bridge = (
+        leg.usd * params.cctp_fast_fee_bps / 10_000
+        if leg.chain_id != source_chain_id
+        else 0.0
+    )
+    spread = params.spread_usd(leg.usd) if leg.swaps else 0.0
+    return gas + bridge + spread
+
+
+def _rollovers_in_year1(term_days: float) -> float:
+    """Re-entries a fixed-term leg needs to stay invested for the year-1 window.
+
+    Continuous rather than whole: a 100-day term is re-entered 365/100 - 1 =
+    2.65 more times, not "twice" or "three times". A term already at or past maturity
+    (0 days) is priced as one re-entry — it is rolled now or it earns nothing.
+    """
+    if term_days <= 0:
+        return 1.0
+    return max(365.0 / term_days - 1.0, 0.0)
 
 
 def estimate_from_allocation_legs(
@@ -417,6 +476,7 @@ def estimate_from_allocation_legs(
     apy_by_instrument: Mapping[str, float],
     base_apy_by_instrument: Mapping[str, float | None] | None = None,
     txs_by_instrument: Mapping[str, int] | None = None,
+    term_days_by_instrument: Mapping[str, float] | None = None,
     source_chain_id: int | None = None,
     params: CostParams | None = None,
 ) -> CostEstimate | None:
@@ -455,6 +515,11 @@ def estimate_from_allocation_legs(
                 txs=(
                     txs_by_instrument.get(instrument_id)
                     if txs_by_instrument is not None
+                    else None
+                ),
+                term_days=(
+                    term_days_by_instrument.get(instrument_id)
+                    if term_days_by_instrument is not None
                     else None
                 ),
             )

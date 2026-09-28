@@ -98,6 +98,30 @@ Never present an independence number as a property of the library. It is a
 property of the shelf on the day it was measured — regenerate it per run.
 Full surface and the known limits of every metric: [docs/capabilities.md](docs/capabilities.md).
 
+## Fixed-Term Instruments
+
+A row with a `maturity` (a Pendle PT, `sector: FIXED_RATE`) is not an open-ended
+vault, and three things read differently:
+
+- **`apy` is the rate locked to maturity**, annualized. Held to maturity it earns
+  `term_return_pct` over `days_to_maturity` days, then **nothing** until redeemed.
+  Announce the term and the maturity date next to the rate, never the rate alone.
+- **`risk_metrics` are the holder's mark-to-market path**, rebuilt from the
+  implied-rate history (`core/fixed_rate.py`): when rates rise a PT's price
+  falls, so volatility and drawdown are real for an exit before maturity. Selling
+  early crosses the PT's AMM; redeeming at or after maturity is 1:1 with no AMM leg.
+- **Costs recur.** `net_apy_pct_year1` charges a PT that matures inside the year
+  for re-entering a successor at each maturity (`rollover_cost_usd_year1`), and
+  `simulate` flags fixed-term weight with a `fixed_term:` warning.
+
+`drift` reports a `maturity` reason from `MATURITY_NOTICE_DAYS` (7) before
+maturity, and a held PT that has matured and left the shelf is read back by id,
+not lost. The action at maturity is `withdraw` (redeem) and, if the mandate still
+wants fixed rate, a deposit into the successor maturity — time it *to* maturity,
+not before: an early sell pays the AMM. To compare a held PT with alternatives,
+use its current implied rate: that is what holding on earns from here, and the
+entry rate is sunk.
+
 ## Rebalance Loop
 
 1. Run `positions` and compare current holdings to the target allocation.

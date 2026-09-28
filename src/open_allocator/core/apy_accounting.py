@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import date
 from typing import Literal
 
 from open_allocator.core.types import Allocation, FrozenModel, Vault
@@ -56,9 +57,20 @@ class ApyAccounting(FrozenModel):
     priced_blended_apy_pct: float | None
     apy_basis: Literal["base", "mixed_unknown"]
     reward_basis: Literal["traded", "none", "mixed_unpriced"]
+    # Weight in fixed-term instruments, whose APY is a rate locked only until
+    # maturity: past it they pay nothing unless redeemed and rolled.
+    fixed_term_weight_bps: int = 0
+    earliest_maturity: date | None = None
 
     def warnings(self) -> tuple[str, ...]:
         warnings: list[str] = []
+        if self.fixed_term_weight_bps:
+            warnings.append(
+                f"fixed_term:weight_bps={self.fixed_term_weight_bps}:"
+                f"earliest_maturity={self.earliest_maturity}:"
+                "apy is locked to maturity only; it pays nothing after unless "
+                "redeemed and rolled"
+            )
         if self.unknown_base_weight_bps:
             warnings.append(
                 f"apy_base_unknown:weight_bps={self.unknown_base_weight_bps}:"
@@ -101,11 +113,15 @@ def for_allocation(allocation: Allocation, vaults: Sequence[Vault]) -> ApyAccoun
 
     advertised_numerator = base_numerator = reward_numerator = 0.0
     advertised_usd = base_usd = reward_usd = 0.0
-    unpriced_usd = 0.0
+    unpriced_usd = fixed_term_usd = 0.0
+    maturities: list[date] = []
     for leg in legs:
         vault = by_id.get(leg.instrument_id)
         if vault is None:
             continue
+        if vault.maturity is not None:
+            fixed_term_usd += leg.usd
+            maturities.append(vault.maturity.date())
         advertised_numerator += leg.usd * vault.apy
         advertised_usd += leg.usd
         if vault.apy_base is not None:
@@ -142,6 +158,8 @@ def for_allocation(allocation: Allocation, vaults: Sequence[Vault]) -> ApyAccoun
         ),
         apy_basis="base" if base_coverage == 10_000 else "mixed_unknown",
         reward_basis=_reward_basis(reward_coverage, measured_reward),
+        fixed_term_weight_bps=_coverage_bps(fixed_term_usd, total),
+        earliest_maturity=min(maturities) if maturities else None,
     )
 
 

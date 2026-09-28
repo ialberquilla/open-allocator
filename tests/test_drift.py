@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import random
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -881,3 +881,112 @@ def test_a_book_with_no_better_candidate_stays_quiet() -> None:
 
     assert reasons_of(report, "opportunity") == []
     assert report.drifted is False
+
+
+# ── fixed-term (Pendle PT) holdings ─────────────────────────────────────────
+
+MATURITY = datetime(2027, 3, 1, tzinfo=UTC)
+
+
+def fixed_term(instrument_id: str, *, apy: float = 10.0, maturity=MATURITY) -> Vault:
+    return vault(instrument_id, apy=apy).model_copy(update={"maturity": maturity})
+
+
+def test_a_pt_inside_the_notice_window_is_reported() -> None:
+    report = drift_core.evaluate(
+        mandate(),
+        book(holding("pt", 1_000)),
+        policy(),
+        target=target(("pt", 1.0)),
+        known_instruments=[fixed_term("pt")],
+        as_of=MATURITY - timedelta(days=drift_core.MATURITY_NOTICE_DAYS),
+    )
+
+    [found] = reasons_of(report, "maturity")
+    assert found.instrument_id == "pt"
+    assert found.days_to_maturity == drift_core.MATURITY_NOTICE_DAYS
+    assert found.matured is False
+    assert found.position_usd == 1_000
+    assert report.drifted is True
+
+
+def test_a_pt_outside_the_notice_window_is_quiet() -> None:
+    report = drift_core.evaluate(
+        mandate(),
+        book(holding("pt", 1_000)),
+        policy(),
+        target=target(("pt", 1.0)),
+        known_instruments=[fixed_term("pt")],
+        as_of=MATURITY - timedelta(days=drift_core.MATURITY_NOTICE_DAYS + 1),
+    )
+
+    assert reasons_of(report, "maturity") == []
+    assert report.drifted is False
+
+
+def test_a_matured_pt_held_off_shelf_is_reported_not_left_unscorable() -> None:
+    """Upstream delists a PT at maturity while the book still holds it. Read
+    back by id, it is reported for what it is -- matured -- rather than as a
+    holding drift cannot see."""
+    report = drift_core.evaluate(
+        mandate(),
+        book(holding("pt", 1_000)),
+        policy(),
+        target=target(("pt", 1.0)),
+        known_instruments=[vault("vault-b", apy=4.0)],
+        held_off_shelf=[fixed_term("pt")],
+        as_of=MATURITY + timedelta(days=3),
+    )
+
+    [found] = reasons_of(report, "maturity")
+    assert found.matured is True
+    assert found.days_to_maturity == 0
+    assert not any(
+        "absent from the shelf" in reason.because
+        for reason in reasons_of(report, "unevaluated")
+    )
+    # Off-shelf rows describe the book, not the shelf.
+    assert report.shelf is not None
+    assert report.shelf.instrument_ids == ("vault-b",)
+
+
+def test_a_maturing_holding_is_not_measured_for_an_uplift() -> None:
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(holding("pt", 1_000)),
+        policy(),
+        target=target(("pt", 1.0)),
+        known_instruments=[fixed_term("pt", apy=4.0), vault("vault-b", apy=9.0)],
+        as_of=MATURITY - timedelta(days=2),
+    )
+
+    assert reasons_of(report, "opportunity") == []
+    assert len(reasons_of(report, "maturity")) == 1
+
+
+def test_a_fixed_term_candidate_must_repay_inside_its_own_term() -> None:
+    """A PT pays its rate until maturity only, so a switch into one that would
+    repay in a year but not before the PT matures is not an opportunity."""
+    as_of = MATURITY - timedelta(days=20)
+    held = holding("vault-a", 100)
+    report = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(held),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[vault("vault-a", apy=5.0), fixed_term("pt", apy=5.6)],
+        as_of=as_of,
+    )
+    open_ended = drift_core.evaluate(
+        mandate(min_uplift_bps=50),
+        book(held),
+        policy(),
+        target=target(("vault-a", 1.0)),
+        known_instruments=[vault("vault-a", apy=5.0), vault("pt", apy=5.6)],
+        as_of=as_of,
+    )
+
+    # Same uplift, same cost: repays inside a year, not inside 20 days.
+    [found] = reasons_of(open_ended, "opportunity")
+    assert 20 < found.payback_days < 365
+    assert reasons_of(report, "opportunity") == []

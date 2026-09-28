@@ -12,7 +12,13 @@ from typing import Annotated, Any, ParamSpec, TypeVar
 import typer
 
 from open_allocator.core import allocator as allocation_core
-from open_allocator.core import apy_accounting, eligibility, metrics, universe
+from open_allocator.core import (
+    apy_accounting,
+    eligibility,
+    fixed_rate,
+    metrics,
+    universe,
+)
 from open_allocator.core import backtest as backtest_core
 from open_allocator.core import costs as costs_core
 from open_allocator.core import drift as drift_core
@@ -119,6 +125,36 @@ def _withdraw_executor(
         amount=amount,
         confirm=confirm,
     )
+
+
+def _held_off_shelf(
+    positions_snapshot: positions_core.Positions,
+    shelf: Sequence[Vault],
+) -> list[Vault]:
+    """Held instruments the shelf no longer lists — a matured PT, most often.
+
+    Only opens a client when something held is actually missing.
+    """
+    listed = {vault.instrument_id for vault in shelf}
+    # A levered holding's id is its loop id, which names no instrument.
+    missing = [
+        holding.instrument_id
+        for holding in positions_snapshot.holdings
+        if holding.levered is None and holding.instrument_id not in listed
+    ]
+    if not missing:
+        return []
+    with OneTxClient(ReadOnlyOneTxConfig()) as client:
+        off_shelf, skipped = universe.held_off_shelf(client, missing, shelf)
+    if skipped:
+        _write_json(
+            {
+                "warning": "held_instruments_unreadable",
+                "instruments": [s.model_dump() for s in skipped],
+            },
+            err=True,
+        )
+    return off_shelf
 
 
 def _discover_vaults(*, enrich: bool = False) -> list[Vault]:
@@ -1136,6 +1172,11 @@ def _vault_summary(vault: Vault, score: VaultScore) -> JsonObject:
         # max_leverage times that, which no weight cap can see.
         "levered": vault.is_levered,
         "max_leverage": vault.max_leverage,
+        # A fixed-term row's apy is the rate locked to maturity, and its risk
+        # metrics are the holder's mark-to-market path (core.fixed_rate).
+        "maturity": vault.maturity.isoformat() if vault.maturity else None,
+        "days_to_maturity": fixed_rate.days_to_maturity(vault),
+        "term_return_pct": vault.term_return_pct,
         "score": score.score,
         "risk_metrics": _risk_metrics(vault),
     }
@@ -1466,6 +1507,11 @@ def build_allocation(
         chain_by_instrument=chain_by_instrument,
         apy_by_instrument={v.instrument_id: v.apy for v in discovered},
         base_apy_by_instrument={v.instrument_id: v.apy_base for v in discovered},
+        term_days_by_instrument={
+            v.instrument_id: float(days)
+            for v in discovered
+            if (days := fixed_rate.days_to_maturity(v)) is not None
+        },
         source_chain_id=source_chain_id,
         params=_live_cost_params(allocation, chain_by_instrument, source_chain_id),
     )
@@ -1681,6 +1727,8 @@ def drift(
         if positions_path is not None
         else positions_core.Positions.model_validate(_positions_payload(None))
     )
+    shelf = _discover_vaults(enrich=True)
+    off_shelf = _held_off_shelf(positions_snapshot, shelf)
     return drift_core.evaluate(
         mandate,
         positions_snapshot,
@@ -1688,7 +1736,8 @@ def drift(
         target=(
             _read_allocation(allocation_path) if allocation_path is not None else None
         ),
-        known_instruments=_discover_vaults(enrich=True),
+        known_instruments=shelf,
+        held_off_shelf=off_shelf,
         previous_shelf=(
             _read_json(previous_shelf_path) if previous_shelf_path is not None else None
         ),

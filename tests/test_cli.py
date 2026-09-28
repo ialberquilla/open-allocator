@@ -743,6 +743,9 @@ def test_list_vaults_returns_json_array_with_summaries(
         "tvl_usd": 10_000_000.0,
         "levered": False,
         "max_leverage": None,
+        "maturity": None,
+        "days_to_maturity": None,
+        "term_return_pct": None,
         "score": pytest.approx(payload[0]["score"]),
         "risk_metrics": payload[0]["risk_metrics"],
     }
@@ -762,6 +765,9 @@ def test_list_vaults_returns_json_array_with_summaries(
         "tvl_usd",
         "levered",
         "max_leverage",
+        "maturity",
+        "days_to_maturity",
+        "term_return_pct",
         "score",
         "risk_metrics",
     }
