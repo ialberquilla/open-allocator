@@ -245,8 +245,49 @@ bridged.
 factor). Debt is read from the pool's own account data, which is also how a
 held position is attributed to a pair; a pool whose debt cannot be attributed
 to one loop is an error rather than a gross figure. `withdraw` and `rebalance`
-refuse to trade a levered position — it is unwound by a loop close, which
-nothing here builds yet.
+refuse to trade a levered position — it is unwound by `loop-close`.
+
+**Standalone loop commands.** `loop-open --loop <id> --amount <usd> --leverage
+<x>` opens one loop next to the held book without restating the book as an
+allocation. Caps are scored against the book the open produces (held positions,
+loops at equity, plus the new loop) and the per-cycle gates against the open
+alone. It is funded only from idle USDC on the loop's chain — it never sells or
+bridges — so `bridge --from <chain> --to <chain> --amount <usdc>` is how that
+USDC gets there. `loop-close --loop <id>` unwinds one loop as one atomic
+bundle, with the venue's measurement checked against the model before signing
+and the e-mode change announced with every position it re-prices. Each command
+dry-runs without `--confirm` and keeps its own idempotency scope, so a rerun
+resumes rather than repeats.
+
+### Fixed-term instruments are measured as held
+
+A row with a `maturity` (a Pendle PT, `sector: FIXED_RATE`) publishes the
+**implied rate** — what buying now and holding to maturity returns, annualized
+— next to `days_to_maturity` and `term_return_pct`. That rate's history is not
+a holder's return: a holder earns the PT's price change, and the price falls
+when rates rise. `core.fixed_rate` restates the history as the holder's
+mark-to-market path (`price = (1 + r) ** -T`, annualized per day) at the point
+history is attached, so Sharpe, drawdown, `apy_stability`, `backtest` and the
+diversification metrics all read the holder's exposure without knowing what a
+PT is. A constant implied rate returns exactly that rate every day, so a PT held
+to maturity is not penalised for anything it does not face.
+
+Three other surfaces account for the term:
+
+- **Costs.** A fixed-term leg that matures inside the year is re-entered to
+  stay invested, so `cost_estimate.rollover_cost_usd_year1` charges its entry
+  again per rollover (continuous, `365 / term − 1`) and `net_apy_pct_year1`
+  subtracts it. `total_expected_cost_usd` stays what this deploy costs.
+- **Accounting.** `apy_accounting` reports `fixed_term_weight_bps` and
+  `earliest_maturity`, and a `fixed_term:` warning says the rate is locked to
+  maturity only.
+- **Drift.** A held PT within `MATURITY_NOTICE_DAYS` of maturity, or past it,
+  is a `maturity` reason. 1Tx delists a PT at maturity while it is still held,
+  so `drift` reads held rows that are absent from the shelf back by id instead
+  of losing them. A held PT is compared with alternatives at its **current**
+  implied rate — what holding on earns from here; the entry rate is sunk — and
+  a switch into a fixed-term candidate has to repay before that candidate
+  matures.
 
 Gas in that block is priced from **live** chain state — the source chain's gas
 price and an on-chain Chainlink ETH/USD feed — and `cost_estimate.gas_priced_live`
@@ -319,8 +360,8 @@ blocks.
   parameters, which carry no liquidation threshold, so a loop that `execute`
   admits on its effective threshold can fail them. Only `execute`/`build-tx`
   read the venue's parameters and compare its simulated HF with the model.
-- **Nothing services or unwinds a loop yet.** There is no loop close, adjust,
-  claim-and-repay or HF watch in this repository; a held loop is reported, not
+- **Nothing services a loop.** `loop-close` unwinds one on request, but there
+  is no adjust, claim-and-repay or HF watch; a held loop is reported, not
   managed.
 - **A levered quote is rate arithmetic on a snapshot.** It does not model our
   own market impact — borrowing at size moves the rate that was just quoted —
@@ -328,6 +369,13 @@ blocks.
   on whether anything will unwind the position when a floor breaks. On a
   cross-asset loop the health factor **is** the depeg budget, not only a
   liquidation guard, and at high leverage that budget is a few percent.
+- **A PT's price impact is not in the cost estimate.** Entry and exit cross the
+  PT's own AMM, and the impact grows with size; the estimate charges the flat
+  expected spread only. `slippage_bps` bounds the fill, and the 1Tx quote at
+  build time is the number to read before a large PT trade.
+- **Rollover cost assumes a like successor.** `rollover_cost_usd_year1` prices
+  each re-entry like this one; it does not know whether a next maturity will be
+  listed, or at what rate.
 - **Unmeasured reward liquidity is not zero and is not a pass.**
   `equity_cap_for_reward_liquidity` returns `None` when the reward token's
   volume is unmeasured, and any cap reading that `None` has to fail closed.
