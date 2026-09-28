@@ -36,6 +36,7 @@ The registered CLI commands are exactly:
 - `rebalance`
 - `withdraw`
 - `loop-close`
+- `loop-open`
 - `bridge`
 <!-- command-inventory:end -->
 
@@ -133,6 +134,23 @@ so de-risking does not require first deciding where the proceeds go.
 4. Wait for approval, then run `loop-close --confirm`. The bundle goes out as one
    atomic operation; a signer that cannot batch is refused, because a half-unwound
    loop is a levered position with its collateral withdrawn.
+
+## Loop Open Loop
+
+Use this to add one levered loop to the held book. `execute` scores its allocation as
+the whole book, so a single loop leg fails every concentration cap however small it
+is. This scores the book the open produces — held positions, loops at equity, plus
+the new loop — against the caps, and the open alone against the per-cycle gates.
+
+1. Identify the loop id; it must be listed by the loop screen, on a chain where the
+   wallet already holds enough idle USDC. The open never sells or bridges to fund itself.
+2. Dry-run it: `loop-open --loop <loop id> --amount <usd> --leverage <x>` without
+   `--confirm` checks policy, builds and simulates the bundle, and sends nothing.
+3. Announce the `policy_result`, the simulated health factor, and the announcement's
+   `account_config` and `pool_positions`: an open that switches e-mode re-prices every
+   other position in that pool.
+4. Wait for approval, then run the same command with `--confirm`. The bundle goes out
+   as one atomic operation and is logged as `loop_open` at its equity.
 
 ## Bridge Loop
 

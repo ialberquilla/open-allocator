@@ -142,10 +142,12 @@ def close(
     return report
 
 
-def _target(loop_id: str, vaults: Sequence[Vault]) -> loops_exec.LoopTarget:
-    """The loop being closed, as the screen describes it.
+def _target(
+    loop_id: str, vaults: Sequence[Vault], *, verb: str = "closed"
+) -> loops_exec.LoopTarget:
+    """The loop being acted on, as the screen describes it.
 
-    A loop the screen no longer lists cannot be closed through this path: its
+    A loop the screen does not list cannot be acted on through this path: its
     legs and collateral token are what every check downstream is held against,
     and guessing them would defeat the checks rather than pass them.
     """
@@ -155,7 +157,7 @@ def _target(loop_id: str, vaults: Sequence[Vault]) -> loops_exec.LoopTarget:
             return loops_exec.LoopTarget.from_vault(vault)
     raise calldata.CalldataValidationError(
         f"loop {loop_id} is not in the discovered loop screen; it cannot be "
-        "closed through the loop path"
+        f"{verb} through the loop path"
     )
 
 
