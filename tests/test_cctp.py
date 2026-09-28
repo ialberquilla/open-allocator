@@ -386,6 +386,35 @@ def test_circle_is_asked_by_source_domain_and_transaction_hash() -> None:
     assert message.complete
 
 
+def test_a_null_pending_message_is_not_ready_rather_than_an_error() -> None:
+    # Circle may send `message` as null rather than "0x" before attesting.
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "messages": [
+                    {
+                        "message": None,
+                        "attestation": "PENDING",
+                        "eventNonce": None,
+                        "cctpVersion": 2,
+                        "status": "pending_confirmations",
+                        "delayReason": None,
+                    }
+                ]
+            },
+        )
+
+    [message] = circle(handler).messages(15, "0xfeed").messages
+
+    assert message.message == "0x"
+    assert not message.complete
+    assert (
+        cctp.select_attestation([message], "0x" + SOURCE.hex(), EXPECTED, burn_index=0)
+        is None
+    )
+
+
 def test_a_transaction_circle_has_not_seen_is_not_ready_rather_than_an_error() -> None:
     response = circle(lambda _request: httpx.Response(404, json={"error": "x"}))
 
