@@ -44,11 +44,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import UTC, date, datetime
 from typing import Any, Literal, TypeAlias
 
 from pydantic import Field
 
-from open_allocator.core import costs, diversify, simulate
+from open_allocator.core import costs, diversify, fixed_rate, simulate
 from open_allocator.core import policy as policy_core
 from open_allocator.core.mandate import Mandate
 from open_allocator.core.positions import Positions
@@ -74,6 +75,11 @@ _SWITCH_CROSSINGS = 2
 # Horizon the switch must repay within. Not a new knob: it is the same year-1
 # window ``costs.CostEstimate.net_apy_pct_year1`` already reports against.
 _PAYBACK_HORIZON_DAYS = 365.0
+# How far ahead of maturity a fixed-term holding is reported. Redeeming at
+# maturity is 1:1 with no AMM leg, so the roll is timed *to* maturity, not
+# before it — this is notice to plan the successor, and a matured holding earns
+# nothing from that day until it is redeemed.
+MATURITY_NOTICE_DAYS = 7
 
 
 class WeightBandReason(FrozenModel):
@@ -136,6 +142,24 @@ class OpportunityReason(FrozenModel):
     payback_days: float
 
 
+class MaturityReason(FrozenModel):
+    """A fixed-term holding is at or near the date it stops paying.
+
+    A PT earns its locked rate until maturity and nothing after it: it sits at
+    par until someone redeems it. None of the other checks see that — the
+    weights have not moved and the position's value has not dropped — so a
+    matured book reads as perfectly compliant while its yield is zero.
+    """
+
+    type: Literal["maturity"] = "maturity"
+    instrument_id: str
+    maturity: date
+    days_to_maturity: int
+    matured: bool
+    position_usd: float
+    notice_days: int = MATURITY_NOTICE_DAYS
+
+
 class UnevaluatedReason(FrozenModel):
     """A check the mandate asks for that could not be run.
 
@@ -152,6 +176,7 @@ class UnevaluatedReason(FrozenModel):
 DriftReason: TypeAlias = (
     WeightBandReason
     | OpportunityReason
+    | MaturityReason
     | SleeveBandReason
     | PolicyViolationReason
     | ShelfChangeReason
@@ -214,8 +239,10 @@ def evaluate(
     *,
     target: Allocation | Mapping[str, object] | None = None,
     known_instruments: Iterable[Vault | Mapping[str, object]] = (),
+    held_off_shelf: Iterable[Vault | Mapping[str, object]] = (),
     previous_shelf: object | None = None,
     cost_params: costs.CostParams | None = None,
+    as_of: datetime | None = None,
 ) -> DriftReport:
     """Compare a book against the mandate that governs it.
 
@@ -224,12 +251,27 @@ def evaluate(
     history the independence floor is measured from, and defining today's shelf
     for `shelf_change` -- so an empty one degrades three checks rather than
     silently passing them.
+
+    `held_off_shelf` is instruments the book holds that the shelf no longer
+    lists, read back by id -- a matured PT is delisted while it is still held.
+    They describe the book, so every check about the book sees them, but they
+    are not the shelf, so `shelf_change` does not.
     """
     positions_model = _positions(positions)
     policy_model = _policy(policy)
-    vaults = tuple(_vault(item) for item in known_instruments)
+    shelf_vaults = tuple(_vault(item) for item in known_instruments)
+    shelf_ids = {vault.instrument_id for vault in shelf_vaults}
+    vaults = (
+        *shelf_vaults,
+        *(
+            vault
+            for vault in (_vault(item) for item in held_off_shelf)
+            if vault.instrument_id not in shelf_ids
+        ),
+    )
     vault_by_id = {vault.instrument_id: vault for vault in vaults}
     held = _held_bps(positions_model)
+    now = as_of or datetime.now(UTC)
 
     current = _as_allocation(positions_model, held)
     reasons: list[DriftReason] = []
@@ -237,11 +279,14 @@ def evaluate(
     reasons.extend(_weight_band_reasons(mandate, held, target))
     reasons.extend(_sleeve_band_reasons(mandate, held, vault_by_id))
     reasons.extend(_policy_reasons(current, policy_model, vaults))
+    reasons.extend(_maturity_reasons(positions_model, held, vault_by_id, now))
     reasons.extend(
-        _opportunity_reasons(mandate, positions_model, held, vault_by_id, cost_params)
+        _opportunity_reasons(
+            mandate, positions_model, held, vault_by_id, cost_params, now
+        )
     )
 
-    shelf = ShelfSnapshot.of(vault_by_id) if vaults else None
+    shelf = ShelfSnapshot.of(shelf_ids) if shelf_vaults else None
     reasons.extend(_shelf_reasons(shelf, previous_shelf))
 
     return DriftReport(
@@ -374,12 +419,46 @@ def _gas_confidence_ok(chain_id: int, params: costs.CostParams) -> bool:
     return chain_id not in params.l1_chain_ids
 
 
+def _maturity_reasons(
+    positions: Positions,
+    held: Mapping[str, int],
+    vault_by_id: Mapping[str, Vault],
+    now: datetime,
+) -> list[DriftReason]:
+    """Fixed-term holdings within notice of maturity, or already past it.
+
+    Runs without a mandate knob: whether a book is earning anything at all is
+    not a tolerance question.
+    """
+    usd_by_id = _usd_by_instrument(positions)
+    reasons: list[DriftReason] = []
+    for instrument_id in sorted(held):
+        vault = vault_by_id.get(instrument_id)
+        if vault is None or vault.maturity is None:
+            continue
+        days = fixed_rate.days_to_maturity(vault, as_of=now)
+        assert days is not None
+        if days > MATURITY_NOTICE_DAYS:
+            continue
+        reasons.append(
+            MaturityReason(
+                instrument_id=instrument_id,
+                maturity=vault.maturity.date(),
+                days_to_maturity=days,
+                matured=days == 0,
+                position_usd=round(usd_by_id.get(instrument_id, 0.0), 2),
+            )
+        )
+    return reasons
+
+
 def _opportunity_reasons(
     mandate: Mandate,
     positions: Positions,
     held: Mapping[str, int],
     vault_by_id: Mapping[str, Vault],
     cost_params: costs.CostParams | None,
+    now: datetime | None = None,
 ) -> list[DriftReason]:
     """Is a better-paying instrument available in a holding's own sleeve?
 
@@ -450,10 +529,15 @@ def _opportunity_reasons(
         if tier is not None:
             by_tier.setdefault(str(tier["name"]), []).append(vault)
 
+    now = now or datetime.now(UTC)
     reasons: list[DriftReason] = []
     unpriced: list[str] = []
     for instrument_id in sorted(held):
         current = vault_by_id[instrument_id]
+        if _within_notice(current, now):
+            # Its rate is ending, not being beaten; `maturity` reports it, and
+            # a stale implied rate is no yield to measure an uplift from.
+            continue
         tier = _tier_for(score_vault(current).score, tiers)
         if tier is None:
             continue
@@ -463,6 +547,7 @@ def _opportunity_reasons(
             vault
             for vault in by_tier.get(sleeve, ())
             if vault.instrument_id not in held
+            and not _within_notice(vault, now)
             and vault.apy_base is not None
             and current.apy_base is not None
             and vault.apy_base > current.apy_base
@@ -498,7 +583,14 @@ def _opportunity_reasons(
         if annual_gain_usd <= 0:
             continue
         payback_days = round_trip_usd / (annual_gain_usd / 365.0)
-        if payback_days > _PAYBACK_HORIZON_DAYS:
+        # A fixed-term candidate pays its rate only until it matures, so the
+        # switch has to repay inside that term, not inside a year it will not
+        # be paying for.
+        horizon = _PAYBACK_HORIZON_DAYS
+        best_term = fixed_rate.days_to_maturity(best, as_of=now)
+        if best_term is not None:
+            horizon = min(horizon, float(best_term))
+        if payback_days > horizon:
             continue
 
         reasons.append(
@@ -530,6 +622,11 @@ def _opportunity_reasons(
             )
         )
     return reasons
+
+
+def _within_notice(vault: Vault, now: datetime) -> bool:
+    days = fixed_rate.days_to_maturity(vault, as_of=now)
+    return days is not None and days <= MATURITY_NOTICE_DAYS
 
 
 def _usd_by_instrument(positions: Positions) -> dict[str, float]:

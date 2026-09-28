@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Literal, TypeAlias
 
@@ -91,6 +91,15 @@ class Vault(FrozenModel):
     # hardcoded here, per the Dynamic Universe Rule. None = upstream has not
     # classified it; see sector_bucket for what that costs.
     sector: str | None = None
+    # Fixed-term instruments (a Pendle PT) redeem at par on this date and earn
+    # nothing after it. ``apy`` is then the implied rate locked by buying now,
+    # annualized over the remaining term — not a rate that keeps paying. None
+    # for every open-ended instrument. See :mod:`open_allocator.core.fixed_rate`.
+    maturity: datetime | None = None
+    days_to_maturity: int | None = Field(default=None, ge=0)
+    # What buying now and holding to maturity returns over the remaining term,
+    # in percent — the un-annualized form of ``apy``.
+    term_return_pct: float | None = None
     is_stablecoin: bool | None = None
     # Advertised/headline APY. Keep this meaning until APY-basis migration is
     # explicit so additive split data cannot silently change allocations.
@@ -201,6 +210,11 @@ class Vault(FrozenModel):
     def accruing_apy(self) -> float | None:
         """Yield known to accrue into the yield-token share price."""
         return self.apy_base
+
+    @property
+    def fixed_term(self) -> bool:
+        """Whether this instrument redeems at par on a maturity date."""
+        return self.maturity is not None
 
 
 def levered_ltv_floor(vault: Vault) -> float | None:

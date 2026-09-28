@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import cast, get_args
 
 from pydantic import BaseModel
@@ -75,6 +76,34 @@ def discover_instruments(
     return vaults, tuple(skipped)
 
 
+def held_off_shelf(
+    client: object,
+    held_ids: Iterable[str],
+    shelf: Iterable[Vault],
+) -> tuple[list[Vault], tuple[SkippedInstrument, ...]]:
+    """Held instruments the shelf does not list, read back one by one.
+
+    Discovery serves active rows only, and a fixed-term row is deactivated at
+    maturity while the account still holds it until it is redeemed. Without
+    this the held row is simply absent, and "absent from the shelf" is all
+    anything downstream can say about a position that has in fact stopped
+    paying. Not policy-narrowed: these describe the book, not a choice.
+    """
+    listed = {vault.instrument_id for vault in shelf}
+    vaults: list[Vault] = []
+    skipped: list[SkippedInstrument] = []
+    for instrument_id in dict.fromkeys(held_ids):
+        if instrument_id in listed:
+            continue
+        try:
+            vaults.append(_to_vault(client.get_instrument(instrument_id)))
+        except Exception as error:  # noqa: BLE001 — reported, never fatal
+            skipped.append(
+                SkippedInstrument(instrument_id=instrument_id, reason=str(error))
+            )
+    return vaults, tuple(skipped)
+
+
 def _identify(instrument: object, position: int) -> str:
     """Best-effort id for an instrument we already failed to parse."""
     found = _value(instrument, "instrument_id", "instrumentId")
@@ -142,6 +171,11 @@ def _to_vault(instrument: object) -> Vault:
         ),
         asset_category=_optional_text(instrument, "asset_category", "assetCategory"),
         sector=_optional_text(instrument, "sector"),
+        maturity=_optional_datetime(instrument, "maturity"),
+        days_to_maturity=_optional_int(
+            instrument, "days_to_maturity", "daysToMaturity"
+        ),
+        term_return_pct=_optional_float(instrument, "term_return_pct", "termReturnPct"),
         is_stablecoin=_optional_bool(instrument, "is_stablecoin", "isStablecoin"),
         apy=float(_required(instrument, "apy", "current_apy", "currentApy")),
         tvl_usd=float(_required(instrument, "tvl_usd", "tvlUsd", "tvl")),
@@ -205,6 +239,21 @@ def _optional_text(value: object, *names: str) -> str | None:
     if found is _MISSING or found is None:
         return None
     return str(found)
+
+
+def _optional_datetime(value: object, *names: str) -> datetime | None:
+    found = _value(value, *names)
+    if found is _MISSING or found is None:
+        return None
+    if isinstance(found, datetime):
+        moment = found
+    elif isinstance(found, str):
+        moment = datetime.fromisoformat(found.replace("Z", "+00:00"))
+    else:
+        raise TypeError(f"{names[0]} must be an ISO-8601 timestamp")
+    # A maturity without a zone is read as UTC, the zone upstream writes in, so
+    # every comparison against "now" is between aware datetimes.
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def _optional_reward_basis(value: object) -> RewardPriceBasis | None:

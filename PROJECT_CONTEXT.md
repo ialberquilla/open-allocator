@@ -60,4 +60,5 @@ Users control the wallet. The signer is composed from three independent axes —
 - Policy violations abort before any transaction is built or signed.
 - Agents must announce exact vaults, chains, amounts, risks, and expected transactions before asking for confirmation.
 - ERC-4626 exits use share balances, not USDC value guesses.
+- A fixed-term instrument's rate history is measured as its holder's mark-to-market path, never as an accrual series; its APY is locked only to maturity, and drift reports a holding approaching or past it.
 - A smart account submits a plan's steps for one chain as a single atomic operation. This is not an optimisation: the paymaster charges after execution, so batching is what lets an exit pay its gas out of what it just redeemed. Splitting a plan back into one operation per step breaks gasless exits.

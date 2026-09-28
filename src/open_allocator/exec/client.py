@@ -56,6 +56,10 @@ class Instrument(OneTxModel):
     is_active: bool = Field(alias="isActive")
     is_stablecoin: bool = Field(alias="isStablecoin")
     asset_category: str | None = Field(default=None, alias="assetCategory")
+    sector: str | None = None
+    maturity: str | None = None
+    days_to_maturity: int | None = Field(default=None, alias="daysToMaturity", ge=0)
+    term_return_pct: float | None = Field(default=None, alias="termReturnPct")
 
 
 class LoopCollateralLeg(OneTxModel):
@@ -831,6 +835,17 @@ class OneTxClient:
     def list_instruments(self, **filters: object) -> InstrumentsListResponse:
         payload = self._request_json("GET", "/instruments", query=_aliases(filters))
         return InstrumentsListResponse.model_validate(payload)
+
+    def get_instrument(self, instrument_id: str) -> Instrument:
+        """One instrument by id, listed or not.
+
+        ``list_instruments`` serves active rows only, and a fixed-term row is
+        deactivated at maturity while it is still held until redeemed. This is
+        how a held row that has left the shelf is read back.
+        """
+        escaped_id = quote(instrument_id, safe="")
+        payload = self._request_json("GET", f"/instruments/{escaped_id}")
+        return Instrument.model_validate(payload)
 
     def metrics_bulk(
         self,

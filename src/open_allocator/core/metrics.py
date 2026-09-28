@@ -6,6 +6,7 @@ from math import sqrt
 
 from pydantic import BaseModel
 
+from open_allocator.core import fixed_rate
 from open_allocator.core.types import Unknown, Vault
 
 _MISSING = object()
@@ -37,12 +38,14 @@ def attach_series(client: object, vaults: Iterable[Vault], days: int) -> list[Va
     for vault in vault_list:
         points = _metric_points(metrics_by_id.get(vault.instrument_id))
         attached.append(
-            vault.model_copy(
-                update={
-                    "apy_series": _series(points, "apy"),
-                    "apy_daily": _daily_series(points, "apy"),
-                    "tvl_usd_series": _series(points, "tvl_usd", "tvlUsd", "tvl"),
-                }
+            fixed_rate.with_holder_path(
+                vault.model_copy(
+                    update={
+                        "apy_series": _series(points, "apy"),
+                        "apy_daily": _daily_series(points, "apy"),
+                        "tvl_usd_series": _series(points, "tvl_usd", "tvlUsd", "tvl"),
+                    }
+                )
             )
         )
     return attached
@@ -63,13 +66,23 @@ def enrich(client: object, vaults: Iterable[Vault], days: int) -> list[Vault]:
     for vault in vault_list:
         instrument_metrics = metrics_by_id.get(vault.instrument_id)
         metric_points = _metric_points(instrument_metrics)
-        apy_series = _series(metric_points, "apy")
         tvl_series = _series(metric_points, "tvl_usd", "tvlUsd", "tvl")
+        # A fixed-term row's history is restated as its holder's return path
+        # before anything measures it, the stability factor included.
+        with_history = fixed_rate.with_holder_path(
+            vault.model_copy(
+                update={
+                    "apy_series": _series(metric_points, "apy"),
+                    "apy_daily": _daily_series(metric_points, "apy"),
+                }
+            )
+        )
+        apy_series = with_history.apy_series
         analysis = client.instrument_analysis(vault.instrument_id)
 
         updates: dict[str, object] = {
             "apy_series": apy_series,
-            "apy_daily": _daily_series(metric_points, "apy"),
+            "apy_daily": with_history.apy_daily,
             "tvl_usd_series": tvl_series,
             "apy_stability": _preserve_known(
                 _coefficient_of_variation(apy_series), vault.apy_stability
