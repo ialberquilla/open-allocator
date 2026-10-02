@@ -25,7 +25,9 @@ from open_allocator.exec.client import (
 from open_allocator.exec.execute import WalletPreparation
 from open_allocator.exec.funding import FundingRequirement
 from open_allocator.service import _common as service_common
+from open_allocator.service import allocation as allocation_service
 from open_allocator.service import positions as positions_service
+from open_allocator.service import universe as universe_service
 from open_allocator.service import wallet as wallet_service
 
 runner = CliRunner()
@@ -33,7 +35,14 @@ runner = CliRunner()
 
 # The CLI delegates to service modules that bind these collaborators themselves,
 # so a fake has to replace every binding or the service reaches the real one.
-_SURFACE_MODULES = (cli, service_common, wallet_service, positions_service)
+_SURFACE_MODULES = (
+    cli,
+    service_common,
+    wallet_service,
+    positions_service,
+    universe_service,
+    allocation_service,
+)
 
 
 def patch_surface(monkeypatch: pytest.MonkeyPatch, name: str, value: object) -> None:

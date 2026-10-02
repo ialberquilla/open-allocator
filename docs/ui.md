@@ -20,10 +20,13 @@ Clients that read a project [.mcp.json](../.mcp.json) pick it up from this repos
 
 Tools are named after the CLI commands and return the same objects, with these differences:
 
-- `positions` adds a `warnings` list. The CLI prints those warnings to stderr; over stdio, stdout is the protocol.
+- Every tool except `wallet-status`, `safe-address` and `rewards` adds a `warnings` list. The CLI prints those warnings to stderr; over stdio, stdout is the protocol.
+- `list-vaults` returns `{"vaults": [...], "warnings": [...]}` instead of a bare array.
+- `build-allocation` returns `{"allocation": {...}, "warnings": [...]}`. The `allocation` object is what `simulate` takes, unchanged, in place of the CLI's `--allocation` file.
+- Arguments are typed values, not CLI strings: `pins` and `strategy_params` are objects, `spec` is an allocation-spec object rather than a path. `policy_path` is still a path, resolved against the server's working directory.
 - Errors come back as `{"error": ..., "code": ...}` in the tool result; `code` is present for `ServiceError`.
 
-Exposed tools: `wallet-status`, `safe-address`, `positions`, `rewards`, all read-only.
+Exposed tools, all read-only: `wallet-status`, `safe-address`, `positions`, `rewards`, `list-vaults`, `score-vault`, `screen`, `build-allocation`, `simulate`.
 
 ## Invariants
 

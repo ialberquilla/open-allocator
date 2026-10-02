@@ -11,8 +11,6 @@
 
 [Quickstart](#quickstart) · [Talking to Your Agent](#talking-to-your-agent) · [The Mandate](#the-mandate) · [Commands](#commands) · [Configuration](#configuration) · [Safety](#safety) · [Disclaimer](#disclaimer)
 
-▶ **[Watch a full run](docs/media/demo-full-run.mp4)** — a plain-language ask → a policy-clean $10k book, the honest "this passed set is a Morpho-on-Base monoculture" finding, and a proposal artifact that signs nothing without your go-ahead.
-
 </div>
 
 OpenAllocator is an open-source, agent-operated DeFi yield allocator built on the [1Tx](https://app.1tx.fi/) API and run as a CLI. It discovers the live 1Tx instrument universe, scores yield venues transparently, builds policy-bounded allocations, and executes through a self-custody wallet — only after explicit confirmation.

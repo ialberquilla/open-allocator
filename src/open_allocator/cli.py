@@ -11,46 +11,32 @@ from typing import Annotated, Any, ParamSpec, TypeVar
 import typer
 
 from open_allocator.core import allocator as allocation_core
-from open_allocator.core import (
-    apy_accounting,
-    eligibility,
-    fixed_rate,
-    metrics,
-    universe,
-)
 from open_allocator.core import backtest as backtest_core
-from open_allocator.core import costs as costs_core
 from open_allocator.core import drift as drift_core
 from open_allocator.core import mandate as mandate_core
 from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
-from open_allocator.core import riskmetrics as riskmetrics_core
-from open_allocator.core import screen as screen_core
-from open_allocator.core import simulate as simulate_core
-from open_allocator.core import strategies as strategies_core
-from open_allocator.core.metrics import enrich as enrich_vaults
+from open_allocator.core import (
+    universe,
+)
 from open_allocator.core.policy_loader import load_policy
 from open_allocator.core.schema import validate
-from open_allocator.core.scoring import score_vault as score_vault_model
 from open_allocator.core.state import (
     ScopedIdempotencyStore,
     backend_from_config,
-    json_safe,
 )
 from open_allocator.core.types import (
     Allocation,
-    Policy,
     TxPlan,
-    Unknown,
     Vault,
-    VaultScore,
 )
-from open_allocator.exec import gas as gas_module
 from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
 from open_allocator.exec.execute import TransactionPlanError, plan_calldata_allocation
+from open_allocator.service import allocation as allocation_service
 from open_allocator.service import positions as positions_service
+from open_allocator.service import universe as universe_service
 from open_allocator.service import wallet as wallet_service
 from open_allocator.service._common import model_payload as _model_payload
 from open_allocator.service._common import signer_from_config
@@ -59,15 +45,6 @@ JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonObject = dict[str, Any]
 P = ParamSpec("P")
 R = TypeVar("R", bound=JsonValue)
-
-# History window for every command that fetches metrics.
-#
-# Must exceed `diversify.MIN_OVERLAP` (60), the *shared* days a pair needs
-# before it is scored at all: below that every pair is unmeasured, unmeasured
-# fails closed to "one bet", and `caps.min_effective_positions` becomes
-# impossible to satisfy rather than merely strict. Single-instrument metrics
-# (coefficient of variation, reward dependence) read the same window.
-HISTORY_DAYS = 180
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -84,7 +61,7 @@ class RiskPreset(StrEnum):
     AGGRESSIVE = "aggressive"
 
 
-DEFAULT_POLICY_PATH = Path("policy.yaml")
+DEFAULT_POLICY_PATH = allocation_service.DEFAULT_POLICY_PATH
 
 
 def _write_json(payload: JsonValue, *, err: bool = False) -> None:
@@ -158,9 +135,14 @@ def _held_off_shelf(
     return off_shelf
 
 
+def _warn(warning: JsonObject) -> None:
+    # stderr, not stdout: every command's stdout is one JSON object and callers
+    # parse it.
+    _write_json(warning, err=True)
+
+
 def _discover_vaults(*, enrich: bool = False) -> list[Vault]:
-    with OneTxClient(ReadOnlyOneTxConfig()) as client:
-        return _discover_vaults_from_client(client, enrich=enrich)
+    return universe_service.discover_vaults(enrich=enrich, on_warning=_warn)
 
 
 def _discover_vaults_from_client(
@@ -169,106 +151,18 @@ def _discover_vaults_from_client(
     enrich: bool = False,
     loops: bool = False,
 ) -> list[Vault]:
-    """The discovered universe; with ``loops``, plus every loopable pair.
-
-    Loop rows are levered synthetic instruments keyed by their loop id. They
-    are added for execution, where an allocation may name one, and are not yet
-    on the scored shelf.
-    """
-    vaults, skipped = universe.discover_instruments(client)
-    if skipped:
-        # stderr, not stdout: every command's stdout is one JSON object and
-        # callers parse it. A shrunk universe still has to be visible — an
-        # instrument silently missing looks exactly like one that never existed.
-        _write_json(
-            {
-                "warning": "skipped_instruments",
-                "instruments": [s.model_dump() for s in skipped],
-            },
-            err=True,
-        )
-    if enrich:
-        vaults = enrich_vaults(client, vaults, days=HISTORY_DAYS)
-    if loops:
-        from open_allocator.exec import loops as loops_exec
-
-        levered, skipped_loops = loops_exec.discover_loop_vaults(client, vaults)
-        if skipped_loops:
-            _write_json(
-                {
-                    "warning": "skipped_loops",
-                    "loops": [s.model_dump() for s in skipped_loops],
-                },
-                err=True,
-            )
-        vaults = [*vaults, *levered]
-    return vaults
-
-
-def _filter_vaults(
-    vaults: list[Vault],
-    *,
-    chain: int | None,
-    asset: str | None,
-    protocol: str | None,
-) -> list[Vault]:
-    return [
-        vault
-        for vault in vaults
-        if (chain is None or vault.chain_id == chain)
-        and (asset is None or vault.asset.casefold() == asset.casefold())
-        and (protocol is None or vault.protocol.casefold() == protocol.casefold())
-    ]
-
-
-def _score_by_instrument(vaults: list[Vault]) -> dict[str, VaultScore]:
-    return {vault.instrument_id: score_vault_model(vault) for vault in vaults}
-
-
-def _live_cost_params(
-    allocation: Allocation,
-    chain_by_instrument: Mapping[str, int],
-    source_chain_id: int | None,
-) -> costs_core.CostParams:
-    """Cost params with gas priced from live chain state where possible.
-
-    Only the *source* chain's gas is charged (every deposit signs there), but the
-    source may be inferred from the legs, so price every chain the allocation
-    touches and let ``CostParams`` pick. A failed read is not fatal: the params
-    fall back to static constants and the estimate reports
-    ``gas_priced_live: false`` rather than passing a guess off as a measurement.
-    """
-    chain_ids = [
-        chain_id
-        for chain_id in (
-            chain_by_instrument.get(leg.instrument_id) for leg in allocation.legs
-        )
-        if chain_id is not None
-    ]
-    if source_chain_id is not None:
-        chain_ids.append(source_chain_id)
-    return costs_core.CostParams(gas=gas_module.live_pricing(chain_ids))
+    return universe_service.discover_vaults_from_client(
+        client, enrich=enrich, loops=loops, on_warning=_warn
+    )
 
 
 def _read_allocation(path: Path) -> Allocation:
-    with path.open(encoding="utf-8") as file:
-        payload = json.load(file)
-
-    validate(payload, "allocation")
-    return Allocation.model_validate(payload)
+    return allocation_service.parse_allocation(_read_json(path))
 
 
 def _read_json(path: Path) -> object:
     with path.open(encoding="utf-8") as file:
         return json.load(file)
-
-
-def _load_allocation_spec(path: Path) -> JsonObject:
-    with path.open(encoding="utf-8") as file:
-        payload = json.load(file)
-
-    validate(payload, "allocation-spec")
-    return payload
 
 
 def _read_positions(path: Path) -> positions_core.Positions:
@@ -734,127 +628,6 @@ def _select_position(
     return matches[0]
 
 
-def _policy_candidate_vaults(
-    vaults: Sequence[Vault],
-    policy: Policy,
-) -> tuple[list[Vault], list[str]]:
-    candidates: list[Vault] = []
-    exclusions: list[str] = []
-
-    for vault in vaults:
-        rule = _policy_exclusion_rule(vault, policy)
-        if rule is None:
-            candidates.append(vault)
-        else:
-            exclusions.append(f"policy_excluded:{vault.instrument_id}:{rule}")
-
-    return candidates, exclusions
-
-
-def _policy_exclusion_rule(vault: Vault, policy: Policy) -> str | None:
-    # Single source of truth for per-vault policy eligibility.
-    return eligibility.candidate_exclusion(vault, policy)
-
-
-def _policy_violation_summary(result: policy_core.PolicyResult) -> list[str]:
-    return [
-        f"{violation.rule}:{violation.entity}:limit={violation.limit}:actual={violation.actual}"
-        for violation in result.violations
-    ]
-
-
-def _allocation_payload_with_policy_result(
-    allocation: Allocation,
-    result: policy_core.PolicyResult,
-    *,
-    discovered: Sequence[Vault],
-    candidates: Sequence[Vault],
-    exclusions: Sequence[str],
-    cost_estimate: costs_core.CostEstimate | None = None,
-) -> JsonObject:
-    metadata = dict(allocation.metadata)
-    warnings = [str(item) for item in metadata.get("warnings", [])]
-    warnings.extend(exclusions)
-    accounting = apy_accounting.for_allocation(allocation, discovered)
-    warnings.extend(accounting.warnings())
-    # Selection remains headline-based in this compatibility release.  The
-    # accounting block separately states whether accruing yield is measurable.
-    metadata["apy_basis"] = "advertised"
-    metadata["apy_accounting"] = accounting.model_dump(mode="json")
-    if cost_estimate is not None:
-        metadata["cost_estimate"] = cost_estimate.as_metadata()
-        cost_warning = cost_estimate.warning()
-        if cost_warning is not None:
-            warnings.append(cost_warning)
-    metadata.update(
-        {
-            "warnings": sorted(set(warnings)),
-            "policy_ok": result.ok,
-            "policy_violations": _policy_violation_summary(result),
-            "discovered_instruments": [vault.instrument_id for vault in discovered],
-            "candidate_instruments": [vault.instrument_id for vault in candidates],
-        }
-    )
-    payload = allocation.model_copy(update={"metadata": metadata}).model_dump(
-        mode="json"
-    )
-    validate(payload, "allocation")
-    return payload
-
-
-def _vault_summary(vault: Vault, score: VaultScore) -> JsonObject:
-    # `reward_apy` stays the advertised number — APY is descriptive here, and
-    # hiding what upstream said would make the row harder to check, not safer.
-    # `priced_reward_apy` is the one this allocator is willing to count, and it
-    # reads Unknown for a reward APY priced at the emission schedule rather
-    # than at a quote something would fill.
-    priced_reward = apy_accounting.priced_reward_apy(vault)
-    return {
-        "instrument_id": vault.instrument_id,
-        "protocol": vault.protocol,
-        "chain_id": vault.chain_id,
-        "asset": vault.asset,
-        "apy": vault.apy,
-        "advertised_apy": vault.apy,
-        "base_apy": vault.apy_base,
-        "reward_apy": vault.apy_reward,
-        "priced_reward_apy": (
-            priced_reward if priced_reward is not None else json_safe(Unknown)
-        ),
-        "reward_apy_basis": vault.reward_price_basis or "unknown",
-        "reward_tokens": list(vault.reward_tokens),
-        "reward_dependence": json_safe(vault.reward_dependence),
-        "tvl_usd": vault.tvl_usd,
-        # A levered row's usd value is its equity; its gross exposure is up to
-        # max_leverage times that, which no weight cap can see.
-        "levered": vault.is_levered,
-        "max_leverage": vault.max_leverage,
-        # A fixed-term row's apy is the rate locked to maturity, and its risk
-        # metrics are the holder's mark-to-market path (core.fixed_rate).
-        "maturity": vault.maturity.isoformat() if vault.maturity else None,
-        "days_to_maturity": fixed_rate.days_to_maturity(vault),
-        "term_return_pct": vault.term_return_pct,
-        "score": score.score,
-        "risk_metrics": _risk_metrics(vault),
-    }
-
-
-def _vault_score_payload(score: VaultScore, vault: Vault) -> JsonObject:
-    payload = score.model_dump(mode="json")
-    payload["risk_metrics"] = _risk_metrics(vault)
-    validate(payload, "vault-score")
-    return payload
-
-
-def _risk_metrics(vault: Vault) -> JsonObject:
-    # Yield-path risk only; never principal/depeg/contract loss. Unknown stays
-    # Unknown when history is insufficient.
-    return {
-        name: json_safe(value)
-        for name, value in riskmetrics_core.summary(vault).items()
-    }
-
-
 def _parse_pins(pins: list[str] | None) -> dict[str, float] | None:
     if not pins:
         return None
@@ -928,25 +701,6 @@ MinScreenTvlOption = Annotated[
 ]
 
 
-def _screen_criteria(
-    *,
-    min_sharpe: float | None,
-    max_drawdown: float | None,
-    max_reward_dependence: float | None,
-    min_history_days: int | None,
-    curators: list[str] | None,
-    min_tvl_usd: float | None,
-) -> screen_core.ScreenCriteria:
-    return screen_core.ScreenCriteria(
-        min_sharpe=min_sharpe,
-        max_drawdown=max_drawdown,
-        max_reward_dependence=max_reward_dependence,
-        min_history_days=min_history_days,
-        curators=tuple(curators) if curators else None,
-        min_tvl_usd=min_tvl_usd,
-    )
-
-
 @app.command("wallet-status")
 @json_command
 def wallet_status() -> JsonObject:
@@ -975,22 +729,13 @@ def list_vaults(
     protocol: Annotated[str | None, typer.Option("--protocol")] = None,
     sort: Annotated[VaultSort | None, typer.Option("--sort")] = None,
 ) -> list[JsonObject]:
-    vaults = _filter_vaults(
-        _discover_vaults(enrich=True),
+    return universe_service.list_vaults(
         chain=chain,
         asset=asset,
         protocol=protocol,
+        sort=sort.value if sort else None,
+        on_warning=_warn,
     )
-    scores = _score_by_instrument(vaults)
-
-    if sort == VaultSort.APY:
-        vaults.sort(key=lambda vault: vault.apy, reverse=True)
-    elif sort == VaultSort.TVL:
-        vaults.sort(key=lambda vault: vault.tvl_usd, reverse=True)
-    elif sort == VaultSort.SCORE:
-        vaults.sort(key=lambda vault: scores[vault.instrument_id].score, reverse=True)
-
-    return [_vault_summary(vault, scores[vault.instrument_id]) for vault in vaults]
 
 
 @app.command("score-vault")
@@ -998,11 +743,7 @@ def list_vaults(
 def score_vault(
     instrument_id: Annotated[str, typer.Option("--instrument-id")],
 ) -> JsonObject:
-    for vault in _discover_vaults(enrich=True):
-        if vault.instrument_id == instrument_id:
-            return _vault_score_payload(score_vault_model(vault), vault)
-
-    raise ValueError(f"instrument not found: {instrument_id}")
+    return universe_service.score_vault(instrument_id, on_warning=_warn)
 
 
 @app.command("build-allocation")
@@ -1094,91 +835,30 @@ def build_allocation(
         ),
     ] = None,
 ) -> JsonObject:
-    if strategy in {"list", "help"}:
-        # Discovery convenience: enumerate strategies without needing --amount.
-        return {"strategies": list(strategies_core.available())}
-    risk_value = risk.value
-    strategy_params = _parse_strategy_params(strategy_param)
-    overrides = _parse_pins(pin)
-    if spec is not None:
-        spec_data = _load_allocation_spec(spec)
-        selection = spec_data.get("selection", {})
-        amount = amount if amount is not None else spec_data.get("amount_usd")
-        risk_value = spec_data.get("risk", risk_value)
-        strategy = spec_data.get("strategy", strategy)
-        strategy_params = spec_data.get("params", strategy_params)
-        weights = spec_data.get("weights")
-        if weights:
-            overrides = {str(key): float(value) for key, value in weights.items()}
-        exclude = selection.get("exclude", exclude)
-        max_positions = selection.get("max_positions", max_positions)
-        min_position_usd = selection.get("min_position_usd", min_position_usd)
-        criteria = _screen_criteria(
-            min_sharpe=selection.get("min_sharpe"),
-            max_drawdown=selection.get("max_drawdown"),
-            max_reward_dependence=selection.get("max_reward_dependence"),
-            min_history_days=selection.get("min_history_days"),
-            curators=selection.get("curators"),
-            min_tvl_usd=selection.get("min_tvl_usd"),
-        )
-    else:
-        criteria = _screen_criteria(
+    return allocation_service.build_allocation(
+        amount,
+        risk=risk.value,
+        policy=policy_path,
+        spec=_read_json(spec) if spec is not None else None,
+        strategy=strategy,
+        strategy_params=_parse_strategy_params(strategy_param),
+        criteria=universe_service.screen_criteria(
             min_sharpe=min_sharpe,
             max_drawdown=max_drawdown,
             max_reward_dependence=max_reward_dependence,
             min_history_days=min_history_days,
             curators=screen_curator,
             min_tvl_usd=min_tvl_usd,
-        )
-
-    if amount is None:
-        raise ValueError("amount required: pass --amount or set amount_usd in the spec")
-
-    policy = load_policy(policy_path)
-    discovered = _discover_vaults(enrich=True)
-    candidates, exclusions = _policy_candidate_vaults(discovered, policy)
-    if criteria.active:
-        screened = screen_core.screen(candidates, criteria)
-        candidates = list(screened.kept)
-        exclusions = [*exclusions, *screened.warnings()]
-    scores = _score_by_instrument(discovered)
-    allocation = allocation_core.build_allocation(
-        [(vault, scores[vault.instrument_id]) for vault in candidates],
-        amount,
-        risk=risk_value,
-        caps=policy.caps,
-        caps_headroom_bps=caps_headroom_bps,
-        strategy=strategy,
-        strategy_params=strategy_params,
+        ),
         max_positions=max_positions,
         min_position_usd=min_position_usd,
-        overrides=overrides,
-        exclude=exclude,
         score_power=score_power,
         apy_weight=apy_weight,
-    )
-    result = policy_core.check(allocation, policy, discovered)
-    chain_by_instrument = {v.instrument_id: v.chain_id for v in discovered}
-    cost_estimate = costs_core.estimate_from_allocation_legs(
-        [leg.model_dump() for leg in allocation.legs],
-        chain_by_instrument=chain_by_instrument,
-        apy_by_instrument={v.instrument_id: v.apy for v in discovered},
-        base_apy_by_instrument={v.instrument_id: v.apy_base for v in discovered},
-        term_days_by_instrument={
-            v.instrument_id: float(days)
-            for v in discovered
-            if (days := fixed_rate.days_to_maturity(v)) is not None
-        },
+        caps_headroom_bps=caps_headroom_bps,
+        exclude=exclude,
+        pins=_parse_pins(pin),
         source_chain_id=source_chain_id,
-        params=_live_cost_params(allocation, chain_by_instrument, source_chain_id),
-    )
-    return _allocation_payload_with_policy_result(
-        allocation,
-        result,
-        discovered=discovered,
-        candidates=candidates,
-        exclusions=exclusions,
-        cost_estimate=cost_estimate,
+        on_warning=_warn,
     )
 
 
@@ -1197,7 +877,7 @@ def screen(
     Narrows only; policy (``check-policy``) still applies downstream and cannot
     be loosened by any screen.
     """
-    criteria = _screen_criteria(
+    criteria = universe_service.screen_criteria(
         min_sharpe=min_sharpe,
         max_drawdown=max_drawdown,
         max_reward_dependence=max_reward_dependence,
@@ -1205,31 +885,7 @@ def screen(
         curators=screen_curator,
         min_tvl_usd=min_tvl_usd,
     )
-    discovered = _discover_vaults(enrich=True)
-    scores = _score_by_instrument(discovered)
-    result = screen_core.screen(discovered, criteria)
-    return {
-        "label": "advisory-not-policy",
-        "criteria": {
-            "min_sharpe": criteria.min_sharpe,
-            "max_drawdown": criteria.max_drawdown,
-            "max_reward_dependence": criteria.max_reward_dependence,
-            "min_history_days": criteria.min_history_days,
-            "curators": list(criteria.curators) if criteria.curators else None,
-            "min_tvl_usd": criteria.min_tvl_usd,
-        },
-        "kept": [
-            _vault_summary(vault, scores[vault.instrument_id]) for vault in result.kept
-        ],
-        "dropped": [
-            {
-                "instrument_id": drop.instrument_id,
-                "rule": drop.rule,
-                "detail": drop.detail,
-            }
-            for drop in result.dropped
-        ],
-    }
+    return universe_service.screen(criteria, on_warning=_warn)
 
 
 @app.command("simulate")
@@ -1241,23 +897,11 @@ def simulate(
     ],
     benchmark: Annotated[str | None, typer.Option("--benchmark")] = None,
 ) -> JsonObject:
-    allocation = _read_allocation(allocation_path)
-    # Discovery supplies the sector labels; without it the output would show
-    # yield and stability but say nothing about how many sleeves the capital
-    # actually sits in. The dated history on top is what turns that label into
-    # a measurement — one extra bulk call, not one per instrument.
-    with OneTxClient(ReadOnlyOneTxConfig()) as client:
-        vaults = metrics.attach_series(
-            client,
-            _discover_vaults_from_client(client, enrich=False),
-            days=HISTORY_DAYS,
-        )
-        return simulate_core.simulate(
-            client,
-            allocation,
-            benchmark=benchmark,
-            vaults=vaults,
-        ).model_dump(mode="json")
+    return allocation_service.simulate(
+        _read_allocation(allocation_path),
+        benchmark=benchmark,
+        on_warning=_warn,
+    )
 
 
 @app.command("backtest")

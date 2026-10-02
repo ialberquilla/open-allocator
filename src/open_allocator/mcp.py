@@ -4,9 +4,9 @@ Thin by design, like the CLI. A tool parses nothing and decides nothing; it call
 one `open_allocator.service` function and returns its dict. Tool names are the CLI
 command names, so the AGENT_GUIDE workflows read the same over either surface.
 
-Only read-only commands are exposed. An execution tool must return a plan-required
-response and never accept a confirmation: approval is a human action outside the
-model's reach (see docs/ui.md).
+Only read-only and analysis commands are exposed. An execution tool must return a
+plan-required response and never accept a confirmation: approval is a human action
+outside the model's reach (see docs/ui.md).
 
 Run over stdio with `open-allocator-mcp` (needs the `mcp` extra). stdout carries the
 protocol, which is why nothing in the service layer may print.
@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Annotated, Any
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -24,18 +25,43 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from open_allocator import __version__
+from open_allocator.core import allocator as allocation_core
+from open_allocator.core import strategies as strategies_core
 from open_allocator.service import ServiceError
+from open_allocator.service import allocation as allocation_service
 from open_allocator.service import positions as positions_service
+from open_allocator.service import universe as universe_service
 from open_allocator.service import wallet as wallet_service
 
 JsonObject = dict[str, Any]
 
 INSTRUCTIONS = (
     "Open Allocator: a policy-bounded DeFi yield allocator on 1Tx. "
-    "Every tool returns the same JSON object as the CLI command of the same name. "
+    "Every tool returns the same JSON object as the CLI command of the same name, "
+    "plus a `warnings` list where the CLI would report warnings on stderr. "
+    "`list-vaults` wraps its rows as `vaults` and `build-allocation` its result "
+    "as `allocation`; pass that `allocation` object to `simulate` unchanged. "
     "APY figures are descriptive, not predictive. "
     "Fields reported as unknown or null are unknown; do not fill them in."
 )
+
+# Advisory screen arguments, shared by `screen` and `build-allocation`.
+MinSharpe = Annotated[
+    float | None, Field(description="Drop below this Sharpe (Unknown fails).")
+]
+MaxDrawdown = Annotated[
+    float | None,
+    Field(ge=0, description="Max tolerated NAV dip magnitude (0.1 == 10%)."),
+]
+MaxRewardDependence = Annotated[
+    float | None,
+    Field(ge=0, description="Drop above this reward dependence (Unknown fails)."),
+]
+MinHistoryDays = Annotated[
+    int | None, Field(ge=0, description="Require this many days of history.")
+]
+Curators = Annotated[list[str] | None, Field(description="Curator allowlist.")]
+MinTvlUsd = Annotated[float | None, Field(ge=0, description="Minimum TVL in USD.")]
 
 # Reads 1Tx and chain RPCs; changes nothing anywhere.
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
@@ -107,6 +133,193 @@ def build_mcp() -> MCPServer:
         """Claimable and pending protocol rewards for a wallet. Claim calldata
         expires at `expires_at`; `expired` says whether it already has."""
         return _call(positions_service.rewards, wallet, chain)
+
+    @server.tool(name="list-vaults", annotations=READ_ONLY)
+    def list_vaults(
+        chain: Annotated[int | None, Field(description="Chain id filter.")] = None,
+        asset: Annotated[str | None, Field(description="Asset symbol filter.")] = None,
+        protocol: Annotated[str | None, Field(description="Protocol filter.")] = None,
+        sort: Annotated[
+            Literal["apy", "tvl", "score"] | None,
+            Field(description="Sort descending by this field."),
+        ] = None,
+    ) -> JsonObject:
+        """The live universe with score, advertised and priced APY, TVL and
+        yield-path risk metrics per instrument. Risk metrics never cover
+        principal, depeg or contract loss."""
+        warnings: list[JsonObject] = []
+        vaults = _call(
+            universe_service.list_vaults,
+            chain=chain,
+            asset=asset,
+            protocol=protocol,
+            sort=sort,
+            on_warning=warnings.append,
+        )
+        return {"vaults": vaults, "warnings": warnings}
+
+    @server.tool(name="score-vault", annotations=READ_ONLY)
+    def score_vault(
+        instrument_id: Annotated[str, Field(description="Instrument id to score.")],
+    ) -> JsonObject:
+        """Score breakdown and risk metrics for one instrument."""
+        warnings: list[JsonObject] = []
+        score = _call(
+            universe_service.score_vault, instrument_id, on_warning=warnings.append
+        )
+        return {**score, "warnings": warnings}
+
+    @server.tool(name="screen", annotations=READ_ONLY)
+    def screen(
+        min_sharpe: MinSharpe = None,
+        max_drawdown: MaxDrawdown = None,
+        max_reward_dependence: MaxRewardDependence = None,
+        min_history_days: MinHistoryDays = None,
+        curators: Curators = None,
+        min_tvl_usd: MinTvlUsd = None,
+    ) -> JsonObject:
+        """Advisory metric screen over the live universe: what is kept, and what
+        is dropped by which rule. Narrows only; policy still applies downstream
+        and no screen can loosen it."""
+        warnings: list[JsonObject] = []
+        criteria = universe_service.screen_criteria(
+            min_sharpe=min_sharpe,
+            max_drawdown=max_drawdown,
+            max_reward_dependence=max_reward_dependence,
+            min_history_days=min_history_days,
+            curators=curators,
+            min_tvl_usd=min_tvl_usd,
+        )
+        result = _call(universe_service.screen, criteria, on_warning=warnings.append)
+        return {**result, "warnings": warnings}
+
+    @server.tool(name="build-allocation", annotations=READ_ONLY)
+    def build_allocation(
+        amount: Annotated[
+            float | None,
+            Field(ge=0, description="USD to allocate. Required unless in `spec`."),
+        ] = None,
+        risk: Annotated[
+            Literal["conservative", "balanced", "aggressive"],
+            Field(description="Risk preset."),
+        ] = "balanced",
+        policy_path: Annotated[
+            str,
+            Field(description="Policy YAML, relative to the server's directory."),
+        ] = str(allocation_service.DEFAULT_POLICY_PATH),
+        spec: Annotated[
+            dict[str, Any] | None,
+            Field(
+                description="Allocation-spec object (weights, or strategy + params "
+                "+ selection). What it sets wins over the matching arguments, "
+                "except `amount`."
+            ),
+        ] = None,
+        strategy: Annotated[
+            str,
+            Field(
+                description="Allocation strategy, one of: "
+                + ", ".join(strategies_core.available())
+            ),
+        ] = allocation_core.DEFAULT_STRATEGY,
+        strategy_params: Annotated[
+            dict[str, Any] | None, Field(description="Strategy parameters.")
+        ] = None,
+        min_sharpe: MinSharpe = None,
+        max_drawdown: MaxDrawdown = None,
+        max_reward_dependence: MaxRewardDependence = None,
+        min_history_days: MinHistoryDays = None,
+        curators: Curators = None,
+        min_tvl_usd: MinTvlUsd = None,
+        max_positions: Annotated[
+            int | None, Field(ge=1, description="Keep only the top-N positions.")
+        ] = None,
+        min_position_usd: Annotated[
+            float | None, Field(ge=0, description="Drop legs below this USD size.")
+        ] = None,
+        score_power: Annotated[
+            float | None, Field(ge=0, description="Override preset score exponent.")
+        ] = None,
+        apy_weight: Annotated[
+            float | None, Field(ge=0, description="Override the preset APY tilt.")
+        ] = None,
+        caps_headroom_bps: Annotated[
+            float,
+            Field(
+                ge=0,
+                description="Build under the policy's concentration caps by this "
+                "many bps, relative (300 = caps x 0.97). check-policy still scores "
+                "against the untightened policy.",
+            ),
+        ] = 0.0,
+        exclude: Annotated[
+            list[str] | None, Field(description="Instrument ids to veto.")
+        ] = None,
+        pins: Annotated[
+            dict[str, float] | None,
+            Field(description="Pinned weights by instrument id."),
+        ] = None,
+        source_chain_id: Annotated[
+            int | None,
+            Field(
+                description="Chain the wallet's USDC is funded on, for the cost "
+                "estimate. Defaults to the chain holding most of the deploy."
+            ),
+        ] = None,
+    ) -> JsonObject:
+        """A policy-checked allocation over the live universe, with a cost
+        estimate. Builds a proposal only; nothing is executed. Check
+        `metadata.policy_ok` and `metadata.warnings` before presenting it."""
+        warnings: list[JsonObject] = []
+        criteria = universe_service.screen_criteria(
+            min_sharpe=min_sharpe,
+            max_drawdown=max_drawdown,
+            max_reward_dependence=max_reward_dependence,
+            min_history_days=min_history_days,
+            curators=curators,
+            min_tvl_usd=min_tvl_usd,
+        )
+        allocation = _call(
+            allocation_service.build_allocation,
+            amount,
+            risk=risk,
+            policy=Path(policy_path),
+            spec=spec,
+            strategy=strategy,
+            strategy_params=strategy_params,
+            criteria=criteria,
+            max_positions=max_positions,
+            min_position_usd=min_position_usd,
+            score_power=score_power,
+            apy_weight=apy_weight,
+            caps_headroom_bps=caps_headroom_bps,
+            exclude=exclude,
+            pins=pins,
+            source_chain_id=source_chain_id,
+            on_warning=warnings.append,
+        )
+        return {"allocation": allocation, "warnings": warnings}
+
+    @server.tool(name="simulate", annotations=READ_ONLY)
+    def simulate(
+        allocation: Annotated[
+            dict[str, Any],
+            Field(description="The `allocation` object from build-allocation."),
+        ],
+        benchmark: Annotated[
+            str | None, Field(description="Benchmark to compare against.")
+        ] = None,
+    ) -> JsonObject:
+        """Descriptive scorecard of an allocation: yield, stability and how many
+        independent sleeves the capital sits in. Not a forecast."""
+        warnings: list[JsonObject] = []
+        scorecard = _call(
+            allocation_service.simulate,
+            allocation,
+            benchmark=benchmark,
+            on_warning=warnings.append,
+        )
+        return {**scorecard, "warnings": warnings}
 
     return server
 
