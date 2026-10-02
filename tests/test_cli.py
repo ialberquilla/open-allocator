@@ -24,8 +24,24 @@ from open_allocator.exec.client import (
 )
 from open_allocator.exec.execute import WalletPreparation
 from open_allocator.exec.funding import FundingRequirement
+from open_allocator.service import _common as service_common
+from open_allocator.service import positions as positions_service
+from open_allocator.service import wallet as wallet_service
 
 runner = CliRunner()
+
+
+# The CLI delegates to service modules that bind these collaborators themselves,
+# so a fake has to replace every binding or the service reaches the real one.
+_SURFACE_MODULES = (cli, service_common, wallet_service, positions_service)
+
+
+def patch_surface(monkeypatch: pytest.MonkeyPatch, name: str, value: object) -> None:
+    owners = [module for module in _SURFACE_MODULES if hasattr(module, name)]
+    assert owners, f"nothing binds {name}"
+    for module in owners:
+        monkeypatch.setattr(module, name, value)
+
 
 COMMANDS = [
     "wallet-status",
@@ -279,7 +295,7 @@ def install_mock_onetx_client(
             self.simulate_body = body
             return simulation_payload()
 
-    monkeypatch.setattr(cli, "OneTxClient", MockOneTxClient)
+    patch_surface(monkeypatch, "OneTxClient", MockOneTxClient)
     return MockOneTxClient
 
 
@@ -299,7 +315,7 @@ def set_execution_config(
         slippage_bps=50,
         token_balance_reader=lambda _chain, _rpc, _token, _account: 10**30,
     )
-    monkeypatch.setattr(cli, "AllocatorConfig", lambda: config)
+    patch_surface(monkeypatch, "AllocatorConfig", lambda: config)
     return config
 
 
@@ -544,8 +560,8 @@ def install_execution_surface_mocks(
     signer = ExecutionSignerSpy(fail_at=fail_at)
     ExecutionOneTxClient.instances = []
     ExecutionOneTxClient.calldata_requests = []
-    monkeypatch.setattr(cli, "OneTxClient", ExecutionOneTxClient)
-    monkeypatch.setattr(cli, "signer_from_config", lambda _config: signer)
+    patch_surface(monkeypatch, "OneTxClient", ExecutionOneTxClient)
+    patch_surface(monkeypatch, "signer_from_config", lambda _config: signer)
     return signer
 
 
@@ -561,8 +577,8 @@ def install_rebalance_surface_mocks(
     signer = ExecutionSignerSpy()
     RebalanceOneTxClient.instances = []
     RebalanceOneTxClient.calls = []
-    monkeypatch.setattr(cli, "OneTxClient", RebalanceOneTxClient)
-    monkeypatch.setattr(cli, "signer_from_config", lambda _config: signer)
+    patch_surface(monkeypatch, "OneTxClient", RebalanceOneTxClient)
+    patch_surface(monkeypatch, "signer_from_config", lambda _config: signer)
     return signer
 
 
@@ -578,8 +594,8 @@ def install_withdraw_surface_mocks(
     signer = ExecutionSignerSpy()
     WithdrawOneTxClient.instances = []
     WithdrawOneTxClient.calls = []
-    monkeypatch.setattr(cli, "OneTxClient", WithdrawOneTxClient)
-    monkeypatch.setattr(cli, "signer_from_config", lambda _config: signer)
+    patch_surface(monkeypatch, "OneTxClient", WithdrawOneTxClient)
+    patch_surface(monkeypatch, "signer_from_config", lambda _config: signer)
     return signer
 
 
@@ -815,7 +831,7 @@ def test_rewards_is_read_only_and_emits_normalized_amounts(
         def __getattr__(self, name: str) -> object:
             raise AssertionError(f"read-only rewards command accessed {name}")
 
-    monkeypatch.setattr(cli, "OneTxClient", RewardsOnlyClient)
+    patch_surface(monkeypatch, "OneTxClient", RewardsOnlyClient)
 
     result = runner.invoke(
         cli.app,
@@ -862,7 +878,7 @@ def test_rewards_labels_expired_calldata(monkeypatch: pytest.MonkeyPatch) -> Non
         def rewards(self, _wallet: str, _chain: int | None) -> RewardsResponse:
             return RewardsResponse.model_validate(fixture)
 
-    monkeypatch.setattr(cli, "OneTxClient", ExpiredRewardsClient)
+    patch_surface(monkeypatch, "OneTxClient", ExpiredRewardsClient)
 
     result = runner.invoke(cli.app, ["rewards", "--wallet", fixture["wallet"]])
 
@@ -1373,7 +1389,7 @@ def test_wallet_status_includes_balances_and_not_executable_flags(
             "not_executable_reasons": ["missing_rpc"],
         }
 
-    monkeypatch.setattr(cli, "_native_gas_status", gas_status)
+    patch_surface(monkeypatch, "_native_gas_status", gas_status)
 
     result = runner.invoke(cli.app, ["wallet-status"])
 
@@ -1454,7 +1470,7 @@ def test_positions_command_outputs_holdings_and_idle_balances(
                 ],
             }
 
-    monkeypatch.setattr(cli, "OneTxClient", PositionsOneTxClient)
+    patch_surface(monkeypatch, "OneTxClient", PositionsOneTxClient)
 
     result = runner.invoke(cli.app, ["positions", "--address", address])
 
@@ -1970,7 +1986,7 @@ def set_paymaster_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         _usdc_overrides={},
         idempotency_store_path=None,
     )
-    monkeypatch.setattr(cli, "AllocatorConfig", lambda: config)
+    patch_surface(monkeypatch, "AllocatorConfig", lambda: config)
     return config
 
 
@@ -1985,10 +2001,12 @@ def test_wallet_status_does_not_demand_native_gas_when_gas_is_paid_in_usdc(
     set_paymaster_config(monkeypatch)
     ExecutionOneTxClient.instances = []
     ExecutionOneTxClient.calldata_requests = []
-    monkeypatch.setattr(cli, "OneTxClient", ExecutionOneTxClient)
-    monkeypatch.setattr(cli, "signer_from_config", lambda _config: ExecutionSignerSpy())
-    monkeypatch.setattr(
-        cli,
+    patch_surface(monkeypatch, "OneTxClient", ExecutionOneTxClient)
+    patch_surface(
+        monkeypatch, "signer_from_config", lambda _config: ExecutionSignerSpy()
+    )
+    patch_surface(
+        monkeypatch,
         "_native_gas_status",
         lambda *_args: pytest.fail("native gas must not be checked in paymaster mode"),
     )
@@ -2012,8 +2030,10 @@ def test_wallet_status_flags_a_chain_the_paymaster_cannot_price(
     set_paymaster_config(monkeypatch)
     ExecutionOneTxClient.instances = []
     ExecutionOneTxClient.calldata_requests = []
-    monkeypatch.setattr(cli, "OneTxClient", ExecutionOneTxClient)
-    monkeypatch.setattr(cli, "signer_from_config", lambda _config: ExecutionSignerSpy())
+    patch_surface(monkeypatch, "OneTxClient", ExecutionOneTxClient)
+    patch_surface(
+        monkeypatch, "signer_from_config", lambda _config: ExecutionSignerSpy()
+    )
 
     result = runner.invoke(cli.app, ["wallet-status"])
 

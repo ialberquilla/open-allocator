@@ -33,12 +33,19 @@ Repository = "https://github.com/ialberquilla/open-allocator"
 dev = [
     "eth-tester==0.13.0b1",
     "py-evm==0.12.1b1",
+    "mcp==2.2.0",
     "pytest==9.1.1",
     "ruff==0.15.19",
 ]
 
 [project.scripts]
 open-allocator = "open_allocator.cli:main"
+open-allocator-mcp = "open_allocator.mcp:main"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp==2.2.0",
+]
 
 [tool.uv]
 default-groups = ["dev"]
