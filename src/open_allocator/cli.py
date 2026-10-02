@@ -23,18 +23,16 @@ from open_allocator.core.policy_loader import load_policy
 from open_allocator.core.schema import validate
 from open_allocator.core.state import (
     ScopedIdempotencyStore,
-    backend_from_config,
 )
 from open_allocator.core.types import (
     Allocation,
-    TxPlan,
     Vault,
 )
-from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
-from open_allocator.exec.execute import TransactionPlanError, plan_calldata_allocation
+from open_allocator.exec.execute import TransactionPlanError
 from open_allocator.service import allocation as allocation_service
+from open_allocator.service import execution as execution_service
 from open_allocator.service import positions as positions_service
 from open_allocator.service import universe as universe_service
 from open_allocator.service import wallet as wallet_service
@@ -184,12 +182,6 @@ def _read_position_source(
     return positions_core.PositionHolding.model_validate(payload)
 
 
-def execute_allocation(*args: object, **kwargs: object) -> object:
-    from open_allocator.exec.execute import execute_allocation as executor
-
-    return executor(*args, **kwargs)
-
-
 def execute_rebalance(*args: object, **kwargs: object) -> object:
     from open_allocator.exec.rebalance import execute_rebalance as executor
 
@@ -214,48 +206,15 @@ def execute_loop_open(*args: object, **kwargs: object) -> object:
     return executor(*args, **kwargs)
 
 
-def _execution_report(
-    *,
-    status: str,
-    policy_result: object,
-    plan: TxPlan,
-    preparations: tuple[object, ...] = (),
-    funding: tuple[object, ...] = (),
-    messages: tuple[str, ...] = (),
-    loops: tuple[object, ...] = (),
-) -> object:
-    from open_allocator.exec.execute import ExecutionReport
-
-    return ExecutionReport(
-        status=status,
-        policy_result=policy_result,
-        plan=plan,
-        preparations=preparations,
-        funding=funding,
-        messages=messages,
-        loops=loops,
-    )
-
-
 def _idempotency_store(config: object, scope: str) -> ScopedIdempotencyStore | None:
-    """The store that decides whether a step is re-sent, bound to its scope.
-
-    Where it *lives* is `core.state`'s problem, not the CLI's: on a laptop that
-    is a JSON file, and in a container whose filesystem does not survive a retry
-    it is whatever backend the caller injected. This is the seam that stops a
-    retried run from broadcasting trades that already landed.
-    """
-    backend = backend_from_config(config, needs="idempotency_store_path")
-    if backend is None:
-        return None
-    return ScopedIdempotencyStore(backend, scope)
+    return execution_service.idempotency_store(config, scope)
 
 
 def _execution_idempotency_store(
     config: object,
     allocation: Allocation,
 ) -> ScopedIdempotencyStore | None:
-    return _idempotency_store(config, _allocation_scope(allocation))
+    return _idempotency_store(config, execution_service.allocation_scope(allocation))
 
 
 def _rebalance_idempotency_store(
@@ -278,12 +237,6 @@ def _withdraw_idempotency_store(
     amount: float | None,
 ) -> ScopedIdempotencyStore | None:
     return _idempotency_store(config, _withdraw_scope(position, amount=amount))
-
-
-def _allocation_scope(allocation: Allocation) -> str:
-    payload = allocation.model_dump(mode="json")
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _rebalance_scope(
@@ -342,83 +295,21 @@ def _withdraw_scope(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _build_execution_plan(
-    allocation_path: Path,
-    policy_path: Path,
-) -> tuple[TxPlan, PlanPreparation, tuple[Any, ...], policy_core.PolicyResult]:
-    allocation = _read_allocation(allocation_path)
-    policy = load_policy(policy_path)
-    config = AllocatorConfig()
-    signer = signer_from_config(config)
-
-    with OneTxClient(config) as client:
-        known_instruments = _discover_vaults_from_client(
-            client, enrich=True, loops=True
-        )
-        # Planned and prepared in one pass: deposits are sized against the
-        # same preparation the dry run reports.
-        fitted = plan_calldata_allocation(
-            client,
-            signer,
-            allocation,
-            policy,
-            known_instruments=known_instruments,
-            config=config,
-            # Read only: legs already sent or bridging are not planned again.
-            idempotency_store=_execution_idempotency_store(config, allocation),
-        )
-    preparation = fitted.preparation.model_copy(
-        update={"messages": (*fitted.messages, *fitted.preparation.messages)}
-    )
-    return fitted.plan, preparation, fitted.loops, fitted.policy_result
-
-
 def _execute_allocation_from_cli(
     allocation_path: Path,
     policy_path: Path,
     *,
     confirm: bool,
 ) -> JsonObject:
+    proposal = execution_service.plan_execute(
+        _read_allocation(allocation_path), policy=policy_path, on_warning=_warn
+    )
     if not confirm:
-        plan, preparation, loops, policy_result = _build_execution_plan(
-            allocation_path, policy_path
-        )
-        report = _execution_report(
-            status="planned",
-            policy_result=policy_result,
-            plan=plan,
-            preparations=preparation.preparations,
-            funding=preparation.funding,
-            loops=loops,
-            messages=(
-                "dry-run only; no transactions broadcast",
-                *preparation.messages,
-                *preparation.blockers,
-            ),
-        )
-        return _model_payload(report)
-
-    allocation = _read_allocation(allocation_path)
-    policy = load_policy(policy_path)
-    config = AllocatorConfig()
-    signer = signer_from_config(config)
-
-    with OneTxClient(config) as client:
-        known_instruments = _discover_vaults_from_client(
-            client, enrich=True, loops=True
-        )
-        report = execute_allocation(
-            client,
-            signer,
-            allocation,
-            policy,
-            confirm=True,
-            known_instruments=known_instruments,
-            config=config,
-            idempotency_store=_execution_idempotency_store(config, allocation),
-        )
-
-    return _model_payload(report)
+        return proposal["report"]
+    # Confirmed in the same run: the plan just built is the plan that runs.
+    return execution_service.apply_execute(
+        proposal["plan"], expected_hash=proposal["plan_hash"]
+    )
 
 
 def _rebalance_from_cli(
@@ -1057,13 +948,13 @@ def build_tx(
         typer.Option("--policy", dir_okay=False, readable=True),
     ] = DEFAULT_POLICY_PATH,
 ) -> JsonObject:
-    plan, preparation, _loops, _policy_result = _build_execution_plan(
-        allocation_path, policy_path
+    planned = execution_service.plan_allocation_execution(
+        _read_allocation(allocation_path), policy=policy_path, on_warning=_warn
     )
     # The plan is the output, so blockers are an error rather than a note.
-    if preparation.blockers:
-        raise TransactionPlanError("; ".join(preparation.blockers))
-    payload = plan.model_dump(mode="json")
+    if planned.preparation.blockers:
+        raise TransactionPlanError("; ".join(planned.preparation.blockers))
+    payload = planned.plan.model_dump(mode="json")
     validate(payload, "tx-plan")
     return payload
 

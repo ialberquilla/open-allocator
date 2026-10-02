@@ -26,7 +26,25 @@ Tools are named after the CLI commands and return the same objects, with these d
 - Arguments are typed values, not CLI strings: `pins` and `strategy_params` are objects, `spec` is an allocation-spec object rather than a path. `policy_path` is still a path, resolved against the server's working directory.
 - Errors come back as `{"error": ..., "code": ...}` in the tool result; `code` is present for `ServiceError`.
 
-Exposed tools, all read-only: `wallet-status`, `safe-address`, `positions`, `rewards`, `list-vaults`, `score-vault`, `screen`, `build-allocation`, `simulate`.
+Exposed tools: `wallet-status`, `safe-address`, `positions`, `rewards`, `list-vaults`, `score-vault`, `screen`, `build-allocation`, `simulate`, `execute`. None of them changes anything on chain.
+
+## Plans and approval
+
+Execution is split in the service layer (`open_allocator.service.execution`):
+
+- `plan_execute(allocation, policy=...)` discovers, policy-checks, sizes and prepares the deposits and sends nothing. It returns `{kind, plan, plan_hash, report}`. `plan` is a complete `AllocationPlan` (`exec/allocation_plan.py`), `plan_hash` is sha256 over the canonical JSON of the kind and plan, and `report` is the dry run `execute` prints without `--confirm`.
+- `apply_execute(plan, expected_hash=...)` executes that plan as it stands. It never discovers, sizes or plans again. It refuses a plan that does not match the hash, a plan built for another signer, and a plan the wallet has moved past (a leg sent or bridging since it was built). Calldata close to expiry is re-quoted for the same leg, account and amount just before signing, as on the CLI.
+- `execute --confirm` runs plan then apply in one process. Its output is unchanged.
+
+The MCP `execute` tool takes the `allocation` object from `build-allocation`. It calls `plan_execute`, stores the plan in a `PlanStore` (`service/plan_store.py`) and returns:
+
+```json
+{"plan_required": true, "kind": "execute", "plan_hash": "…", "expires_at": "…", "plan": {"status": "planned", …}, "warnings": []}
+```
+
+Nothing in the MCP adapter can apply a plan. `apply_approved(store, plan_hash)` is the approval entry point for a human-facing surface (the local server's Approve button): it marks the stored plan used before running it, so a plan runs at most once, and refuses unknown (`plan_not_found`), expired (`plan_expired`, 15 minutes by default) or used (`plan_used`) plans. The stdio server keeps plans in memory and has no approval surface yet. Over stdio, approve by running `execute --confirm` yourself.
+
+Not yet split: `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`. Policy is not re-checked at approval yet; the plan carries the result it was built under.
 
 ## Invariants
 

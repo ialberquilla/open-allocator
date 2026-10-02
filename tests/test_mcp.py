@@ -7,18 +7,22 @@ import anyio
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 
+from open_allocator import mcp as mcp_module
 from open_allocator.core import positions as positions_core
 from open_allocator.core import universe as universe_core
 from open_allocator.core.types import Vault
+from open_allocator.exec import execute as execute_exec
 from open_allocator.exec import gas as gas_module
 from open_allocator.exec import loops as loops_exec
 from open_allocator.exec.client import RewardsResponse
 from open_allocator.mcp import build_mcp
 from open_allocator.service import ServiceError
 from open_allocator.service import allocation as allocation_service
+from open_allocator.service import execution as execution_service
 from open_allocator.service import positions as positions_service
 from open_allocator.service import universe as universe_service
 from open_allocator.service import wallet as wallet_service
+from open_allocator.service.plan_store import InMemoryPlanStore, plan_hash
 
 ROOT = Path(__file__).resolve().parents[1]
 WALLET = "0x" + "ab" * 20
@@ -63,7 +67,7 @@ class FakeClient:
         pass
 
 
-def test_tools_are_the_read_only_cli_commands() -> None:
+def test_tools_are_cli_commands_that_change_nothing() -> None:
     tools = list_tools()
 
     assert {tool.name for tool in tools} == {
@@ -76,6 +80,7 @@ def test_tools_are_the_read_only_cli_commands() -> None:
         "screen",
         "build-allocation",
         "simulate",
+        "execute",
     }
     assert {tool.name for tool in tools} <= cli_inventory()
     for tool in tools:
@@ -297,3 +302,52 @@ def test_build_allocation_requires_an_amount() -> None:
         "error": "amount required: pass --amount or set amount_usd in the spec",
         "code": "invalid_input",
     }
+
+
+def test_execute_stores_the_plan_for_approval_and_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = {"account": WALLET, "plan": {"steps": []}}
+    report = {"status": "planned", "messages": ["dry-run only"]}
+
+    def fake_plan(allocation: object, **kwargs: Any) -> dict[str, Any]:
+        assert allocation == {"legs": [], "total_usd": 0}
+        kwargs["on_warning"]({"warning": "skipped_instruments", "instruments": []})
+        return {
+            "kind": "execute",
+            "plan": document,
+            "plan_hash": plan_hash("execute", document),
+            "report": report,
+        }
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an execution tool applied a plan")
+
+    monkeypatch.setattr(execution_service, "plan_execute", fake_plan)
+    monkeypatch.setattr(execution_service, "apply_execute", refuse)
+    monkeypatch.setattr(execute_exec, "apply_allocation_plan", refuse)
+    store = InMemoryPlanStore()
+
+    result = anyio.run(
+        build_mcp(store).call_tool,
+        "execute",
+        {"allocation": {"legs": [], "total_usd": 0}},
+    )
+
+    payload = result.structured_content
+    assert payload["plan_required"] is True
+    assert payload["plan_hash"] == plan_hash("execute", document)
+    assert payload["plan"] == report
+    assert payload["warnings"] == [
+        {"warning": "skipped_instruments", "instruments": []}
+    ]
+    stored = store.get(payload["plan_hash"])
+    assert stored is not None and stored.used_at is None
+    assert stored.plan == document
+
+
+def test_nothing_in_the_mcp_adapter_can_apply_a_plan() -> None:
+    source = Path(mcp_module.__file__).read_text(encoding="utf-8")
+
+    for name in ("apply_execute", "apply_approved", "apply_allocation_plan", "take("):
+        assert name not in source, name

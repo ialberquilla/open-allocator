@@ -4,9 +4,10 @@ Thin by design, like the CLI. A tool parses nothing and decides nothing; it call
 one `open_allocator.service` function and returns its dict. Tool names are the CLI
 command names, so the AGENT_GUIDE workflows read the same over either surface.
 
-Only read-only and analysis commands are exposed. An execution tool must return a
-plan-required response and never accept a confirmation: approval is a human action
-outside the model's reach (see docs/ui.md).
+Read-only and analysis commands are exposed as they are. An execution tool builds
+its plan, stores it in the `PlanStore` and returns a plan-required response with the
+plan's hash. It never accepts a confirmation and nothing here can apply a plan:
+approval is a human action outside the model's reach (see docs/ui.md).
 
 Run over stdio with `open-allocator-mcp` (needs the `mcp` extra). stdout carries the
 protocol, which is why nothing in the service layer may print.
@@ -29,9 +30,11 @@ from open_allocator.core import allocator as allocation_core
 from open_allocator.core import strategies as strategies_core
 from open_allocator.service import ServiceError
 from open_allocator.service import allocation as allocation_service
+from open_allocator.service import execution as execution_service
 from open_allocator.service import positions as positions_service
 from open_allocator.service import universe as universe_service
 from open_allocator.service import wallet as wallet_service
+from open_allocator.service.plan_store import InMemoryPlanStore, PlanStore
 
 JsonObject = dict[str, Any]
 
@@ -63,7 +66,8 @@ MinHistoryDays = Annotated[
 Curators = Annotated[list[str] | None, Field(description="Curator allowlist.")]
 MinTvlUsd = Annotated[float | None, Field(ge=0, description="Minimum TVL in USD.")]
 
-# Reads 1Tx and chain RPCs; changes nothing anywhere.
+# Reads 1Tx and chain RPCs; changes nothing anywhere. Execution tools are read-only
+# too: they only store a plan, which a human may later approve elsewhere.
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
 
@@ -84,7 +88,10 @@ def _call(function: Callable[..., JsonObject], *args: Any, **kwargs: Any) -> Jso
         raise ToolError(json.dumps({"error": str(error)})) from error
 
 
-def build_mcp() -> MCPServer:
+def build_mcp(plan_store: PlanStore | None = None) -> MCPServer:
+    """The MCP app. `plan_store` holds the plans execution tools propose; the
+    default keeps them in this process."""
+    plans = plan_store if plan_store is not None else InMemoryPlanStore()
     server = MCPServer(
         name="open-allocator",
         version=__version__,
@@ -320,6 +327,31 @@ def build_mcp() -> MCPServer:
             on_warning=warnings.append,
         )
         return {**scorecard, "warnings": warnings}
+
+    @server.tool(name="execute", annotations=READ_ONLY)
+    def execute(
+        allocation: Annotated[
+            dict[str, Any],
+            Field(description="The `allocation` object from build-allocation."),
+        ],
+        policy_path: Annotated[
+            str,
+            Field(description="Policy YAML, relative to the server's directory."),
+        ] = str(allocation_service.DEFAULT_POLICY_PATH),
+    ) -> JsonObject:
+        """Plan the deposits for an allocation and submit the plan for human
+        approval. Broadcasts nothing. Returns `plan_required: true`, the
+        `plan_hash` a human approves, `expires_at`, and `plan`: the dry-run
+        report (steps, funding, wallet preparation, blockers). Show the plan and
+        its blockers; only the user can approve it, outside this conversation."""
+        warnings: list[JsonObject] = []
+        proposal = _call(
+            execution_service.plan_execute,
+            allocation,
+            policy=Path(policy_path),
+            on_warning=warnings.append,
+        )
+        return {**execution_service.propose(plans, proposal), "warnings": warnings}
 
     return server
 

@@ -15,7 +15,8 @@ from open_allocator import cli
 from open_allocator.cli import JsonObject, json_command
 from open_allocator.core.policy import PolicyResult
 from open_allocator.core.schema import validate
-from open_allocator.core.types import TxPlan
+from open_allocator.core.types import Allocation, TxPlan
+from open_allocator.exec.allocation_plan import AllocationPlan
 from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.client import (
     InstrumentCalldataQuery,
@@ -26,6 +27,7 @@ from open_allocator.exec.execute import WalletPreparation
 from open_allocator.exec.funding import FundingRequirement
 from open_allocator.service import _common as service_common
 from open_allocator.service import allocation as allocation_service
+from open_allocator.service import execution as execution_service
 from open_allocator.service import positions as positions_service
 from open_allocator.service import universe as universe_service
 from open_allocator.service import wallet as wallet_service
@@ -42,6 +44,7 @@ _SURFACE_MODULES = (
     positions_service,
     universe_service,
     allocation_service,
+    execution_service,
 )
 
 
@@ -1668,15 +1671,15 @@ def _calldata_dry_run(
         messages=("wallet note",),
         blockers=blockers,
     )
-    monkeypatch.setattr(
-        cli,
-        "_build_execution_plan",
-        lambda _allocation, _policy: (
-            TxPlan(steps=(), summary="calldata plan"),
-            preparation,
-            (),
-            PolicyResult(ok=True, violations=()),
-        ),
+    planned = AllocationPlan(
+        account="0x0000000000000000000000000000000000000001",
+        allocation=Allocation(legs=(), total_usd=0),
+        policy_result=PolicyResult(ok=True, violations=()),
+        plan=TxPlan(steps=(), summary="calldata plan"),
+        preparation=preparation,
+    )
+    patch_surface(
+        monkeypatch, "plan_allocation_execution", lambda *_args, **_kwargs: planned
     )
 
 
