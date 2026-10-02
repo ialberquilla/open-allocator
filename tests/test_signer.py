@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,6 +24,10 @@ from open_allocator.core.types import (
     Vault,
 )
 from open_allocator.exec import chains
+from open_allocator.exec.client import (
+    InstrumentCalldataQuery,
+    InstrumentCalldataResponse,
+)
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
     PaymasterConfigurationError,
@@ -423,18 +429,8 @@ def test_safe_guard_rejects_tx_outside_policy() -> None:
 def test_executor_can_call_safe_signer_without_executor_changes() -> None:
     adapter = MockSafeTransactionServiceAdapter(threshold=2)
     signer = SafeSigner(adapter=adapter)
-    client = MockOneTxClient(
-        response={
-            "transactions": [
-                {
-                    "to": "0x00000000000000000000000000000000000000bb",
-                    "data": "0x1234",
-                    "value": 42,
-                    "chainId": 8453,
-                }
-            ]
-        }
-    )
+    signer.is_deployed = lambda _chain_id, _rpc_url: True  # type: ignore[method-assign]
+    client = MockOneTxClient()
 
     report = execute_allocation(
         client,
@@ -452,7 +448,8 @@ def test_executor_can_call_safe_signer_without_executor_changes() -> None:
 
     assert report.receipts[0].pending is True
     assert report.receipts[0].execution_status == "safe_proposed"
-    assert adapter.proposed[0].to == "0x00000000000000000000000000000000000000bb"
+    # The whole deposit bundle goes out as one Safe proposal.
+    assert len(adapter.proposed) == 1
 
 
 def test_paymaster_signer_can_wrap_safe_account_at_signer_seam() -> None:
@@ -466,18 +463,7 @@ def test_paymaster_signer_can_wrap_safe_account_at_signer_seam() -> None:
         entry_point="0x0000000000000000000000000000000000004337",
         usdc_address="0x0000000000000000000000000000000000000c0c",
     )
-    client = MockOneTxClient(
-        response={
-            "transactions": [
-                {
-                    "to": "0x00000000000000000000000000000000000000bb",
-                    "data": "0x1234",
-                    "value": 42,
-                    "chainId": 8453,
-                }
-            ]
-        }
-    )
+    client = MockOneTxClient()
 
     report = execute_allocation(
         client,
@@ -493,10 +479,10 @@ def test_paymaster_signer_can_wrap_safe_account_at_signer_seam() -> None:
         config=PaymasterExecutorConfig(),
     )
 
-    assert client.response["transactions"][0]["data"] == "0x1234"
     assert paymaster_adapter.requests[0].sender == SAFE_ADDRESS
     assert paymaster_adapter.requests[0].account_type == "safe"
-    assert paymaster_adapter.requests[0].call_data.data == "0x1234"
+    # The bundle's first call: the fixture's ERC-20 approve.
+    assert paymaster_adapter.requests[0].call_data.data.startswith("0x095ea7b3")
     assert report.receipts[0].execution_status == "user_operation_submitted"
 
 
@@ -733,15 +719,40 @@ def safe_vault(instrument_id: str) -> Vault:
         tvl_usd=1_000_000,
         curator="curator-a",
         reward_dependence=0.1,
+        token_address=BASE_USDC,
+        token_decimals=6,
     )
+
+
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
 
 @dataclass
 class MockOneTxClient:
-    response: dict[str, Any]
+    requests: list[InstrumentCalldataQuery] = field(default_factory=list)
 
-    def build_buy(self, _body: dict[str, object]) -> dict[str, Any]:
-        return self.response
+    def instrument_calldata(
+        self,
+        instrument_id: str,
+        query: InstrumentCalldataQuery,
+    ) -> InstrumentCalldataResponse:
+        self.requests.append(query)
+        payload = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "calldata-instrument-deposit-swap.json"
+            ).read_text(encoding="utf-8")
+        )
+        payload.update(
+            instrumentId=instrument_id,
+            account=query.account,
+            amountIn=query.amount,
+            requires=[{"token": BASE_USDC, "amount": query.amount}],
+            leftovers=[],
+            expiresAt=None,
+        )
+        return InstrumentCalldataResponse.model_validate(payload)
 
 
 @dataclass(frozen=True)
@@ -754,6 +765,8 @@ class SafeExecutorConfig:
         message=f"native gas available on chain {chain_id}",
     )
     _rpc_overrides: dict[int, str] = field(default_factory=lambda: {8453: "rpc://base"})
+    slippage_bps: int = 30
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
 
 
 @dataclass(frozen=True)
@@ -765,6 +778,8 @@ class PaymasterExecutorConfig:
     paymaster_entry_point: str = "0x0000000000000000000000000000000000004337"
     paymaster_usdc_address: str = "0x0000000000000000000000000000000000000c0c"
     paymaster_supported_chain_ids: tuple[int, ...] = (8453,)
+    slippage_bps: int = 30
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
 
 
 @dataclass(frozen=True)

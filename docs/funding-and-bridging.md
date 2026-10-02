@@ -6,11 +6,11 @@ a wallet needs and where.
 
 ## The one-sentence model
 
-A leg's **destination chain is encoded in its `instrumentId`**; the allocator
-**sources USDC from whichever chain the wallet is actually funded on** and 1Tx
-(`SwapDepositRouter` + CCTP) **bridges to the destination automatically** when
-they differ. The wallet only needs native gas on the chain it *signs* on — the
-source chain — not on every destination.
+A leg's **destination chain is encoded in its `instrumentId`**; 1Tx's calldata
+API builds a **same-chain bundle** for it, funded from the Safe's USDC on that
+chain, and when that chain is short the allocator **bridges USDC over CCTP**
+from a funded chain and settles the destination itself
+([`exec/bridge.py`](../src/open_allocator/exec/bridge.py)).
 
 ## Instrument IDs encode the destination chain
 
@@ -32,27 +32,7 @@ Decode it directly: `chain_id = int(instrument_id[2:10], 16)`. The `Vault.chain_
 returned by discovery matches this; never re-derive the universe from it, but it is
 a reliable cross-check for which chain a leg lands on.
 
-## Source chain selection (deterministic, balance-aware)
-
-When building each buy, the executor sets 1Tx's `sourceChainId` to the chain the
-wallet is funded on, in this precedence (`exec/execute.py:_source_chain_id` →
-`_select_source_chain`):
-
-1. **Explicit override** — `source_chain_id` in config (`ONE_TX_SOURCE_CHAIN_ID`)
-   or in the allocation's `metadata`. Always wins.
-2. **Vault's own chain, if it holds enough USDC** — no bridge, cheapest.
-3. **Best-funded chain that can cover the leg** — bridge via CCTP to the vault's
-   chain.
-4. **Fallback when no single chain can cover the leg** — the vault's chain if it
-   holds any USDC, else the best-funded chain; 1Tx then surfaces the shortfall.
-5. **No balance info available** — omit `sourceChainId` and let 1Tx auto-select.
-
-> Do **not** pin `sourceChainId` to the vault's own chain unconditionally. If the
-> wallet holds no USDC there, 1Tx returns `400 No chain has sufficient USDC
-> balance` instead of bridging. This was a real bug; the balance-aware default
-> fixes it. Rebalance buys use the same path (`exec/rebalance.py`).
-
-### With the calldata API (`ONE_TX_TRANSACTION_API=calldata`)
+## Source chain selection
 
 1Tx's calldata API builds same-chain bundles and a separate CCTP source burn; it
 does not settle a destination. The allocator does that itself (`exec/bridge.py`).
@@ -89,7 +69,7 @@ does not settle a destination. The allocator does that itself (`exec/bridge.py`)
   holds and sells is left at full size and reported as a funding shortfall,
   which blocks execution.
 
-#### Bridged legs, step by step
+### Bridged legs, step by step
 
 Each leg's progress is a record in the run's idempotency store under
 `bridge:leg:<index>:<instrument>`, validated by
@@ -133,7 +113,7 @@ Circle is `CIRCLE_IRIS_API_URL` (production by default); each check is bounded
 by `CIRCLE_HTTP_TIMEOUT_SECONDS` and `CIRCLE_HTTP_MAX_RETRIES`, not by the
 attestation wait.
 
-#### Moving USDC without depositing: `bridge`
+### Moving USDC without depositing: `bridge`
 
 `bridge --from <chain id> --to <chain id> --amount <usdc> [--confirm]` moves the
 Safe's own USDC between two CCTP chains and deposits nothing. It exists for what
@@ -159,20 +139,16 @@ chains, the amount and `--ref`:
 
 ## What a wallet actually needs
 
-For a normal (`local-eoa`) self-custody wallet:
-
-- **USDC on one chain is enough.** You do not need USDC pre-positioned on every
-  chain your allocation touches — CCTP bridges from the source chain.
-- **Native gas is per-chain and only on chains you sign on.** With an EOA every
-  transaction is signed and broadcast on its own chain, so the wallet needs gas
-  on:
-  - the **source chain(s)** for deposits (where the buy/approve txs execute), and
-  - the **position's own chain** for exits — `sell`/`withdraw` are share-
-    denominated on the chain the position lives on, so those sign there.
-- **Size the deploy to the funded chain's balance.** Legs draw down the same
-  source-chain USDC in sequence. `build-tx` validates each leg against the
-  current balance, so an `--amount` larger than the funded chain's USDC builds a
-  plan but fails partway through execution as that balance drains.
+- **USDC on one chain is enough to deposit anywhere CCTP reaches**, but only
+  with `SIGNER_SUBMISSION=erc4337-paymaster` and `PAYMASTER_PROVIDER=pimlico`:
+  the destination operation pays its gas out of the mint. Any other signer
+  deposits only from USDC already on the vault's chain.
+- **Each chain's bundles are one operation.** Deposits and burns on a chain go
+  out together, so the dry run checks the Safe's balance on that chain against
+  everything planned there; a shortfall is a blocker, not a partial run.
+- **Exits sign on the position's chain**, and their proceeds land there.
+- **Set a private `RPC_URL_<chain>`** for every chain you plan on: balances are
+  read and operations estimated over RPC, and the public defaults rate-limit.
 
 `wallet-status` reports USDC and native-gas readiness per chain; treat a chain as
 executable only when both are present.
@@ -182,10 +158,8 @@ executable only when both are present.
 A complete execution announcement (see [AGENT_GUIDE.md](../AGENT_GUIDE.md)) must
 name the **source chain(s)** the USDC comes from, the **destination chain(s)** the
 instruments live on, whether any leg **bridges**, and the **native-gas assets**
-required on each chain that will be signed. On the legacy API a bridged leg is handed
-to 1Tx once its source-chain transaction lands; 1Tx settles the destination mint.
-On the calldata API the allocator settles it: announce that the leg bridges, from
-and to which chain, that its deposit is built only after Circle attests and is
-sized to the mint less Circle's fee and the destination paymaster charge, and that
-`execute --confirm` must be rerun until the leg's `bridges` state is `completed`.
-Either way, checkpoint and resume idempotently, never blind-retry.
+required on each chain that will be signed. For a bridged leg, announce that it
+bridges, from and to which chain, that its deposit is built only after Circle
+attests and is sized to the mint less Circle's fee and the destination paymaster
+charge, and that `execute --confirm` must be rerun until the leg's `bridges`
+state is `completed`. Checkpoint and resume idempotently, never blind-retry.

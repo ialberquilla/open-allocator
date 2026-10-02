@@ -2,7 +2,7 @@
 
 `SafeSigner` is a signer swap: 1Tx still builds the original `{to,data,value,chainId}` steps, and Safe mode wraps those exact steps as one Safe multisig transaction proposal per chain run. A single step is proposed as a plain call. Several consecutive steps on one chain are proposed together as one `DELEGATECALL` to Safe 1.4.1 `MultiSendCallOnly`, so owners sign and execute them atomically; proposed separately, each would read the same on-chain Safe nonce and at most one could execute. `MultiSendCallOnly` can only emit plain `CALL`s, so a batch cannot delegatecall out of the Safe.
 
-A proposal waits for co-signers with no execution deadline, so the Safe Transaction Service path refuses calldata bundles that carry an expiring quote (`ONE_TX_TRANSACTION_API=calldata`), and refuses to propose to a Safe that is not yet deployed on the chain. Both are reported by the dry run and rejected before anything is proposed.
+A proposal waits for co-signers with no execution deadline, so the Safe Transaction Service path refuses calldata bundles that carry an expiring quote, and refuses to propose to a Safe that is not yet deployed on the chain. Both are reported by the dry run and rejected before anything is proposed.
 
 ## Python Guard Helper
 

@@ -49,7 +49,6 @@ from open_allocator.core.types import (
 from open_allocator.exec import chains, safe_deployment
 from open_allocator.exec import gas as gas_module
 from open_allocator.exec.bundle_execution import PlanPreparation
-from open_allocator.exec.calldata import uses_calldata_api
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
 from open_allocator.exec.execute import TransactionPlanError, plan_calldata_allocation
@@ -471,15 +470,7 @@ def _withdraw_scope(
 def _build_execution_plan(
     allocation_path: Path,
     policy_path: Path,
-) -> tuple[
-    Allocation,
-    Policy,
-    TxPlan,
-    list[Vault],
-    PlanPreparation | None,
-    tuple[Any, ...],
-    policy_core.PolicyResult | None,
-]:
+) -> tuple[TxPlan, PlanPreparation, tuple[Any, ...], policy_core.PolicyResult]:
     allocation = _read_allocation(allocation_path)
     policy = load_policy(policy_path)
     config = AllocatorConfig()
@@ -487,46 +478,24 @@ def _build_execution_plan(
 
     with OneTxClient(config) as client:
         known_instruments = _discover_vaults_from_client(
-            client, enrich=True, loops=uses_calldata_api(config)
+            client, enrich=True, loops=True
         )
-        if uses_calldata_api(config):
-            # Planned and prepared in one pass: deposits are sized against the
-            # same preparation the dry run reports.
-            fitted = plan_calldata_allocation(
-                client,
-                signer,
-                allocation,
-                policy,
-                known_instruments=known_instruments,
-                config=config,
-                # Read only: legs already sent or bridging are not planned again.
-                idempotency_store=_execution_idempotency_store(config, allocation),
-            )
-            preparation = fitted.preparation.model_copy(
-                update={"messages": (*fitted.messages, *fitted.preparation.messages)}
-            )
-            return (
-                allocation,
-                policy,
-                fitted.plan,
-                known_instruments,
-                preparation,
-                fitted.loops,
-                fitted.policy_result,
-            )
-        plan = execute_allocation(
+        # Planned and prepared in one pass: deposits are sized against the
+        # same preparation the dry run reports.
+        fitted = plan_calldata_allocation(
             client,
             signer,
             allocation,
             policy,
-            confirm=False,
             known_instruments=known_instruments,
             config=config,
+            # Read only: legs already sent or bridging are not planned again.
+            idempotency_store=_execution_idempotency_store(config, allocation),
         )
-
-    if not isinstance(plan, TxPlan):
-        raise TypeError("execute_allocation(confirm=False) did not return a TxPlan")
-    return allocation, policy, plan, known_instruments, None, (), None
+    preparation = fitted.preparation.model_copy(
+        update={"messages": (*fitted.messages, *fitted.preparation.messages)}
+    )
+    return fitted.plan, preparation, fitted.loops, fitted.policy_result
 
 
 def _execute_allocation_from_cli(
@@ -536,23 +505,20 @@ def _execute_allocation_from_cli(
     confirm: bool,
 ) -> JsonObject:
     if not confirm:
-        allocation, policy, plan, known_instruments, preparation, loops, checked = (
-            _build_execution_plan(allocation_path, policy_path)
-        )
-        policy_result = checked or policy_core.check(
-            allocation, policy, known_instruments
+        plan, preparation, loops, policy_result = _build_execution_plan(
+            allocation_path, policy_path
         )
         report = _execution_report(
             status="planned",
             policy_result=policy_result,
             plan=plan,
-            preparations=() if preparation is None else preparation.preparations,
-            funding=() if preparation is None else preparation.funding,
+            preparations=preparation.preparations,
+            funding=preparation.funding,
             loops=loops,
             messages=(
                 "dry-run only; no transactions broadcast",
-                *(() if preparation is None else preparation.messages),
-                *(() if preparation is None else preparation.blockers),
+                *preparation.messages,
+                *preparation.blockers,
             ),
         )
         return _model_payload(report)
@@ -564,7 +530,7 @@ def _execute_allocation_from_cli(
 
     with OneTxClient(config) as client:
         known_instruments = _discover_vaults_from_client(
-            client, enrich=True, loops=uses_calldata_api(config)
+            client, enrich=True, loops=True
         )
         report = execute_allocation(
             client,
@@ -1756,11 +1722,11 @@ def build_tx(
         typer.Option("--policy", dir_okay=False, readable=True),
     ] = DEFAULT_POLICY_PATH,
 ) -> JsonObject:
-    _allocation, _policy, plan, _known_instruments, preparation, _loops, _checked = (
-        _build_execution_plan(allocation_path, policy_path)
+    plan, preparation, _loops, _policy_result = _build_execution_plan(
+        allocation_path, policy_path
     )
     # The plan is the output, so blockers are an error rather than a note.
-    if preparation is not None and preparation.blockers:
+    if preparation.blockers:
         raise TransactionPlanError("; ".join(preparation.blockers))
     payload = plan.model_dump(mode="json")
     validate(payload, "tx-plan")

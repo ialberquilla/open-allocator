@@ -240,7 +240,6 @@ def _receipt(index: int, to: str) -> Receipt:
 
 @dataclass(frozen=True)
 class Config:
-    transaction_api: str = "calldata"
     slippage_bps: int = 10
     token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
     referral_fee_bps: int = 0
@@ -664,18 +663,6 @@ def test_a_loop_whose_collateral_is_not_usdc_is_refused() -> None:
             loop_policy(),
             known_instruments=vaults,
             config=Config(),
-        )
-
-
-def test_the_legacy_transaction_api_refuses_a_levered_leg() -> None:
-    with pytest.raises(TransactionPlanError, match="calldata API"):
-        execute_allocation(
-            LoopClient(),
-            BatchingSigner(),
-            loop_allocation(),
-            loop_policy(),
-            known_instruments=universe(),
-            config=Config(transaction_api="legacy"),
         )
 
 

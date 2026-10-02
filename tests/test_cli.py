@@ -15,9 +15,13 @@ from open_allocator import cli
 from open_allocator.cli import JsonObject, json_command
 from open_allocator.core.policy import PolicyResult
 from open_allocator.core.schema import validate
-from open_allocator.core.types import Allocation, TxPlan
+from open_allocator.core.types import TxPlan
 from open_allocator.exec.bundle_execution import PlanPreparation
-from open_allocator.exec.client import RewardsResponse
+from open_allocator.exec.client import (
+    InstrumentCalldataQuery,
+    InstrumentCalldataResponse,
+    RewardsResponse,
+)
 from open_allocator.exec.execute import WalletPreparation
 from open_allocator.exec.funding import FundingRequirement
 
@@ -292,9 +296,43 @@ def set_execution_config(
         _rpc_overrides={8453: "rpc://base", 999999: "rpc://missing"},
         gas_checker=lambda _address, _chain_id, _rpc_url, _config: True,
         idempotency_store_path=idempotency_store_path,
+        slippage_bps=50,
+        token_balance_reader=lambda _chain, _rpc, _token, _account: 10**30,
     )
     monkeypatch.setattr(cli, "AllocatorConfig", lambda: config)
     return config
+
+
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+DEPOSIT_KINDS = ["approve", "swap", "approve", "approve", "deposit"]
+
+
+def calldata_response(
+    instrument_id: str,
+    query: InstrumentCalldataQuery,
+) -> InstrumentCalldataResponse:
+    """1Tx calldata for one instrument, echoing what the request asked for."""
+    name = (
+        "calldata-instrument-withdraw-max.json"
+        if query.action == "withdraw"
+        else "calldata-instrument-deposit-swap.json"
+    )
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
+    )
+    payload.update(
+        instrumentId=instrument_id,
+        account=query.account,
+        amountIn=query.amount,
+        expiresAt=None,
+    )
+    if query.action == "withdraw":
+        if query.amount != "max":
+            payload["expectedOut"] = payload["minOut"] = query.amount
+    else:
+        payload["requires"] = [{"token": BASE_USDC, "amount": query.amount}]
+        payload["leftovers"] = []
+    return InstrumentCalldataResponse.model_validate(payload)
 
 
 class ExecutionSignerSpy:
@@ -327,7 +365,7 @@ class ExecutionSignerSpy:
 
 class ExecutionOneTxClient:
     instances: list["ExecutionOneTxClient"] = []
-    build_buy_bodies: list[dict[str, object]] = []
+    calldata_requests: list[tuple[str, InstrumentCalldataQuery]] = []
 
     def __init__(self, config: object) -> None:
         self.config = config
@@ -378,31 +416,21 @@ class ExecutionOneTxClient:
     def instrument_analysis(self, instrument_id: str) -> dict[str, object]:
         return {}
 
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        self.build_buy_bodies.append(body)
-        return {
-            "transactions": [
-                {
-                    "to": "0x0000000000000000000000000000000000000002",
-                    "data": "0xapprove",
-                    "value": 0,
-                    "chainId": 8453,
-                    "type": "approve",
-                },
-                {
-                    "to": "0x0000000000000000000000000000000000000003",
-                    "data": "0xbuy",
-                    "value": 0,
-                    "chainId": 8453,
-                    "type": "deposit",
-                },
-            ]
-        }
+    def loops(self) -> Any:
+        return SimpleNamespace(data=())
+
+    def instrument_calldata(
+        self,
+        instrument_id: str,
+        query: InstrumentCalldataQuery,
+    ) -> InstrumentCalldataResponse:
+        self.calldata_requests.append((instrument_id, query))
+        return calldata_response(instrument_id, query)
 
 
 class RebalanceOneTxClient:
     instances: list["RebalanceOneTxClient"] = []
-    calls: list[tuple[str, dict[str, object]]] = []
+    calls: list[tuple[str, str, str]] = []
 
     def __init__(self, config: object) -> None:
         self.config = config
@@ -422,6 +450,8 @@ class RebalanceOneTxClient:
                     protocol="aave",
                     chainId=8453,
                     tokenSymbol="USDC",
+                    tokenAddress=BASE_USDC,
+                    tokenDecimals=6,
                     tvl=10_000_000,
                     rewardDependence=0.1,
                     curator="curator-a",
@@ -431,6 +461,8 @@ class RebalanceOneTxClient:
                     protocol="aave",
                     chainId=8453,
                     tokenSymbol="USDC",
+                    tokenAddress=BASE_USDC,
+                    tokenDecimals=6,
                     tvl=10_000_000,
                     rewardDependence=0.1,
                     curator="curator-a",
@@ -454,32 +486,16 @@ class RebalanceOneTxClient:
     def instrument_analysis(self, instrument_id: str) -> dict[str, object]:
         return {}
 
-    def build_sell(self, body: dict[str, object]) -> dict[str, Any]:
-        self.calls.append(("sell", body))
-        return {
-            "transactions": [
-                {
-                    "to": "0x0000000000000000000000000000000000000002",
-                    "data": "0xsell",
-                    "value": 0,
-                    "chainId": 8453,
-                }
-            ]
-        }
+    def loops(self) -> Any:
+        return SimpleNamespace(data=())
 
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        self.calls.append(("buy", body))
-        return {
-            "transactions": [
-                {
-                    "to": "0x0000000000000000000000000000000000000003",
-                    "data": "0xbuy",
-                    "value": 0,
-                    "chainId": 8453,
-                    "type": "deposit",
-                }
-            ]
-        }
+    def instrument_calldata(
+        self,
+        instrument_id: str,
+        query: InstrumentCalldataQuery,
+    ) -> InstrumentCalldataResponse:
+        self.calls.append((query.action, instrument_id, query.amount))
+        return calldata_response(instrument_id, query)
 
     def positions(self, _body: dict[str, object]) -> dict[str, Any]:
         return {
@@ -494,7 +510,7 @@ class RebalanceOneTxClient:
 
 class WithdrawOneTxClient:
     instances: list["WithdrawOneTxClient"] = []
-    calls: list[dict[str, object]] = []
+    calls: list[tuple[str, str]] = []
 
     def __init__(self, config: object) -> None:
         self.config = config
@@ -506,19 +522,13 @@ class WithdrawOneTxClient:
     def __exit__(self, *args: object) -> None:
         pass
 
-    def build_sell(self, body: dict[str, object]) -> dict[str, Any]:
-        self.calls.append(body)
-        return {
-            "expectedUsdc": "79.50",
-            "transactions": [
-                {
-                    "to": "0x0000000000000000000000000000000000000002",
-                    "data": "0xsell",
-                    "value": 0,
-                    "chainId": 8453,
-                }
-            ],
-        }
+    def instrument_calldata(
+        self,
+        instrument_id: str,
+        query: InstrumentCalldataQuery,
+    ) -> InstrumentCalldataResponse:
+        self.calls.append((instrument_id, query.amount))
+        return calldata_response(instrument_id, query)
 
 
 def install_execution_surface_mocks(
@@ -533,7 +543,7 @@ def install_execution_surface_mocks(
     )
     signer = ExecutionSignerSpy(fail_at=fail_at)
     ExecutionOneTxClient.instances = []
-    ExecutionOneTxClient.build_buy_bodies = []
+    ExecutionOneTxClient.calldata_requests = []
     monkeypatch.setattr(cli, "OneTxClient", ExecutionOneTxClient)
     monkeypatch.setattr(cli, "signer_from_config", lambda _config: signer)
     return signer
@@ -584,6 +594,8 @@ def execution_instrument() -> dict[str, Any]:
         rewardDependence=0.1,
         liquidity=5_000_000,
         curator="curator-a",
+        tokenAddress=BASE_USDC,
+        tokenDecimals=6,
     )
 
 
@@ -1482,16 +1494,12 @@ def test_build_tx_emits_schema_valid_plan_and_does_not_send(
     assert result.exit_code == 0
     payload = parse_single_stdout_object(result.stdout)
     assert validate(payload, "tx-plan") == payload
-    assert [step["kind"] for step in payload["steps"]] == ["approve", "buy"]
+    assert [step["kind"] for step in payload["steps"]] == DEPOSIT_KINDS
     assert signer.sent == []
-    assert ExecutionOneTxClient.build_buy_bodies == [
-        {
-            "userAddress": "0x0000000000000000000000000000000000000001",
-            "instrumentId": "base-aave-usdc",
-            "amountUsdc": "100",
-            "sourceChainId": 8453,
-        }
-    ]
+    assert [
+        (instrument_id, query.action, query.amount)
+        for instrument_id, query in ExecutionOneTxClient.calldata_requests
+    ] == [("base-aave-usdc", "deposit", "100000000")]
 
 
 def test_execute_without_confirm_announces_plan_and_does_not_broadcast(
@@ -1516,10 +1524,7 @@ def test_execute_without_confirm_announces_plan_and_does_not_broadcast(
     payload = parse_single_stdout_object(result.stdout)
     assert payload["status"] == "planned"
     assert payload["policy_result"] == {"ok": True, "violations": []}
-    assert [step["data"] for step in payload["plan"]["steps"]] == [
-        "0xapprove",
-        "0xbuy",
-    ]
+    assert [step["kind"] for step in payload["plan"]["steps"]] == DEPOSIT_KINDS
     assert payload["receipts"] == []
     assert signer.sent == []
 
@@ -1546,13 +1551,12 @@ def test_execute_with_confirm_broadcasts_and_emits_execution_report(
     assert result.exit_code == 0
     payload = parse_single_stdout_object(result.stdout)
     assert payload["status"] == "success"
-    assert [step["status"] for step in payload["steps"]] == ["sent", "sent"]
+    assert [step["status"] for step in payload["steps"]] == ["sent"] * 5
     assert [receipt["transaction_hash"] for receipt in payload["receipts"]] == [
-        f"0x{1:064x}",
-        f"0x{2:064x}",
+        f"0x{index:064x}" for index in range(1, 6)
     ]
-    assert [getattr(sent[0], "data") for sent in signer.sent] == ["0xapprove", "0xbuy"]
-    assert [sent[1] for sent in signer.sent] == ["rpc://base", "rpc://base"]
+    assert [step["kind"] for step in payload["plan"]["steps"]] == DEPOSIT_KINDS
+    assert [sent[1] for sent in signer.sent] == ["rpc://base"] * 5
 
 
 def test_execute_confirmed_uses_durable_idempotency_store_on_retry(
@@ -1582,8 +1586,9 @@ def test_execute_confirmed_uses_durable_idempotency_store_on_retry(
     assert json.loads(failed_result.stderr) == {"error": "transaction broadcast failed"}
     assert retry_result.exit_code == 0
     payload = parse_single_stdout_object(retry_result.stdout)
-    assert [step["status"] for step in payload["steps"]] == ["skipped", "sent"]
-    assert [getattr(sent[0], "data") for sent in signer.sent] == ["0xapprove", "0xbuy"]
+    assert [step["status"] for step in payload["steps"]] == ["skipped"] + ["sent"] * 4
+    # The call that landed before the failure is not sent again.
+    assert len(signer.sent) == 5
 
 
 def test_build_tx_and_execute_dry_run_and_confirmed_share_plan(
@@ -1605,7 +1610,7 @@ def test_build_tx_and_execute_dry_run_and_confirmed_share_plan(
     dry_run_plan = parse_single_stdout_object(dry_run_result.stdout)["plan"]
     confirmed_plan = parse_single_stdout_object(confirmed_result.stdout)["plan"]
     assert build_plan == dry_run_plan == confirmed_plan
-    assert len(signer.sent) == 2
+    assert len(signer.sent) == 5
 
 
 def _calldata_dry_run(
@@ -1638,24 +1643,15 @@ def _calldata_dry_run(
         messages=("wallet note",),
         blockers=blockers,
     )
-    allocation = Allocation(legs=(), total_usd=0, metadata={})
     monkeypatch.setattr(
         cli,
         "_build_execution_plan",
         lambda _allocation, _policy: (
-            allocation,
-            None,
             TxPlan(steps=(), summary="calldata plan"),
-            [],
             preparation,
             (),
-            None,
+            PolicyResult(ok=True, violations=()),
         ),
-    )
-    monkeypatch.setattr(
-        cli.policy_core,
-        "check",
-        lambda *_args: PolicyResult(ok=True, violations=()),
     )
 
 
@@ -1787,9 +1783,14 @@ def test_rebalance_without_confirm_plans_deltas_and_does_not_broadcast(
         ("sell", "vault-a"),
         ("buy", "vault-b"),
     ]
-    assert [step["kind"] for step in payload["plan"]["steps"]] == ["sell", "buy"]
-    assert [call[0] for call in RebalanceOneTxClient.calls] == ["sell", "buy"]
-    assert RebalanceOneTxClient.calls[0][1]["yieldTokenAmount"] == "30"
+    assert [step["kind"] for step in payload["plan"]["steps"]] == [
+        "withdraw",
+        *DEPOSIT_KINDS,
+    ]
+    assert RebalanceOneTxClient.calls == [
+        ("withdraw", "vault-a", "30000000"),
+        ("deposit", "vault-b", "30000000"),
+    ]
     assert signer.sent == []
 
 
@@ -1817,9 +1818,12 @@ def test_rebalance_with_confirm_broadcasts_sell_before_buy(
     assert result.exit_code == 0, (result.stdout, result.stderr, result.exception)
     payload = parse_single_stdout_object(result.stdout)
     assert payload["status"] == "success"
-    assert [step["status"] for step in payload["steps"]] == ["sent", "sent"]
-    assert [getattr(sent[0], "data") for sent in signer.sent] == ["0xsell", "0xbuy"]
-    assert [call[0] for call in RebalanceOneTxClient.calls] == ["sell", "buy"]
+    assert [step["status"] for step in payload["steps"]] == ["sent"] * 6
+    assert [getattr(sent[0], "kind") for sent in signer.sent] == [
+        "withdraw",
+        *DEPOSIT_KINDS,
+    ]
+    assert [call[0] for call in RebalanceOneTxClient.calls] == ["withdraw", "deposit"]
 
 
 def test_rebalance_autonomous_false_requires_confirm(
@@ -1875,15 +1879,9 @@ def test_withdraw_with_confirm_uses_positions_output_and_sells_shares(
     assert payload["status"] == "success"
     assert payload["withdraw_plan"]["instrument_id"] == "vault-a"
     assert payload["withdraw_plan"]["yield_token_amount"] == "80.000000"
-    assert payload["sell"]["expected_usdc"] == "79.50"
-    assert WithdrawOneTxClient.calls == [
-        {
-            "userAddress": "0x0000000000000000000000000000000000000001",
-            "instrumentId": "vault-a",
-            "yieldTokenAmount": "80.000000",
-        }
-    ]
-    assert [getattr(sent[0], "data") for sent in signer.sent] == ["0xsell"]
+    assert payload["sell"]["expected_usdc"] == "50.001234"
+    assert WithdrawOneTxClient.calls == [("vault-a", "max")]
+    assert [getattr(sent[0], "kind") for sent in signer.sent] == ["withdraw"]
 
 
 @pytest.mark.parametrize("flag", [None, "--unsafe", "--autonomous"])
@@ -1914,7 +1912,7 @@ def test_withdraw_without_confirm_is_a_dry_run_that_sends_nothing(
     assert payload["status"] == "planned"
     assert payload["messages"][0] == "dry-run only; no transactions broadcast"
     assert payload["withdraw_plan"]["yield_token_amount"] == "80.000000"
-    assert [step["data"] for step in payload["plan"]["steps"]] == ["0xsell"]
+    assert [step["kind"] for step in payload["plan"]["steps"]] == ["withdraw"]
     assert signer.sent == []
 
 
@@ -1986,7 +1984,7 @@ def test_wallet_status_does_not_demand_native_gas_when_gas_is_paid_in_usdc(
     """
     set_paymaster_config(monkeypatch)
     ExecutionOneTxClient.instances = []
-    ExecutionOneTxClient.build_buy_bodies = []
+    ExecutionOneTxClient.calldata_requests = []
     monkeypatch.setattr(cli, "OneTxClient", ExecutionOneTxClient)
     monkeypatch.setattr(cli, "signer_from_config", lambda _config: ExecutionSignerSpy())
     monkeypatch.setattr(
@@ -2013,7 +2011,7 @@ def test_wallet_status_flags_a_chain_the_paymaster_cannot_price(
     """Not executable here means "no USDC gas on this chain", not "no ETH"."""
     set_paymaster_config(monkeypatch)
     ExecutionOneTxClient.instances = []
-    ExecutionOneTxClient.build_buy_bodies = []
+    ExecutionOneTxClient.calldata_requests = []
     monkeypatch.setattr(cli, "OneTxClient", ExecutionOneTxClient)
     monkeypatch.setattr(cli, "signer_from_config", lambda _config: ExecutionSignerSpy())
 

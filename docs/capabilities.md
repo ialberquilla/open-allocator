@@ -332,13 +332,10 @@ blocks.
   shelf you have, not uniformly.
 - **A build response cannot price a buy.** Neither 1Tx API takes or returns a
   share amount, and the receipt carries no logs, so a rebalance buy reads the
-  settled position and logs the exact share delta. What happens before that
-  delta is observable depends on `ONE_TX_TRANSACTION_API`:
-  - `legacy` — no row is appended and the rebalance stays `in_progress`; a
-    rerun retries the read without rebroadcasting.
-  - `calldata` — the row is appended at once with the USDC the deposit spent
-    and no shares (`basis: "unresolved"`), and the report says the cost basis
-    is not yet observable. The leg is complete, so a rerun does not retry.
+  settled position and logs the exact share delta. Until that delta is
+  observable the row is appended with the USDC the deposit spent and no shares
+  (`basis: "unresolved"`), and the report says the cost basis is not yet
+  observable. The leg is complete, so a rerun does not retry.
 
   Unresolved buy entries, including every calldata deposit made outside a
   rebalance, cannot contribute a per-share cost basis. Sells and withdrawals

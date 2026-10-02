@@ -10,7 +10,6 @@ import pytest
 from open_allocator.core.checkpoint import (
     AllocationLogEntry,
     Checkpoint,
-    read_allocation_log,
 )
 from open_allocator.core.positions import IdleBalance, PositionHolding, Positions
 from open_allocator.core.rebalance import RebalancePolicyError, plan_rebalance
@@ -34,8 +33,6 @@ from open_allocator.exec.client import (
     InstrumentCalldataResponse,
 )
 from open_allocator.exec.execute import (
-    ExecutionBroadcastError,
-    FundingLedger,
     GasCheck,
 )
 from open_allocator.exec.paymaster_types import (
@@ -152,22 +149,6 @@ def known(*instrument_ids: str) -> list[Vault]:
 
 
 @dataclass
-class MockRebalanceClient:
-    sell_responses: list[dict[str, Any]]
-    buy_responses: list[dict[str, Any]]
-    sell_bodies: list[dict[str, object]] = field(default_factory=list)
-    buy_bodies: list[dict[str, object]] = field(default_factory=list)
-
-    def build_sell(self, body: dict[str, object]) -> dict[str, Any]:
-        self.sell_bodies.append(body)
-        return self.sell_responses.pop(0)
-
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        self.buy_bodies.append(body)
-        return self.buy_responses.pop(0)
-
-
-@dataclass
 class MockSigner:
     fail_at: int | None = None
     sent: list[tuple[TxStep, str]] = field(default_factory=list)
@@ -205,9 +186,6 @@ class Config:
         default_factory=lambda: {8453: "rpc://base", 42161: "rpc://arb", 10: "rpc://op"}
     )
     settle_waiter: object = lambda: None  # never sleep in tests
-    # Off by default so the funding tests measure routing, not the reserve.
-    # test_the_paymaster_reserve_is_held_back covers the reserve on its own.
-    paymaster_reserve_usd: float = 0.0
 
 
 class MemoryStateBackend:
@@ -241,158 +219,6 @@ class MemoryStateBackend:
 
     def completed_value(self, scope: str, key: str) -> Any:
         return self.completed.get((scope, key))
-
-
-@dataclass(frozen=True)
-class StateConfig(Config):
-    state_backend: object = field(default_factory=MemoryStateBackend)
-    position_settlement_attempts: int = 1
-
-
-@dataclass
-class PositionAwareClient(MockRebalanceClient):
-    observed_shares: list[str | None] = field(default_factory=list)
-
-    def positions(self, _body: dict[str, object]) -> dict[str, Any]:
-        value = self.observed_shares.pop(0)
-        if value is None:
-            return {"positions": []}
-        return {
-            "positions": [
-                {
-                    "instrumentId": "vault-b",
-                    "protocol": "aave",
-                    "symbol": "USDC",
-                    "balance": value,
-                    "balanceRaw": value.replace(".", ""),
-                    "decimals": 6,
-                    "usdValue": value,
-                    "shareBalance": value,
-                    "shareBalanceRaw": value.replace(".", ""),
-                    "shareDecimals": 6,
-                    "yieldTokenSymbol": "aUSDC",
-                    "yieldTokenAddress": "0x0000000000000000000000000000000000000002",
-                }
-            ]
-        }
-
-
-def response(data: str, *, type_: str | None = None) -> dict[str, Any]:
-    transaction: dict[str, object] = {
-        "to": "0x0000000000000000000000000000000000000002",
-        "data": data,
-        "value": 0,
-        "chainId": 8453,
-    }
-    if type_ is not None:
-        transaction["type"] = type_
-    return {"transactions": [transaction]}
-
-
-def test_confirmed_buy_persists_the_settled_share_boundary() -> None:
-    backend = MemoryStateBackend()
-    config = StateConfig(state_backend=backend)
-    client = PositionAwareClient([], [response("0xbuy")], observed_shares=["9.5"])
-
-    report = execute_rebalance(
-        client,
-        MockSigner(),
-        positions_snapshot(holding("vault-a", "90"), idle_usdc="10"),
-        allocation(("vault-a", 0.9), ("vault-b", 0.1)),
-        policy(),
-        confirm=True,
-        known_instruments=known("vault-a", "vault-b"),
-        config=config,
-        idempotency_store={},
-    )
-
-    entries = read_allocation_log(backend=backend)
-    assert report.status == "success"
-    assert len(entries) == 1
-    assert entries[0].usd == 10
-    assert entries[0].shares == "9.5"
-    assert entries[0].share_price == "1.05263157894736842"
-    assert entries[0].basis == "derived"
-    assert entries[0].tx_hash == f"0x{1:064x}"
-
-
-def test_confirmed_top_up_logs_only_the_new_shares() -> None:
-    backend = MemoryStateBackend()
-    client = PositionAwareClient([], [response("0xbuy")], observed_shares=["49.5"])
-    execute_rebalance(
-        client,
-        MockSigner(),
-        positions_snapshot(
-            holding("vault-a", "50"), holding("vault-b", "40"), idle_usdc="10"
-        ),
-        allocation(("vault-a", 0.5), ("vault-b", 0.5)),
-        policy(),
-        confirm=True,
-        known_instruments=known("vault-a", "vault-b"),
-        config=StateConfig(state_backend=backend),
-        idempotency_store={},
-    )
-
-    assert read_allocation_log(backend=backend)[0].shares == "9.5"
-
-
-def test_confirmed_buy_with_stale_positions_remains_unattributed() -> None:
-    backend = MemoryStateBackend()
-    client = PositionAwareClient([], [response("0xbuy")], observed_shares=[None])
-    report = execute_rebalance(
-        client,
-        MockSigner(),
-        positions_snapshot(holding("vault-a", "90"), idle_usdc="10"),
-        allocation(("vault-a", 0.9), ("vault-b", 0.1)),
-        policy(),
-        confirm=True,
-        known_instruments=known("vault-a", "vault-b"),
-        config=StateConfig(state_backend=backend),
-        idempotency_store={},
-    )
-
-    assert report.status == "in_progress"
-    assert read_allocation_log(backend=backend) == ()
-    assert any("cost basis" in message for message in report.messages)
-
-
-def test_retry_attributes_a_confirmed_buy_without_rebroadcasting() -> None:
-    backend = MemoryStateBackend()
-    config = StateConfig(state_backend=backend)
-    store: dict[str, object] = {}
-    current = positions_snapshot(holding("vault-a", "90"), idle_usdc="10")
-    target = allocation(("vault-a", 0.9), ("vault-b", 0.1))
-
-    first_signer = MockSigner()
-    first = execute_rebalance(
-        PositionAwareClient([], [response("0xbuy")], observed_shares=[None]),
-        first_signer,
-        current,
-        target,
-        policy(),
-        confirm=True,
-        known_instruments=known("vault-a", "vault-b"),
-        config=config,
-        idempotency_store=store,
-    )
-    second_signer = MockSigner()
-    second = execute_rebalance(
-        PositionAwareClient([], [response("0xbuy-retry")], observed_shares=["9.5"]),
-        second_signer,
-        current,
-        target,
-        policy(),
-        confirm=True,
-        known_instruments=known("vault-a", "vault-b"),
-        config=config,
-        idempotency_store=store,
-    )
-
-    assert first.status == "in_progress"
-    assert second.status == "success"
-    assert len(first_signer.sent) == 1
-    assert second_signer.sent == []
-    assert len(read_allocation_log(backend=backend)) == 1
 
 
 def test_plan_rebalance_executes_only_changed_legs_and_skips_dust() -> None:
@@ -484,9 +310,8 @@ def test_plan_rebalance_partial_sell_without_raw_balance_has_no_calldata_amount(
 
 
 def test_plan_rebalance_survives_a_zero_raw_balance_against_a_live_value() -> None:
-    # Planning runs before either transaction API is chosen, so a venue that
-    # reports balance_raw as "0" against a live usd_value must not fail the
-    # plan: a legacy rebalance sells shares and never reads calldata_amount.
+    # A venue that reports balance_raw as "0" against a live usd_value must not
+    # fail the plan; the sell simply carries no calldata amount.
     zero_raw = holding("vault-a", "80").model_copy(update={"balance_raw": "0"})
     current = positions_snapshot(zero_raw, holding("vault-b", "20"))
 
@@ -536,7 +361,7 @@ def test_policy_violation_aborts_before_trade_plan() -> None:
 
 
 def test_autonomous_rebalance_false_blocks_unattended_execution() -> None:
-    client = MockRebalanceClient([response("0xsell")], [response("0xbuy")])
+    client = CalldataRebalanceClient(chains={"vault-a": 8453, "vault-b": 8453})
     signer = MockSigner()
     current = positions_snapshot(holding("vault-a", "80"), holding("vault-b", "20"))
 
@@ -549,189 +374,11 @@ def test_autonomous_rebalance_false_blocks_unattended_execution() -> None:
             policy(autonomous_rebalance=False),
             autonomous=True,
             known_instruments=known("vault-a", "vault-b"),
-            config=Config(),
+            config=CalldataConfig(),
         )
 
     assert signer.address_calls == 0
-    assert client.sell_bodies == []
-    assert client.buy_bodies == []
-
-
-def test_confirmed_rebalance_sells_before_buys_and_retries_from_store() -> None:
-    store: dict[str, object] = {}
-    current = positions_snapshot(holding("vault-a", "80"), holding("vault-b", "20"))
-    target = allocation(("vault-a", 0.5), ("vault-b", 0.5))
-    first_client = MockRebalanceClient(
-        [response("0xsell")],
-        [response("0xbuy")],
-    )
-    first_signer = MockSigner(fail_at=1)
-
-    with pytest.raises(ExecutionBroadcastError):
-        execute_rebalance(
-            first_client,
-            first_signer,
-            current,
-            target,
-            policy(),
-            confirm=True,
-            known_instruments=known("vault-a", "vault-b"),
-            config=Config(),
-            idempotency_store=store,
-        )
-
-    assert [sent[0].data for sent in first_signer.sent] == ["0xsell"]
-    assert "leg:0:vault-a" in store
-    retry_client = MockRebalanceClient([], [response("0xbuy-retry")])
-    retry_signer = MockSigner()
-
-    report = execute_rebalance(
-        retry_client,
-        retry_signer,
-        current,
-        target,
-        policy(),
-        confirm=True,
-        known_instruments=known("vault-a", "vault-b"),
-        config=Config(),
-        idempotency_store=store,
-    )
-
-    assert report.status == "success"
-    assert retry_client.sell_bodies == []
-    assert [body["instrumentId"] for body in retry_client.buy_bodies] == ["vault-b"]
-    assert [sent[0].data for sent in retry_signer.sent] == ["0xbuy-retry"]
-
-
-@dataclass
-class PendingRebalanceSigner:
-    """A Safe below its threshold: every leg is proposed, none broadcast."""
-
-    sent: list[TxStep] = field(default_factory=list)
-
-    def address(self) -> str:
-        return ADDRESS
-
-    def send(self, tx: TxStep, rpc_url: str) -> Receipt:
-        self.sent.append(tx)
-        return Receipt(
-            transaction_hash="0xproposal",
-            block_number=0,
-            gas_used=0,
-            status=0,
-            from_address=ADDRESS,
-            to_address=tx.to,
-            pending=True,
-            execution_status="safe_proposed",
-        )
-
-
-def test_a_proposed_rebalance_is_not_reported_as_a_completed_rebalance() -> None:
-    """The book has not moved until the co-signers execute the proposals."""
-    current = positions_snapshot(holding("vault-a", "80"), holding("vault-b", "20"))
-    target = allocation(("vault-a", 0.5), ("vault-b", 0.5))
-
-    report = execute_rebalance(
-        MockRebalanceClient([response("0xsell")], [response("0xbuy")]),
-        PendingRebalanceSigner(),
-        current,
-        target,
-        policy(),
-        confirm=True,
-        known_instruments=known("vault-a", "vault-b"),
-        config=Config(),
-    )
-
-    assert report.status == "in_progress"
-    assert report.in_progress is True
-    assert any("awaiting threshold" in message for message in report.messages)
-
-
-# ── funding: a sell pays for a buy inside the same batch ──────────────────────
-#
-# The bug (agent-showcase A7, 2026-08-20): every buy was planned against the
-# balances the wallet held BEFORE the batch, so a sell-funded buy was rejected by
-# 1Tx with "No chain has sufficient USDC balance" even though the batch orders
-# sells first and the money is there by the time the buy runs.
-
-
-def test_ledger_prefers_the_vaults_own_chain_so_no_bridge_is_needed() -> None:
-    ledger = FundingLedger({8453: 50.0, 42161: 90.0})
-
-    assert ledger.plan_sources(8453, 30.0) == ((8453, 30.0),)
-    assert ledger.available[8453] == pytest.approx(20.0), "debited, not just read"
-    assert ledger.available[42161] == pytest.approx(90.0), "untouched"
-
-
-def test_ledger_falls_back_to_the_best_funded_chain_then_splits() -> None:
-    ledger = FundingLedger({8453: 10.0, 42161: 30.0, 143: 5.0})
-
-    # Own chain cannot cover it alone, so draw from it first, then the largest.
-    sources = ledger.plan_sources(8453, 25.0)
-
-    assert sources == ((8453, 10.0), (42161, 15.0))
-    assert sum(usd for _, usd in sources) == pytest.approx(25.0)
-    assert ledger.available[8453] == pytest.approx(0.0)
-    assert ledger.available[42161] == pytest.approx(15.0)
-    assert ledger.available[143] == pytest.approx(5.0), "never needed"
-
-
-def test_ledger_credits_a_sell_and_then_the_buy_it_pays_for_fits() -> None:
-    ledger = FundingLedger({8453: 1.0})
-
-    assert ledger.plan_sources(8453, 12.56) == (), "before the sell: nothing fits"
-    ledger.credit(8453, 12.0)
-    assert ledger.plan_sources(8453, 12.56) == ((8453, 12.56),), "after: it does"
-
-
-def test_ledger_refuses_to_split_what_it_cannot_cover_in_aggregate() -> None:
-    """Better one op 1Tx rejects than three that cannot all settle."""
-    ledger = FundingLedger({8453: 5.0, 42161: 5.0})
-
-    assert ledger.plan_sources(8453, 25.0) == ()
-    assert ledger.available == {8453: 5.0, 42161: 5.0}, "nothing debited"
-
-
-def test_ledger_ignores_dust_chains_and_an_unknown_amount() -> None:
-    ledger = FundingLedger({8453: 0.004, 42161: 20.0})
-
-    assert ledger.plan_sources(42161, None) == (), "unknown amount: let 1Tx pick"
-    assert ledger.plan_sources(8453, 15.0) == ((42161, 15.0),), "dust is not a source"
-
-
-@dataclass
-class BalanceAwareClient(MockRebalanceClient):
-    """A client that reports idle USDC per chain and settles sells into it.
-
-    The settlement half matters: the staged executor re-reads balances between
-    the sells and the buys, so a mock that never credits a sell would test the
-    executor against a wallet that behaves nothing like the real one.
-    """
-
-    idle: dict[int, float] = field(default_factory=dict)
-    sell_credits: dict[str, tuple[int, float]] = field(default_factory=dict)
-
-    def balances(self, _address: str) -> dict[str, Any]:
-        return {
-            "balances": [
-                {"chainId": chain, "usdcBalance": usdc}
-                for chain, usdc in self.idle.items()
-            ]
-        }
-
-    def build_sell(self, body: dict[str, object]) -> dict[str, Any]:
-        credit = self.sell_credits.get(str(body["instrumentId"]))
-        if credit is not None:
-            chain, usd = credit
-            self.idle[chain] = self.idle.get(chain, 0.0) + usd
-        return super().build_sell(body)
-
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        chain = body.get("sourceChainId")
-        if isinstance(chain, int):
-            spent = float(str(body["amountUsdc"]))
-            self.idle[chain] = max(0.0, self.idle.get(chain, 0.0) - spent)
-        return super().build_buy(body)
+    assert client.requests == []
 
 
 def chain_holding(instrument_id: str, balance: str, chain_id: int) -> PositionHolding:
@@ -755,266 +402,7 @@ def bare_positions(*holdings: PositionHolding) -> Positions:
     )
 
 
-def test_a_sell_funds_a_buy_on_the_same_chain_with_no_idle_at_all() -> None:
-    """A7 end to end: the wallet holds zero USDC, and the buy still gets a source."""
-    current = bare_positions(
-        chain_holding("vault-a", "20", 8453),
-        chain_holding("vault-b", "80", 8453),
-    )
-    # vault-a 20 -> 10 (sell 10), vault-b unchanged, vault-c 0 -> 10 (buy 10)
-    target = allocation(("vault-a", 0.1), ("vault-b", 0.8), ("vault-c", 0.1))
-    client = BalanceAwareClient(
-        [response("0xsell")],
-        [response("0xbuy")],
-        idle={},
-        sell_credits={"vault-a": (8453, 10.0)},
-    )
-
-    execute_rebalance(
-        client,
-        MockSigner(),
-        current,
-        target,
-        policy(autonomous_rebalance=True),
-        known_instruments=known("vault-a", "vault-b", "vault-c"),
-        config=Config(),
-        confirm=True,
-    )
-
-    assert len(client.buy_bodies) == 1, "one chain covers it, so one op"
-    body = client.buy_bodies[0]
-    assert body["sourceChainId"] == 8453, "the chain the sell proceeds landed on"
-    assert float(body["amountUsdc"]) == pytest.approx(10.0)
-
-
-def test_a_buy_splits_into_several_ops_when_no_single_chain_covers_it() -> None:
-    current = bare_positions(
-        chain_holding("vault-a", "50", 8453),
-        chain_holding("vault-b", "50", 42161),
-    )
-    # both sell 10; vault-c buys 20 — more than either chain frees on its own
-    target = allocation(("vault-a", 0.4), ("vault-b", 0.4), ("vault-c", 0.2))
-    client = BalanceAwareClient(
-        [response("0xsell-a"), response("0xsell-b")],
-        [response("0xbuy-1"), response("0xbuy-2")],
-        idle={},
-        sell_credits={"vault-a": (8453, 10.0), "vault-b": (42161, 10.0)},
-    )
-
-    execute_rebalance(
-        client,
-        MockSigner(),
-        current,
-        target,
-        policy(autonomous_rebalance=True),
-        known_instruments=[
-            chain_vault("vault-a", 8453),
-            chain_vault("vault-b", 42161),
-            chain_vault("vault-c", 10),
-        ],
-        config=Config(),
-        confirm=True,
-    )
-
-    assert len(client.buy_bodies) == 2, "two funding chains, two ops"
-    assert {b["sourceChainId"] for b in client.buy_bodies} == {8453, 42161}
-    assert sum(float(b["amountUsdc"]) for b in client.buy_bodies) == pytest.approx(20.0)
-
-
-def test_split_buy_ops_get_distinct_idempotency_keys() -> None:
-    """Two ops for one leg must not collapse onto one key, or a retry drops one."""
-    store: dict[str, object] = {}
-    current = bare_positions(
-        chain_holding("vault-a", "50", 8453),
-        chain_holding("vault-b", "50", 42161),
-    )
-    target = allocation(("vault-a", 0.4), ("vault-b", 0.4), ("vault-c", 0.2))
-    client = BalanceAwareClient(
-        [response("0xsell-a"), response("0xsell-b")],
-        [response("0xbuy-1"), response("0xbuy-2")],
-        idle={},
-        sell_credits={"vault-a": (8453, 10.0), "vault-b": (42161, 10.0)},
-    )
-
-    execute_rebalance(
-        client,
-        MockSigner(),
-        current,
-        target,
-        policy(autonomous_rebalance=True),
-        known_instruments=[
-            chain_vault("vault-a", 8453),
-            chain_vault("vault-b", 42161),
-            chain_vault("vault-c", 10),
-        ],
-        config=Config(),
-        idempotency_store=store,
-        confirm=True,
-    )
-
-    buy_keys = [key for key in store if "src" in str(key)]
-    assert len(buy_keys) == len(set(buy_keys)) == 2
-
-
-def test_split_buy_ops_log_their_own_share_deltas_and_usd() -> None:
-    class SettlingSplitClient(BalanceAwareClient):
-        settled = iter(("4", "10"))
-
-        def positions(self, body: dict[str, object]) -> dict[str, Any]:
-            assert body["chainId"] == 10, "read the destination, not funding chain"
-            shares = next(self.settled)
-            return {"positions": [{"instrumentId": "vault-c", "shareBalance": shares}]}
-
-    backend = MemoryStateBackend()
-    current = bare_positions(
-        chain_holding("vault-a", "50", 8453),
-        chain_holding("vault-b", "50", 42161),
-    )
-    client = SettlingSplitClient(
-        [response("0xsell-a"), response("0xsell-b")],
-        [response("0xbuy-1"), response("0xbuy-2")],
-        idle={},
-        sell_credits={"vault-a": (8453, 10.0), "vault-b": (42161, 10.0)},
-    )
-
-    execute_rebalance(
-        client,
-        MockSigner(),
-        current,
-        allocation(("vault-a", 0.4), ("vault-b", 0.4), ("vault-c", 0.2)),
-        policy(autonomous_rebalance=True),
-        known_instruments=[
-            chain_vault("vault-a", 8453),
-            chain_vault("vault-b", 42161),
-            chain_vault("vault-c", 10),
-        ],
-        config=StateConfig(state_backend=backend),
-        idempotency_store={},
-        confirm=True,
-    )
-
-    buys = [entry for entry in backend.log if entry.action_type == "buy"]
-    assert [(entry.usd, entry.shares) for entry in buys] == [(10.0, "4"), (10.0, "6")]
-    assert all(entry.basis == "derived" for entry in buys)
-
-
-def test_a_buy_too_big_for_one_round_comes_back_for_the_remainder() -> None:
-    """Sell, buy what fits, discover it is still short, do another op.
-
-    The venue only credits half the sell before the first buy round, so the leg
-    can only be part-filled; the second round picks up what landed since.
-    """
-    current = bare_positions(
-        chain_holding("vault-a", "20", 8453),
-        chain_holding("vault-b", "80", 8453),
-    )
-    target = allocation(("vault-a", 0.1), ("vault-b", 0.8), ("vault-c", 0.1))
-
-    class DripClient(BalanceAwareClient):
-        """Half the proceeds land immediately, the rest on the next look."""
-
-        def balances(self, address: str) -> dict[str, Any]:
-            seen = super().balances(address)
-            self.idle[8453] = self.idle.get(8453, 0.0) + 4.0
-            return seen
-
-    client = DripClient(
-        [response("0xsell")],
-        [response("0xbuy-1"), response("0xbuy-2"), response("0xbuy-3")],
-        idle={},
-        sell_credits={"vault-a": (8453, 6.0)},
-    )
-
-    report = execute_rebalance(
-        client,
-        MockSigner(),
-        current,
-        target,
-        policy(autonomous_rebalance=True),
-        known_instruments=known("vault-a", "vault-b", "vault-c"),
-        config=Config(),
-        confirm=True,
-    )
-
-    assert len(client.buy_bodies) >= 2, "one round could not fill it"
-    total = sum(float(body["amountUsdc"]) for body in client.buy_bodies)
-    assert total == pytest.approx(10.0), "the rounds add up to the whole leg"
-    assert report.status == "success"
-
-
-def test_a_rebalance_that_cannot_be_funded_reports_what_is_outstanding() -> None:
-    """No progress ends the loop; the shortfall is stated, not spun on."""
-    current = bare_positions(
-        chain_holding("vault-a", "20", 8453),
-        chain_holding("vault-b", "80", 8453),
-    )
-    target = allocation(("vault-a", 0.1), ("vault-b", 0.8), ("vault-c", 0.1))
-    client = BalanceAwareClient(
-        [response("0xsell")],
-        [response("0xbuy")],
-        idle={8453: 2.0},
-        sell_credits={},  # the sell never settles
-    )
-
-    report = execute_rebalance(
-        client,
-        MockSigner(),
-        current,
-        target,
-        policy(autonomous_rebalance=True),
-        known_instruments=known("vault-a", "vault-b", "vault-c"),
-        config=Config(),
-        confirm=True,
-    )
-
-    assert report.in_progress is True
-    assert any("outstanding" in message for message in report.messages)
-    assert len(client.buy_bodies) == 1, "one partial op, then it stops"
-    assert float(client.buy_bodies[0]["amountUsdc"]) == pytest.approx(2.0)
-
-
-def test_the_paymaster_reserve_is_held_back_from_every_chain() -> None:
-    """Gas is paid in USDC from this balance, so it cannot all be deployed."""
-    current = bare_positions(
-        chain_holding("vault-a", "20", 8453),
-        chain_holding("vault-b", "80", 8453),
-    )
-    target = allocation(("vault-a", 0.1), ("vault-b", 0.8), ("vault-c", 0.1))
-    client = BalanceAwareClient(
-        [response("0xsell")],
-        [response("0xbuy")],
-        idle={},
-        sell_credits={"vault-a": (8453, 10.0)},
-    )
-
-    @dataclass(frozen=True)
-    class ReservedConfig(Config):
-        paymaster_reserve_usd: float = 0.75
-
-    execute_rebalance(
-        client,
-        MockSigner(),
-        current,
-        target,
-        policy(autonomous_rebalance=True),
-        known_instruments=known("vault-a", "vault-b", "vault-c"),
-        config=ReservedConfig(),
-        confirm=True,
-    )
-
-    spent = float(client.buy_bodies[0]["amountUsdc"])
-    assert spent == pytest.approx(9.25), "$10 freed, $0.75 kept back for gas"
-
-
-def test_the_reserve_is_a_floor_on_the_wallet_not_a_toll_on_each_sell() -> None:
-    ledger = FundingLedger({8453: 5.0}, reserve_usd=0.75)
-
-    assert ledger.available[8453] == pytest.approx(4.25)
-    ledger.credit(8453, 10.0)
-    assert ledger.available[8453] == pytest.approx(14.25), "charged once, not twice"
-
-
-# --- calldata API (ONE_TX_TRANSACTION_API=calldata) --------------------------
+# --- calldata fixtures -------------------------------------------------------
 
 FIXTURES = Path(__file__).parent / "fixtures"
 USDC_BY_CHAIN = {
@@ -1084,12 +472,6 @@ class CalldataRebalanceClient:
             ]
         }
 
-    def build_sell(self, body: dict[str, object]) -> dict[str, Any]:
-        raise AssertionError("the calldata path must not call the legacy builder")
-
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        raise AssertionError("the calldata path must not call the legacy builder")
-
     def deposits(self) -> list[tuple[str, str]]:
         return [
             (instrument_id, query.amount)
@@ -1113,7 +495,6 @@ def usdc_reader(idle: dict[int, int]) -> object:
 
 @dataclass(frozen=True)
 class CalldataConfig(Config):
-    transaction_api: str = "calldata"
     slippage_bps: int = 30
     token_balance_reader: object = field(default_factory=lambda: usdc_reader({}))
 

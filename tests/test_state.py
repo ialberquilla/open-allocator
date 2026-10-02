@@ -54,6 +54,10 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
+from open_allocator.exec.client import (
+    InstrumentCalldataQuery,
+    InstrumentCalldataResponse,
+)
 from open_allocator.exec.config import AllocatorConfig
 from open_allocator.exec.execute import GasCheck, execute_allocation
 from open_allocator.exec.signer import Receipt
@@ -101,12 +105,30 @@ class InMemoryBackend:
         return self.completed.get((scope, key))
 
 
-@dataclass
-class MockOneTxClient:
-    responses: list[dict[str, Any]]
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+FIXTURES = Path(__file__).parent / "fixtures"
 
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        return self.responses.pop(0)
+
+class MockOneTxClient:
+    def instrument_calldata(
+        self,
+        instrument_id: str,
+        query: InstrumentCalldataQuery,
+    ) -> InstrumentCalldataResponse:
+        payload = json.loads(
+            (FIXTURES / "calldata-instrument-deposit-swap.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        payload.update(
+            instrumentId=instrument_id,
+            account=query.account,
+            amountIn=query.amount,
+            requires=[{"token": BASE_USDC, "amount": query.amount}],
+            leftovers=[],
+            expiresAt=None,
+        )
+        return InstrumentCalldataResponse.model_validate(payload)
 
 
 @dataclass
@@ -148,6 +170,8 @@ class Config:
     _rpc_overrides: dict[int, str] = field(
         default_factory=lambda: {8453: "rpc://base"},
     )
+    slippage_bps: int = 30
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
 
 
 def fs_config(state_dir: Path, **overrides: object) -> Config:
@@ -209,21 +233,9 @@ def vault(instrument_id: str) -> Vault:
         tvl_usd=1_000_000,
         curator="curator-a",
         reward_dependence=0.1,
+        token_address=BASE_USDC,
+        token_decimals=6,
     )
-
-
-def buy_response() -> dict[str, Any]:
-    return {
-        "transactions": [
-            {
-                "to": "0x0000000000000000000000000000000000000002",
-                "data": "0xbuy",
-                "value": 0,
-                "chainId": 8453,
-                "type": "deposit",
-            },
-        ],
-    }
 
 
 def run_execution(config: Config, signer: MockSigner) -> object:
@@ -236,7 +248,7 @@ def run_execution(config: Config, signer: MockSigner) -> object:
     target = allocation("vault-a")
     store = cli._execution_idempotency_store(config, target)
     return execute_allocation(
-        MockOneTxClient([buy_response()]),
+        MockOneTxClient(),
         signer,
         target,
         policy(),
@@ -262,10 +274,12 @@ def test_a_fresh_filesystem_re_sends_the_trade_that_already_landed(
     signer = MockSigner()
 
     run_execution(fs_config(state_dir), signer)
+    first_run = len(signer.sent)
     shutil.rmtree(state_dir)  # what Cloud Run hands the retry
     run_execution(fs_config(state_dir), signer)
 
-    assert len(signer.sent) == 2
+    assert first_run > 0
+    assert len(signer.sent) == 2 * first_run
 
 
 def test_an_injected_backend_survives_the_filesystem_being_wiped(
@@ -277,12 +291,13 @@ def test_an_injected_backend_survives_the_filesystem_being_wiped(
     signer = MockSigner()
 
     run_execution(fs_config(state_dir, state_backend=backend), signer)
+    first_run = len(signer.sent)
     # `ignore_errors` because there is nothing to remove: the first run wrote
     # no files at all, which is the same claim as the assertion below.
     shutil.rmtree(state_dir, ignore_errors=True)
     report = run_execution(fs_config(state_dir, state_backend=backend), signer)
 
-    assert len(signer.sent) == 1
+    assert len(signer.sent) == first_run
     assert report.status == "success"
     assert not state_dir.exists(), "an injected backend must not touch the disk"
     assert len(backend.log) == 1

@@ -539,13 +539,8 @@ def ensure_calldata_supported(config: object | None) -> None:
     if (fee_bps is not None and int(fee_bps) > 0) or wallet is not None:
         raise CalldataUnsupportedError(
             "referral fees are not supported by the 1Tx calldata API; unset "
-            "ONE_TX_REFERRAL_FEE_BPS and ONE_TX_REFERRAL_WALLET or use "
-            "ONE_TX_TRANSACTION_API=legacy"
+            "ONE_TX_REFERRAL_FEE_BPS and ONE_TX_REFERRAL_WALLET"
         )
-
-
-def uses_calldata_api(config: object | None) -> bool:
-    return _config_value(config, "transaction_api") == "calldata"
 
 
 def validate_bridge_calldata(

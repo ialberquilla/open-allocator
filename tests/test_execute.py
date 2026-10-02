@@ -22,6 +22,7 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
+from open_allocator.exec import chains
 from open_allocator.exec.bundle_execution import UnderfundedPlanError
 from open_allocator.exec.calldata import (
     CalldataAmountError,
@@ -34,19 +35,16 @@ from open_allocator.exec.client import (
 from open_allocator.exec.erc4337_paymaster import (
     Erc4337PaymasterSigner,
     PaymasterRejected,
-    PaymasterUnsupportedChain,
     PaymasterUserOperationRequest,
     PaymasterUserOperationSubmission,
 )
 from open_allocator.exec.execute import (
-    ExecutionBroadcastError,
     GasCheck,
     GasPreflightError,
     PolicyCheckFailed,
     TransactionPlanError,
     execute_allocation,
     plan_calldata_allocation,
-    submission_groups,
 )
 from open_allocator.exec.paymaster_types import (
     PaymasterTokenQuote,
@@ -54,16 +52,6 @@ from open_allocator.exec.paymaster_types import (
     UserOperationGas,
 )
 from open_allocator.exec.signer import Receipt
-
-
-@dataclass
-class MockOneTxClient:
-    responses: list[dict[str, Any]]
-    bodies: list[dict[str, object]] = field(default_factory=list)
-
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        self.bodies.append(body)
-        return self.responses.pop(0)
 
 
 @dataclass
@@ -168,160 +156,8 @@ def vault(instrument_id: str, chain_id: int = 8453) -> Vault:
     )
 
 
-def buy_response(*transactions: dict[str, object], **extra: object) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "operationId": "op-1",
-        "transactions": list(transactions),
-    }
-    payload.update(extra)
-    return payload
-
-
-def tx(
-    to_suffix: int,
-    data: str,
-    *,
-    value: int | str = 0,
-    chain_id: int = 8453,
-    type_: str | None = None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "to": f"0x{to_suffix:040x}",
-        "data": data,
-        "value": value,
-        "chainId": chain_id,
-    }
-    if type_ is not None:
-        payload["type"] = type_
-    return payload
-
-
-def test_happy_path_preserves_order_and_collects_receipts() -> None:
-    client = MockOneTxClient(
-        [
-            buy_response(
-                tx(2, "0xapprove", type_="approve"),
-                tx(3, "0xbuy", value="5", type_="deposit"),
-            )
-        ]
-    )
-    signer = MockSigner()
-
-    report = execute_allocation(
-        client,
-        signer,
-        allocation("base-morpho-usdc"),
-        permissive_policy(),
-        confirm=True,
-        known_instruments=[vault("base-morpho-usdc")],
-        config=Config(),
-    )
-
-    assert report.status == "success"
-    assert [step.kind for step in report.plan.steps] == ["approve", "buy"]
-    assert [sent[0].data for sent in signer.sent] == ["0xapprove", "0xbuy"]
-    assert [sent[1] for sent in signer.sent] == ["rpc://base", "rpc://base"]
-    assert [receipt.transaction_hash for receipt in report.receipts] == [
-        f"0x{1:064x}",
-        f"0x{2:064x}",
-    ]
-    assert client.bodies == [
-        {
-            "userAddress": signer.address(),
-            "instrumentId": "base-morpho-usdc",
-            "amountUsdc": "100",
-        }
-    ]
-
-
-def test_source_chain_id_metadata_override_is_sent() -> None:
-    client = MockOneTxClient(
-        [
-            buy_response(
-                tx(2, "0xapprove", type_="approve"),
-                tx(3, "0xbuy", value="5", type_="deposit"),
-            )
-        ]
-    )
-    signer = MockSigner()
-
-    alloc = allocation("base-morpho-usdc")
-    alloc = alloc.model_copy(update={"metadata": {"source_chain_id": 42161}})
-
-    execute_allocation(
-        client,
-        signer,
-        alloc,
-        permissive_policy(),
-        confirm=True,
-        known_instruments=[vault("base-morpho-usdc")],
-        config=Config(),
-    )
-
-    # Explicit override still pins the source chain; default omits it so 1Tx
-    # can auto-route from whichever chain actually holds USDC.
-    assert client.bodies == [
-        {
-            "userAddress": signer.address(),
-            "instrumentId": "base-morpho-usdc",
-            "amountUsdc": "100",
-            "sourceChainId": 42161,
-        }
-    ]
-
-
-def test_legacy_legs_are_sourced_against_what_earlier_legs_left() -> None:
-    @dataclass
-    class FundedClient(MockOneTxClient):
-        def balances(self, _address: str) -> dict[str, Any]:
-            return {
-                "balances": [
-                    {"chainId": 8453, "usdcBalance": 150},
-                    {"chainId": 42161, "usdcBalance": 200},
-                ]
-            }
-
-    client = FundedClient(
-        [buy_response(tx(1, "0xbuy-a")), buy_response(tx(2, "0xbuy-b"))]
-    )
-
-    execute_allocation(
-        client,
-        MockSigner(),
-        allocation("vault-a", "vault-b"),
-        permissive_policy(),
-        known_instruments=[vault("vault-a"), vault("vault-b")],
-        config=Config(),
-    )
-
-    # Base covers the first leg; what it has left cannot cover the second,
-    # so the second sources from Arbitrum instead of Base's spent balance.
-    assert [body["sourceChainId"] for body in client.bodies] == [8453, 42161]
-
-
-def test_hex_numeric_transaction_fields_are_accepted() -> None:
-    client = MockOneTxClient(
-        [buy_response(tx(2, "0xbuy", value="0x5", chain_id="0x2105"))]
-    )
-    signer = MockSigner()
-
-    report = execute_allocation(
-        client,
-        signer,
-        allocation("base-morpho-usdc"),
-        permissive_policy(),
-        confirm=True,
-        known_instruments=[vault("base-morpho-usdc")],
-        config=Config(),
-    )
-
-    assert report.plan.steps[0].value == 5
-    assert report.plan.steps[0].chain_id == 8453
-    assert signer.sent[0][0].value == 5
-
-
 def test_policy_violation_aborts_before_client_or_signer() -> None:
-    client = MockOneTxClient([buy_response(tx(2, "0x"))])
+    client = MockCalldataClient()
     signer = MockSigner()
 
     with pytest.raises(PolicyCheckFailed):
@@ -332,33 +168,15 @@ def test_policy_violation_aborts_before_client_or_signer() -> None:
             permissive_policy(),
             confirm=True,
             known_instruments=[],
-            config=Config(),
+            config=CalldataConfig(),
         )
 
-    assert client.bodies == []
-    assert signer.sent == []
-
-
-def test_without_confirm_returns_plan_and_does_not_send() -> None:
-    client = MockOneTxClient([buy_response(tx(2, "0xapprove"), tx(3, "0xbuy"))])
-    signer = MockSigner()
-
-    plan = execute_allocation(
-        client,
-        signer,
-        allocation("base-morpho-usdc"),
-        permissive_policy(),
-        known_instruments=[vault("base-morpho-usdc")],
-        config=Config(),
-    )
-
-    assert isinstance(plan, TxPlan)
-    assert [step.data for step in plan.steps] == ["0xapprove", "0xbuy"]
+    assert client.requests == []
     assert signer.sent == []
 
 
 def test_gas_preflight_failure_aborts_before_sends() -> None:
-    config = Config(
+    config = CalldataConfig(
         gas_checker=lambda _address, chain_id, _rpc_url, _config: GasCheck(
             chain_id=chain_id,
             ok=False,
@@ -367,7 +185,7 @@ def test_gas_preflight_failure_aborts_before_sends() -> None:
             message=f"insufficient native gas on chain {chain_id}",
         )
     )
-    client = MockOneTxClient([buy_response(tx(2, "0x"))])
+    client = MockCalldataClient()
     signer = MockSigner()
 
     with pytest.raises(GasPreflightError) as error:
@@ -377,7 +195,7 @@ def test_gas_preflight_failure_aborts_before_sends() -> None:
             allocation("base-morpho-usdc"),
             permissive_policy(),
             confirm=True,
-            known_instruments=[vault("base-morpho-usdc")],
+            known_instruments=[calldata_vault("base-morpho-usdc")],
             config=config,
         )
 
@@ -385,222 +203,35 @@ def test_gas_preflight_failure_aborts_before_sends() -> None:
     assert signer.sent == []
 
 
-def test_a_safe_cannot_propose_on_a_chain_with_no_service() -> None:
-    # Blast is depositable but Safe runs no Transaction Service for it, so the
-    # plan has to be refused before anything is proposed — on a multi-chain
-    # plan, failing at the step itself would leave earlier chains proposed.
+def test_a_safe_cannot_propose_on_a_chain_with_no_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A chain Safe runs no Transaction Service for has to be refused before
+    # anything is proposed — on a multi-chain plan, failing at the step itself
+    # would leave earlier chains proposed.
     @dataclass(frozen=True)
-    class SafeRpcConfig(Config):
+    class SafeRpcConfig(CalldataConfig):
         account: str = "safe"
         submission: str = "rpc"
         safe_chain_id: int | None = None
         safe_transaction_service_url: str | None = None
 
-    client = MockOneTxClient([buy_response(tx(2, "0x", chain_id=81457))])
+    monkeypatch.setattr(chains, "safe_tx_service_url", lambda _chain_id: None)
+    client = MockCalldataClient()
     signer = MockSigner()
 
     with pytest.raises(GasPreflightError, match="no Safe Transaction Service"):
         execute_allocation(
             client,
             signer,
-            allocation("blast-vault"),
+            allocation("base-vault"),
             permissive_policy(),
             confirm=True,
-            known_instruments=[vault("blast-vault", chain_id=81457)],
-            config=SafeRpcConfig(_rpc_overrides={81457: "rpc://blast"}),
+            known_instruments=[calldata_vault("base-vault")],
+            config=SafeRpcConfig(),
         )
 
     assert signer.sent == []
-
-
-def test_missing_rpc_fails_preflight_before_sends() -> None:
-    client = MockOneTxClient([buy_response(tx(2, "0x", chain_id=999999))])
-    signer = MockSigner()
-
-    with pytest.raises(GasPreflightError, match="missing RPC"):
-        execute_allocation(
-            client,
-            signer,
-            allocation("unknown-chain-vault"),
-            permissive_policy(),
-            confirm=True,
-            known_instruments=[vault("unknown-chain-vault", chain_id=999999)],
-            config=Config(_rpc_overrides={}),
-        )
-
-    assert signer.sent == []
-
-
-def test_retry_after_mid_book_failure_skips_completed_leg() -> None:
-    store: dict[str, object] = {}
-    first_client = MockOneTxClient(
-        [
-            buy_response(tx(2, "0xleg0")),
-            buy_response(tx(3, "0xleg1")),
-        ]
-    )
-    first_signer = MockSigner(fail_at=1)
-
-    with pytest.raises(ExecutionBroadcastError):
-        execute_allocation(
-            first_client,
-            first_signer,
-            allocation("vault-a", "vault-b"),
-            permissive_policy(),
-            confirm=True,
-            known_instruments=[vault("vault-a"), vault("vault-b")],
-            config=Config(),
-            idempotency_store=store,
-        )
-
-    assert "leg:0:vault-a" in store
-    retry_client = MockOneTxClient([buy_response(tx(4, "0xleg1-retry"))])
-    retry_signer = MockSigner()
-
-    report = execute_allocation(
-        retry_client,
-        retry_signer,
-        allocation("vault-a", "vault-b"),
-        permissive_policy(),
-        confirm=True,
-        known_instruments=[vault("vault-a"), vault("vault-b")],
-        config=Config(),
-        idempotency_store=store,
-    )
-
-    assert report.status == "success"
-    assert [body["instrumentId"] for body in retry_client.bodies] == ["vault-b"]
-    assert [sent[0].data for sent in retry_signer.sent] == ["0xleg1-retry"]
-
-
-def test_retry_skips_completed_step_within_incomplete_leg() -> None:
-    store: dict[str, object] = {"leg:0:vault-a:step:0": True}
-    client = MockOneTxClient([buy_response(tx(2, "0xapprove"), tx(3, "0xbuy"))])
-    signer = MockSigner()
-
-    report = execute_allocation(
-        client,
-        signer,
-        allocation("vault-a"),
-        permissive_policy(),
-        confirm=True,
-        known_instruments=[vault("vault-a")],
-        config=Config(),
-        idempotency_store=store,
-    )
-
-    assert [step.status for step in report.steps] == ["skipped", "sent"]
-    assert [sent[0].data for sent in signer.sent] == ["0xbuy"]
-    assert "leg:0:vault-a" in store
-
-
-def test_cross_chain_pending_reports_in_progress_not_error() -> None:
-    client = MockOneTxClient(
-        [
-            buy_response(
-                tx(2, "0xsource-router"),
-                status="confirming_source",
-                isCrossChain=True,
-            )
-        ]
-    )
-    signer = MockSigner()
-
-    report = execute_allocation(
-        client,
-        signer,
-        allocation("base-to-arb-vault"),
-        permissive_policy(),
-        confirm=True,
-        known_instruments=[vault("base-to-arb-vault")],
-        config=Config(),
-    )
-
-    assert report.status == "in_progress"
-    assert report.in_progress is True
-    assert report.receipts
-    assert report.messages == ("cross-chain buy is in progress",)
-
-
-def test_paymaster_mode_builds_user_operation_without_native_gas_check() -> None:
-    adapter = MockPaymasterAdapter()
-    signer = Erc4337PaymasterSigner(
-        adapter=adapter,
-        entry_point="0x0000000000000000000000000000000000004337",
-        usdc_address="0x0000000000000000000000000000000000000c0c",
-    )
-    client = MockOneTxClient([buy_response(tx(2, "0xbuy", value=5))])
-
-    report = execute_allocation(
-        client,
-        signer,
-        allocation("base-morpho-usdc"),
-        permissive_policy(),
-        confirm=True,
-        known_instruments=[vault("base-morpho-usdc")],
-        config=PaymasterConfig(),
-    )
-
-    assert report.gas_checks[0].required_wei == 0
-    # No static surcharge is quoted: Pimlico's fee lives inside the exchangeRate
-    # from pimlico_getTokenQuotes, so preflight names where the cost comes from
-    # rather than inventing a percentage. (The old message claimed "+10%" on
-    # Base and nothing elsewhere, which understated 14 of 16 chains.)
-    assert report.gas_checks[0].message == (
-        "gas paid in USDC via pimlico on chain 8453 "
-        "(rate quoted at submission, provider fee included)"
-    )
-    assert len(adapter.requests) == 1
-    request = adapter.requests[0]
-    assert request.sender == signer.address()
-    assert request.chain_id == 8453
-    assert request.call_data.to == "0x0000000000000000000000000000000000000002"
-    assert request.call_data.data == "0xbuy"
-    assert request.call_data.value == 5
-    assert request.gas_token == "USDC"
-    assert request.gas_token_address == "0x0000000000000000000000000000000000000c0c"
-    assert report.receipts[0].execution_status == "user_operation_submitted"
-
-
-def test_paymaster_preflight_unsupported_chain_is_typed_error() -> None:
-    signer = Erc4337PaymasterSigner(
-        adapter=MockPaymasterAdapter(),
-        entry_point="0x0000000000000000000000000000000000004337",
-        usdc_address="0x0000000000000000000000000000000000000c0c",
-    )
-    client = MockOneTxClient([buy_response(tx(2, "0xbuy", chain_id=1))])
-
-    with pytest.raises(PaymasterUnsupportedChain, match="chain 1"):
-        execute_allocation(
-            client,
-            signer,
-            allocation("eth-morpho-usdc"),
-            permissive_policy(),
-            confirm=True,
-            known_instruments=[vault("eth-morpho-usdc", chain_id=1)],
-            config=PaymasterConfig(paymaster_supported_chain_ids=(8453,)),
-        )
-
-
-def test_paymaster_rejection_surfaces_typed_actionable_error() -> None:
-    adapter = MockPaymasterAdapter(reject=True)
-    signer = Erc4337PaymasterSigner(
-        adapter=adapter,
-        entry_point="0x0000000000000000000000000000000000004337",
-        usdc_address="0x0000000000000000000000000000000000000c0c",
-    )
-    client = MockOneTxClient([buy_response(tx(2, "0xbuy"))])
-
-    with pytest.raises(PaymasterRejected, match="USDC allowance"):
-        execute_allocation(
-            client,
-            signer,
-            allocation("base-morpho-usdc"),
-            permissive_policy(),
-            confirm=True,
-            known_instruments=[vault("base-morpho-usdc")],
-            config=PaymasterConfig(),
-        )
 
 
 def test_policy_violation_blocks_paymaster_submission() -> None:
@@ -610,7 +241,7 @@ def test_policy_violation_blocks_paymaster_submission() -> None:
         entry_point="0x0000000000000000000000000000000000004337",
         usdc_address="0x0000000000000000000000000000000000000c0c",
     )
-    client = MockOneTxClient([buy_response(tx(2, "0xbuy"))])
+    client = MockCalldataClient()
 
     with pytest.raises(PolicyCheckFailed):
         execute_allocation(
@@ -623,7 +254,7 @@ def test_policy_violation_blocks_paymaster_submission() -> None:
             config=PaymasterConfig(),
         )
 
-    assert client.bodies == []
+    assert client.requests == []
     assert adapter.requests == []
 
 
@@ -696,72 +327,12 @@ def test_live_tiny_base_deposit_skips_without_creds_or_explicit_gate() -> None:
             live_allocation,
             permissive_policy(),
             confirm=True,
-            known_instruments=[vault(instrument_id)],
+            known_instruments=[calldata_vault(instrument_id)],
             config=config,
             idempotency_store={},
         )
 
     assert report.status in {"success", "in_progress"}
-
-
-# --- grouping steps into operations -----------------------------------------
-
-
-class _FakeRef:
-    def __init__(self, chain_id: int, key: str) -> None:
-        self.step = TxStep(
-            to="0x" + "11" * 20,
-            data="0x",
-            value=0,
-            chain_id=chain_id,
-            kind="buy",
-        )
-        self.idempotency_key = key
-
-
-class _Batching:
-    def send(self, step: object, rpc_url: str) -> None: ...
-
-    def send_batch(self, steps: object, rpc_url: str) -> None: ...
-
-
-class _Sequential:
-    def send(self, step: object, rpc_url: str) -> None: ...
-
-
-def _group_sizes(
-    refs: list[_FakeRef],
-    signer: object,
-    store: object = None,
-) -> list[int]:
-    return [len(g.refs) for g in submission_groups(refs, store, signer)]
-
-
-def test_consecutive_steps_on_one_chain_ride_in_one_operation() -> None:
-    refs = [_FakeRef(8453, "a"), _FakeRef(8453, "b")]
-
-    assert _group_sizes(refs, _Batching()) == [2]
-
-
-def test_an_eoa_signer_still_sends_one_step_at_a_time() -> None:
-    refs = [_FakeRef(8453, "a"), _FakeRef(8453, "b")]
-
-    assert _group_sizes(refs, _Sequential()) == [1, 1]
-
-
-def test_a_plan_is_never_batched_across_chains() -> None:
-    """One operation belongs to one chain — that limit is inherent."""
-    refs = [_FakeRef(8453, "a"), _FakeRef(8453, "b"), _FakeRef(42161, "c")]
-
-    assert _group_sizes(refs, _Batching()) == [2, 1]
-
-
-def test_already_completed_steps_do_not_join_a_live_batch() -> None:
-    refs = [_FakeRef(8453, "done"), _FakeRef(8453, "todo")]
-
-    sizes = _group_sizes(refs, _Batching(), {"done": True})
-
-    assert sizes == [1, 1]
 
 
 @dataclass
@@ -793,26 +364,21 @@ class PendingSigner:
         )
 
 
-@dataclass(frozen=True)
-class CheckpointConfig(Config):
-    checkpoint_dir: object = None
-
-
 def _pending_report(
     signer: PendingSigner,
     *,
     store: dict[str, object] | None = None,
     config: object | None = None,
 ) -> Any:
-    client = MockOneTxClient([buy_response(tx(3, "0xbuy", type_="deposit"))])
+    client = MockCalldataClient()
     return execute_allocation(
         client,
         signer,
         allocation("base-morpho-usdc"),
         permissive_policy(),
         confirm=True,
-        known_instruments=[vault("base-morpho-usdc")],
-        config=config or Config(),
+        known_instruments=[calldata_vault("base-morpho-usdc")],
+        config=config or CalldataConfig(),
         idempotency_store=store,
     )
 
@@ -840,7 +406,7 @@ def test_a_pending_step_is_still_marked_so_a_rerun_does_not_resubmit() -> None:
 
     _pending_report(PendingSigner(), store=store)
 
-    assert "leg:0:base-morpho-usdc:step:0" in store
+    assert any(key.startswith("leg:0:base-morpho-usdc:deposit:") for key in store)
 
 
 def test_a_pending_execution_checkpoints_in_progress_not_completed(
@@ -849,7 +415,7 @@ def test_a_pending_execution_checkpoints_in_progress_not_completed(
     """Resume must not read an unsettled run as a finished one."""
     report = _pending_report(
         PendingSigner(),
-        config=CheckpointConfig(checkpoint_dir=tmp_path),
+        config=CalldataCheckpointConfig(checkpoint_dir=tmp_path),
     )
 
     written = list(tmp_path.glob("*.json"))
@@ -868,7 +434,7 @@ def test_a_mined_receipt_still_reports_success() -> None:
     assert report.in_progress is False
 
 
-# --- calldata API (ONE_TX_TRANSACTION_API=calldata) --------------------------
+# --- calldata fixtures -------------------------------------------------------
 
 BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 CALLDATA_FIXTURES = Path(__file__).parent / "fixtures"
@@ -918,16 +484,12 @@ class MockCalldataClient:
     def deposits(self) -> list[tuple[str, str]]:
         return [(instrument, query.amount) for instrument, query in self.requests]
 
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        raise AssertionError("the calldata path must not call the legacy builder")
-
     def balances(self, address: str) -> dict[str, Any]:
         raise AssertionError("calldata planning must not route by balances yet")
 
 
 @dataclass(frozen=True)
 class CalldataConfig(Config):
-    transaction_api: str = "calldata"
     slippage_bps: int = 30
     token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
     referral_fee_bps: int = 0

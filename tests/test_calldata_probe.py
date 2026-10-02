@@ -183,7 +183,7 @@ def test_live_calldata_compatibility_across_the_active_catalog() -> None:
     if missing:
         pytest.skip(f"live calldata probe requires: {', '.join(missing)}")
 
-    config = AllocatorConfig(transaction_api="calldata")
+    config = AllocatorConfig()
 
     def code(chain_id: int, account: str) -> bytes | None:
         url = chains.rpc_url(chain_id, config)
@@ -243,7 +243,6 @@ def test_live_calldata_compatibility_across_the_active_catalog() -> None:
             assert not failures, "\n".join(failures)
             return
         counterfactual_config = AllocatorConfig(
-            transaction_api="calldata",
             safe_salt_nonce=int.from_bytes(os.urandom(4), "big") + 1,
         )
         counterfactual = signer_from_config(counterfactual_config)

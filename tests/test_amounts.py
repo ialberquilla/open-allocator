@@ -126,8 +126,8 @@ def test_underlying_withdraw_amount_is_unknown_without_raw_balance_or_decimals(
 
 
 def test_underlying_withdraw_amount_is_unknown_when_it_rounds_to_zero_units() -> None:
-    # Underivable, not an error: a legacy plan plans through here too and sells
-    # shares, so it must not fail on an amount only a calldata request reads.
+    # Underivable, not an error: planning must not fail on an amount only a
+    # calldata request reads; that request fails closed instead.
     assert (
         underlying_withdraw_amount(
             (holding(balance="100", balance_raw="100"),),
