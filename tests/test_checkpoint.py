@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -29,20 +29,40 @@ from open_allocator.core.types import (
     TxStep,
     Vault,
 )
+from open_allocator.exec.client import (
+    InstrumentCalldataQuery,
+    InstrumentCalldataResponse,
+)
 from open_allocator.exec.execute import GasCheck, execute_allocation
 from open_allocator.exec.signer import Receipt
 
 ADDRESS = "0x0000000000000000000000000000000000000001"
 
 
-@dataclass
-class MockOneTxClient:
-    responses: list[dict[str, Any]]
-    bodies: list[dict[str, object]] = field(default_factory=list)
+BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+FIXTURES = Path(__file__).parent / "fixtures"
 
-    def build_buy(self, body: dict[str, object]) -> dict[str, Any]:
-        self.bodies.append(body)
-        return self.responses.pop(0)
+
+class MockOneTxClient:
+    def instrument_calldata(
+        self,
+        instrument_id: str,
+        query: InstrumentCalldataQuery,
+    ) -> InstrumentCalldataResponse:
+        payload = json.loads(
+            (FIXTURES / "calldata-instrument-deposit-swap.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        payload.update(
+            instrumentId=instrument_id,
+            account=query.account,
+            amountIn=query.amount,
+            requires=[{"token": BASE_USDC, "amount": query.amount}],
+            leftovers=[],
+            expiresAt=None,
+        )
+        return InstrumentCalldataResponse.model_validate(payload)
 
 
 @dataclass
@@ -77,6 +97,8 @@ class Config:
         message=f"native gas available on chain {chain_id}",
     )
     _rpc_overrides: dict[int, str] = field(default_factory=lambda: {8453: "rpc://base"})
+    slippage_bps: int = 30
+    token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
 
 
 def allocation(*instrument_ids: str) -> Allocation:
@@ -129,17 +151,9 @@ def vault(instrument_id: str) -> Vault:
         tvl_usd=1_000_000,
         curator="curator-a",
         reward_dependence=0.1,
+        token_address=BASE_USDC,
+        token_decimals=6,
     )
-
-
-def tx(data: str, *, type_: str = "deposit") -> dict[str, object]:
-    return {
-        "to": "0x0000000000000000000000000000000000000002",
-        "data": data,
-        "value": 0,
-        "chainId": 8453,
-        "type": type_,
-    }
 
 
 def holding(instrument_id: str, balance: str) -> PositionHolding:
@@ -482,16 +496,7 @@ def test_confirmed_execution_writes_checkpoint_and_allocation_log(
         checkpoint_dir=tmp_path / "checkpoints",
         allocation_log_path=tmp_path / "allocation-log.jsonl",
     )
-    client = MockOneTxClient(
-        [
-            {
-                "transactions": [
-                    tx("0xapprove", type_="approve"),
-                    tx("0xbuy", type_="deposit"),
-                ]
-            }
-        ]
-    )
+    client = MockOneTxClient()
 
     report = execute_allocation(
         client,
@@ -512,11 +517,12 @@ def test_confirmed_execution_writes_checkpoint_and_allocation_log(
     checkpoint = read_checkpoint(checkpoint_files[0])
     assert checkpoint.status == "completed"
     assert checkpoint.artifact_type == "execute-report"
-    assert checkpoint.artifact["plan"]["summary"].startswith("Build buy transactions")
-    assert checkpoint.completed_keys == (
-        "leg:0:vault-a",
-        "leg:0:vault-a:step:0",
-        "leg:0:vault-a:step:1",
+    summary = checkpoint.artifact["plan"]["summary"]
+    assert summary.startswith("Build calldata deposit bundles")
+    assert checkpoint.completed_keys[0] == "leg:0:vault-a"
+    assert all(
+        key.startswith("leg:0:vault-a:deposit:")
+        for key in checkpoint.completed_keys[1:]
     )
     logged_actions = [
         (entry.action_type, entry.instrument_id, entry.usd) for entry in log_entries

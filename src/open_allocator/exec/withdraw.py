@@ -7,29 +7,15 @@ from pydantic import Field
 
 from open_allocator.core import amounts
 from open_allocator.core import withdraw as withdraw_core
-from open_allocator.core.types import FrozenModel, Policy, TxBundle, TxPlan, TxStep
+from open_allocator.core.types import FrozenModel, Policy, TxBundle, TxPlan
 from open_allocator.exec import bundle_execution, calldata, chains
 from open_allocator.exec.execute import (
-    ExecutionBroadcastError,
-    ExecutionReport,
     ExecutionStepReport,
     GasCheck,
     TransactionPlanError,
     WalletPreparation,
-    _append_allocation_log,
-    _completed_keys,
-    _copy_config_value,
-    _is_in_progress_payload,
-    _messages,
-    _preflight,
-    _raw_transactions,
     _store_completed,
-    _store_mark_completed,
-    _tx_step,
     _write_checkpoint,
-    pending_receipt_messages,
-    submission_groups,
-    submit_steps,
 )
 from open_allocator.exec.funding import FundingRequirement
 from open_allocator.exec.signer import Receipt, Signer
@@ -60,21 +46,6 @@ class WithdrawExecutionReport(FrozenModel):
     messages: tuple[str, ...] = Field(default_factory=tuple)
 
 
-class _StepRef(FrozenModel):
-    leg_index: int
-    step_index: int
-    instrument_id: str
-    step: TxStep
-    idempotency_key: str
-    usd: float | None = None
-    shares: str | None = None
-    # Only set where the venue quoted a price. A buy cannot know it: 1Tx's
-    # build endpoint neither takes nor returns a share amount, and the receipt
-    # carries no logs, so the price is unknown until the position is next read.
-    share_price: str | None = None
-    action_type: str
-
-
 def withdraw(
     client: object,
     signer: Signer,
@@ -89,150 +60,39 @@ def withdraw(
     _refuse_levered(position)
     withdraw_plan = withdraw_core.plan_withdraw(position, policy, amount=amount)
     address = signer.address()
-    if calldata.uses_calldata_api(config):
-        tx_plan, sell = _calldata_tx_plan(
-            client,
-            address,
-            withdraw_plan,
-            config,
-            idempotency_store,
-        )
-        if not confirm:
-            preparation = bundle_execution.prepare_plan(
-                signer, tx_plan, config, idempotency_store
-            )
-            return WithdrawExecutionReport(
-                status="planned",
-                withdraw_plan=withdraw_plan,
-                sell=sell,
-                plan=tx_plan,
-                preparations=preparation.preparations,
-                funding=preparation.funding,
-                messages=(
-                    "dry-run only; no transactions broadcast",
-                    *preparation.messages,
-                    *preparation.blockers,
-                ),
-            )
-        return _execute_calldata_withdraw(
-            client,
-            signer,
-            tx_plan,
-            withdraw_plan,
-            sell,
-            config,
-            idempotency_store,
-        )
-
-    tx_plan, step_refs, sell, messages = _build_tx_plan(
+    tx_plan, sell = _calldata_tx_plan(
         client,
         address,
         withdraw_plan,
         config,
         idempotency_store,
     )
-    in_progress = bool(messages)
     if not confirm:
+        preparation = bundle_execution.prepare_plan(
+            signer, tx_plan, config, idempotency_store
+        )
         return WithdrawExecutionReport(
             status="planned",
             withdraw_plan=withdraw_plan,
             sell=sell,
             plan=tx_plan,
-            messages=("dry-run only; no transactions broadcast", *messages),
-            in_progress=in_progress,
+            preparations=preparation.preparations,
+            funding=preparation.funding,
+            messages=(
+                "dry-run only; no transactions broadcast",
+                *preparation.messages,
+                *preparation.blockers,
+            ),
         )
-
-    rpc_urls, gas_checks = _preflight(
-        address,
-        step_refs,
+    return _execute_calldata_withdraw(
+        client,
+        signer,
+        tx_plan,
+        withdraw_plan,
+        sell,
         config,
         idempotency_store,
     )
-
-    execution_steps: list[ExecutionStepReport] = []
-    receipts: list[Receipt] = []
-    for group in submission_groups(step_refs, idempotency_store, signer):
-        if group.completed:
-            for ref in group.refs:
-                execution_steps.append(
-                    ExecutionStepReport(
-                        leg_index=ref.leg_index,
-                        step_index=ref.step_index,
-                        instrument_id=ref.instrument_id,
-                        status="skipped",
-                        step=ref.step,
-                        idempotency_key=ref.idempotency_key,
-                    )
-                )
-                _mark_withdraw_if_complete(ref, step_refs, idempotency_store)
-            continue
-
-        ref = group.refs[0]
-        try:
-            # The approval and the sell in one operation: the paymaster charges
-            # in postOp, so the redeemed USDC pays for the gas that redeemed it.
-            receipt = submit_steps(signer, group.refs, rpc_urls[ref.step.chain_id])
-        except Exception as error:
-            partial_report = ExecutionReport(
-                status="failed",
-                policy_result=_ok_policy_result(),
-                plan=tx_plan,
-                steps=tuple(execution_steps),
-                receipts=tuple(receipts),
-                gas_checks=gas_checks,
-                in_progress=False,
-                messages=messages,
-            )
-            _write_checkpoint(
-                config,
-                "withdraw",
-                partial_report,
-                completed_keys=_completed_keys(step_refs, execution_steps),
-            )
-            raise ExecutionBroadcastError(
-                "transaction broadcast failed",
-                leg_index=ref.leg_index,
-                step_index=ref.step_index,
-                partial_report=partial_report,
-            ) from error
-
-        receipts.append(receipt)
-        for member in group.refs:
-            _store_mark_completed(idempotency_store, member.idempotency_key, receipt)
-            _append_allocation_log(config, member, receipt)
-            _mark_withdraw_if_complete(member, step_refs, idempotency_store)
-            execution_steps.append(
-                ExecutionStepReport(
-                    leg_index=member.leg_index,
-                    step_index=member.step_index,
-                    instrument_id=member.instrument_id,
-                    status="sent",
-                    step=member.step,
-                    receipt=receipt,
-                    idempotency_key=member.idempotency_key,
-                )
-            )
-
-    unconfirmed = pending_receipt_messages(receipts)
-    in_progress = in_progress or bool(unconfirmed)
-    report = WithdrawExecutionReport(
-        status="in_progress" if in_progress else "success",
-        withdraw_plan=withdraw_plan,
-        sell=sell.model_copy(update={"status": "sent"}),
-        plan=tx_plan,
-        steps=tuple(execution_steps),
-        receipts=tuple(receipts),
-        gas_checks=gas_checks,
-        in_progress=in_progress,
-        messages=(*messages, *unconfirmed),
-    )
-    _write_checkpoint(
-        config,
-        "withdraw",
-        report,
-        completed_keys=_completed_keys(step_refs, execution_steps),
-    )
-    return report
 
 
 def _refuse_levered(position: object) -> None:
@@ -253,61 +113,6 @@ def _refuse_levered(position: object) -> None:
             "fail the pool's health check. It is unwound by a loop close, which "
             "this command does not build"
         )
-
-
-def _build_tx_plan(
-    client: object,
-    address: str,
-    withdraw_plan: withdraw_core.WithdrawPlan,
-    config: object | None,
-    idempotency_store: object | None,
-) -> tuple[TxPlan, tuple[_StepRef, ...], WithdrawSellDetails, tuple[str, ...]]:
-    leg_key = _withdraw_key(withdraw_plan)
-    if _store_completed(idempotency_store, leg_key):
-        tx_plan = TxPlan(
-            steps=(),
-            summary=f"Withdraw already completed for {withdraw_plan.instrument_id}",
-        )
-        return tx_plan, (), _sell_details(address, withdraw_plan, None), ()
-
-    response = _build_sell(
-        client,
-        _sell_body(address, withdraw_plan, config),
-    )
-    raw_steps = _raw_transactions(response)
-    plan_steps: list[TxStep] = []
-    step_refs: list[_StepRef] = []
-    for step_index, raw_step in enumerate(raw_steps):
-        step = _withdraw_tx_step(raw_step, step_index, len(raw_steps))
-        step_key = f"{leg_key}:step:{step_index}"
-        plan_steps.append(step)
-        step_refs.append(
-            _StepRef(
-                leg_index=0,
-                step_index=step_index,
-                instrument_id=withdraw_plan.instrument_id,
-                step=step,
-                idempotency_key=step_key,
-                shares=withdraw_plan.yield_token_amount,
-                share_price=withdraw_plan.share_price_usd,
-                action_type="withdraw",
-            )
-        )
-
-    tx_plan = TxPlan(
-        steps=tuple(plan_steps),
-        summary=(
-            f"Build withdraw sell transaction for {withdraw_plan.instrument_id} "
-            f"across {len(plan_steps)} transaction steps"
-        ),
-    )
-    messages = _withdraw_messages(response)
-    return (
-        tx_plan,
-        tuple(step_refs),
-        _sell_details(address, withdraw_plan, response),
-        messages,
-    )
 
 
 def _calldata_tx_plan(
@@ -417,38 +222,6 @@ def _expected_usdc(bundle: TxBundle, config: object | None) -> str | None:
     return amounts.from_raw_units(bundle.expected_out, bundle.token_out.decimals)
 
 
-def _build_sell(client: object, body: Mapping[str, object]) -> object:
-    build_sell = getattr(client, "build_sell", None)
-    if not callable(build_sell):
-        raise TypeError("client does not implement build_sell")
-    return build_sell(body)
-
-
-def _sell_body(
-    address: str,
-    plan: withdraw_core.WithdrawPlan,
-    config: object | None,
-) -> dict[str, object]:
-    body: dict[str, object] = {
-        "userAddress": address,
-        "instrumentId": plan.instrument_id,
-        "yieldTokenAmount": plan.yield_token_amount,
-    }
-    _copy_config_value(body, "slippageBps", config, "slippage_bps")
-    return body
-
-
-def _withdraw_tx_step(
-    raw_step: Mapping[str, object],
-    step_index: int,
-    step_count: int,
-) -> TxStep:
-    step = _tx_step(raw_step, step_index, step_count)
-    if step.kind == "buy":
-        return step.model_copy(update={"kind": "sell"})
-    return step
-
-
 def _sell_details(
     address: str,
     plan: withdraw_core.WithdrawPlan,
@@ -509,36 +282,8 @@ def _walk_mapping_values(value: object) -> Sequence[tuple[str, object]]:
     return tuple(pairs)
 
 
-def _withdraw_messages(response: object) -> tuple[str, ...]:
-    messages = _messages((response,))
-    if _is_in_progress_payload(response):
-        return tuple(
-            "cross-chain withdraw is in progress"
-            if message == "cross-chain buy is in progress"
-            else message
-            for message in messages
-        )
-    return messages
-
-
-def _mark_withdraw_if_complete(
-    ref: _StepRef,
-    step_refs: Sequence[_StepRef],
-    store: object | None,
-) -> None:
-    if step_refs and all(
-        _store_completed(store, item.idempotency_key) for item in step_refs
-    ):
-        _store_mark_completed(store, _withdraw_key_from_ref(ref), True)
-
-
 def _withdraw_key(plan: withdraw_core.WithdrawPlan) -> str:
     return f"withdraw:0:{plan.instrument_id}:{plan.yield_token_amount}"
-
-
-def _withdraw_key_from_ref(ref: _StepRef) -> str:
-    prefix = ref.idempotency_key.rsplit(":step:", 1)[0]
-    return prefix
 
 
 def _ok_policy_result() -> object:

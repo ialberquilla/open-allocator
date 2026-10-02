@@ -891,12 +891,6 @@ class OneTxClient:
         payload = self._request_json("POST", "/portfolios/simulate", body=body)
         return SimulationResult.model_validate(payload)
 
-    def build_buy(self, body: Mapping[str, object]) -> JsonValue:
-        return self._request_json("POST", "/transactions/buy", body=body)
-
-    def build_sell(self, body: Mapping[str, object]) -> JsonValue:
-        return self._request_json("POST", "/transactions/sell", body=body)
-
     def instrument_calldata(
         self,
         instrument_id: str,

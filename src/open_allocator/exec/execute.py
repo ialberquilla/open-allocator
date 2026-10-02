@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
-from dataclasses import dataclass, replace
-from pathlib import Path
+from dataclasses import replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -30,7 +29,6 @@ from open_allocator.core.types import (
 from open_allocator.exec import calldata, chains, funding, loops
 from open_allocator.exec.bridge_state import BridgeState
 from open_allocator.exec.erc4337_paymaster import (
-    PaymasterError,
     paymaster_cost_notes,
     submits_via_paymaster,
     validate_paymaster_preflight,
@@ -165,11 +163,9 @@ class IdempotencyStore(Protocol):
 
 GasChecker = Callable[[str, int, str, object | None], GasCheck | bool]
 
-_PENDING_STATUSES = {"pending", "confirming_source", "confirmingsource"}
 
 # USDC is 6dp, so anything under a cent is rounding rather than money. Sourcing
 # a leg from a chain holding dust produces an op that costs more gas than it moves.
-_DUST_USDC = 0.01
 
 
 @overload
@@ -212,185 +208,36 @@ def execute_allocation(
     policy_model = _policy(policy)
     known: tuple[Vault | Mapping[str, object], ...] = tuple(known_instruments or ())
     address = signer.address()
-    if calldata.uses_calldata_api(config):
-        known = _with_effective_loop_parameters(
-            client, known, allocation_model, address, config, idempotency_store
-        )
-    else:
-        _refuse_legacy_loops(allocation_model, _vaults_by_id(known))
+    known = _with_effective_loop_parameters(
+        client, known, allocation_model, address, config, idempotency_store
+    )
     policy_result = policy_core.check(allocation_model, policy_model, known)
     if not policy_result.ok:
         raise PolicyCheckFailed(policy_result)
 
     vaults_by_id = _vaults_by_id(known)
-    if calldata.uses_calldata_api(config):
-        fitted = _calldata_deposit_plan(
-            client,
-            signer,
-            address,
-            allocation_model,
-            vaults_by_id,
-            config,
-            idempotency_store,
-            caps=policy_model.caps,
-        )
-        if not confirm:
-            return fitted.plan
-        return _execute_calldata_deposits(
-            client,
-            signer,
-            fitted,
-            allocation_model,
-            vaults_by_id,
-            policy_result,
-            config,
-            idempotency_store,
-        )
-
-    # Source each leg from what earlier legs left, so two legs never spend the
-    # same balance.
-    ledger = FundingLedger(_idle_usdc_by_chain(client, address))
-    plan_steps: list[TxStep] = []
-    step_refs: list[_StepRef] = []
-    build_payloads: list[object] = []
-
-    for leg_index, leg in enumerate(allocation_model.legs):
-        leg_key = _leg_key(leg_index, leg.instrument_id)
-        if _store_completed(idempotency_store, leg_key):
-            continue
-
-        body = _buy_body(
-            address,
-            allocation_model,
-            leg_index,
-            vaults_by_id,
-            config,
-            ledger.available,
-        )
-        source = body.get("sourceChainId")
-        if isinstance(source, int):
-            ledger.debit(source, leg.usd)
-        response = _build_buy(client, body)
-        build_payloads.append(response)
-        raw_steps = _raw_transactions(response)
-
-        for step_index, raw_step in enumerate(raw_steps):
-            step = _tx_step(raw_step, step_index, len(raw_steps))
-            step_key = _step_key(leg_index, leg.instrument_id, step_index)
-            plan_steps.append(step)
-            step_refs.append(
-                _StepRef(
-                    leg_index=leg_index,
-                    step_index=step_index,
-                    instrument_id=leg.instrument_id,
-                    step=step,
-                    idempotency_key=step_key,
-                    usd=leg.usd,
-                    action_type="buy",
-                )
-            )
-
-    plan = TxPlan(
-        steps=tuple(plan_steps),
-        summary=_plan_summary(allocation_model, plan_steps),
-    )
-    in_progress = any(_is_in_progress_payload(payload) for payload in build_payloads)
-    messages = _messages(build_payloads)
-    if not confirm:
-        return plan
-
-    rpc_urls, gas_checks = _preflight(
+    fitted = _calldata_deposit_plan(
+        client,
+        signer,
         address,
-        step_refs,
+        allocation_model,
+        vaults_by_id,
+        config,
+        idempotency_store,
+        caps=policy_model.caps,
+    )
+    if not confirm:
+        return fitted.plan
+    return _execute_calldata_deposits(
+        client,
+        signer,
+        fitted,
+        allocation_model,
+        vaults_by_id,
+        policy_result,
         config,
         idempotency_store,
     )
-
-    execution_steps: list[ExecutionStepReport] = []
-    receipts: list[Receipt] = []
-    for group in submission_groups(step_refs, idempotency_store, signer):
-        if group.completed:
-            for ref in group.refs:
-                execution_steps.append(
-                    ExecutionStepReport(
-                        leg_index=ref.leg_index,
-                        step_index=ref.step_index,
-                        instrument_id=ref.instrument_id,
-                        status="skipped",
-                        step=ref.step,
-                        idempotency_key=ref.idempotency_key,
-                    )
-                )
-                _mark_leg_if_complete(ref, step_refs, idempotency_store)
-            continue
-
-        ref = group.refs[0]
-        try:
-            receipt = submit_steps(signer, group.refs, rpc_urls[ref.step.chain_id])
-        except PaymasterError:
-            raise
-        except Exception as error:
-            partial_report = ExecutionReport(
-                status="failed",
-                policy_result=policy_result,
-                plan=plan,
-                steps=tuple(execution_steps),
-                receipts=tuple(receipts),
-                gas_checks=gas_checks,
-                in_progress=False,
-                messages=messages,
-            )
-            _write_checkpoint(
-                config,
-                "execute",
-                partial_report,
-                completed_keys=_completed_keys(step_refs, execution_steps),
-            )
-            raise ExecutionBroadcastError(
-                "transaction broadcast failed",
-                leg_index=ref.leg_index,
-                step_index=ref.step_index,
-                partial_report=partial_report,
-            ) from error
-
-        # One receipt per operation, shared by every step that rode in it: the
-        # batch is atomic, so they all landed in the same transaction or none did.
-        receipts.append(receipt)
-        for member in group.refs:
-            _store_mark_completed(idempotency_store, member.idempotency_key, receipt)
-            _append_allocation_log(config, member, receipt)
-            _mark_leg_if_complete(member, step_refs, idempotency_store)
-            execution_steps.append(
-                ExecutionStepReport(
-                    leg_index=member.leg_index,
-                    step_index=member.step_index,
-                    instrument_id=member.instrument_id,
-                    status="sent",
-                    step=member.step,
-                    receipt=receipt,
-                    idempotency_key=member.idempotency_key,
-                )
-            )
-
-    unconfirmed = pending_receipt_messages(receipts)
-    in_progress = in_progress or bool(unconfirmed)
-    report = ExecutionReport(
-        status="in_progress" if in_progress else "success",
-        policy_result=policy_result,
-        plan=plan,
-        steps=tuple(execution_steps),
-        receipts=tuple(receipts),
-        gas_checks=gas_checks,
-        in_progress=in_progress,
-        messages=(*messages, *unconfirmed),
-    )
-    _write_checkpoint(
-        config,
-        "execute",
-        report,
-        completed_keys=_completed_keys(step_refs, execution_steps),
-    )
-    return report
 
 
 def plan_calldata_allocation(
@@ -433,23 +280,6 @@ def plan_calldata_allocation(
         caps=policy_model.caps,
     )
     return replace(fitted, policy_result=policy_result)
-
-
-def _refuse_legacy_loops(
-    allocation: Allocation,
-    vaults_by_id: Mapping[str, Vault],
-) -> None:
-    levered = [
-        leg.instrument_id
-        for leg in allocation.legs
-        if (vault := vaults_by_id.get(leg.instrument_id)) is not None
-        and vault.is_levered
-    ]
-    if levered:
-        raise TransactionPlanError(
-            f"levered legs {', '.join(levered)} are built only by the calldata "
-            "API (ONE_TX_TRANSACTION_API=calldata)"
-        )
 
 
 def _with_effective_loop_parameters(
@@ -987,48 +817,12 @@ def _pinned_source_chain_id(
     return None
 
 
-@dataclass(frozen=True)
-class SubmissionGroup:
-    """Steps that go out together, and whether they are already done."""
-
-    refs: tuple[Any, ...]
-    completed: bool
-
-
 def supports_batching(signer: object) -> bool:
     """Whether this signer can put several steps in one transaction.
 
     A smart account can; an EOA cannot, and must keep sending one at a time.
     """
     return callable(getattr(signer, "send_batch", None))
-
-
-def submission_groups(
-    step_refs: Sequence[Any],
-    idempotency_store: object,
-    signer: object,
-) -> list[SubmissionGroup]:
-    """Consecutive steps on one chain, batched when the signer allows it.
-
-    Only consecutive runs are merged, so the order the plan was built in — an
-    approval before the call it clears — survives.
-    """
-    batching = supports_batching(signer)
-    groups: list[SubmissionGroup] = []
-    for ref in step_refs:
-        done = _store_completed(idempotency_store, ref.idempotency_key)
-        last = groups[-1] if groups else None
-        joinable = (
-            last is not None
-            and last.completed == done
-            and (done or batching)
-            and last.refs[-1].step.chain_id == ref.step.chain_id
-        )
-        if joinable and last is not None:
-            groups[-1] = SubmissionGroup((*last.refs, ref), done)
-        else:
-            groups.append(SubmissionGroup((ref,), done))
-    return groups
 
 
 def pending_receipt_messages(
@@ -1090,13 +884,6 @@ def _safe_rpc_chains_without_service(
     )
 
 
-def submit_steps(signer: object, refs: Sequence[Any], rpc_url: str) -> Receipt:
-    steps = [ref.step for ref in refs]
-    if len(steps) == 1:
-        return signer.send(steps[0], rpc_url)  # type: ignore[attr-defined]
-    return signer.send_batch(steps, rpc_url)  # type: ignore[attr-defined]
-
-
 class _StepRef(FrozenModel):
     leg_index: int
     step_index: int
@@ -1138,242 +925,8 @@ def _vaults_by_id(
     return vaults
 
 
-def _build_buy(client: object, body: Mapping[str, object]) -> object:
-    build_buy = getattr(client, "build_buy", None)
-    if not callable(build_buy):
-        raise TransactionPlanError("client does not implement build_buy")
-    return build_buy(body)
-
-
-def _buy_body(
-    address: str,
-    allocation: Allocation,
-    leg_index: int,
-    vaults_by_id: Mapping[str, Vault],
-    config: object | None,
-    balances_by_chain: Mapping[int, float] | None = None,
-    *,
-    amount_usd: float | None = None,
-    source_chain_id_override: int | None = None,
-) -> dict[str, object]:
-    leg = allocation.legs[leg_index]
-    usd = leg.usd if amount_usd is None else amount_usd
-    body: dict[str, object] = {
-        "userAddress": address,
-        "instrumentId": leg.instrument_id,
-        "amountUsdc": _amount_usdc(usd),
-    }
-    source_chain_id = (
-        source_chain_id_override
-        if source_chain_id_override is not None
-        else _source_chain_id(
-            allocation,
-            leg.instrument_id,
-            vaults_by_id,
-            config,
-            usd,
-            balances_by_chain,
-        )
-    )
-    if source_chain_id is not None:
-        body["sourceChainId"] = source_chain_id
-
-    _copy_config_value(body, "slippageBps", config, "slippage_bps")
-    _copy_config_value(body, "fastTransfer", config, "fast_transfer")
-    _copy_config_value(body, "referralFeeBps", config, "referral_fee_bps")
-    _copy_config_value(body, "referralWallet", config, "referral_wallet")
-    return body
-
-
 def _amount_usdc(value: float) -> str:
     return format(value, ".6f").rstrip("0").rstrip(".")
-
-
-def _source_chain_id(
-    allocation: Allocation,
-    instrument_id: str,
-    vaults_by_id: Mapping[str, Vault],
-    config: object | None,
-    leg_usd: float | None,
-    balances_by_chain: Mapping[int, float] | None,
-) -> int | None:
-    pinned = _pinned_source_chain_id(allocation, config)
-    if pinned is not None:
-        return pinned
-
-    # Balance-aware default: source USDC from the chain the wallet is actually
-    # funded on. 1Tx (SwapDepositRouter + CCTP) bridges from that source chain
-    # to the vault's destination chain when they differ. Pinning the source to
-    # the vault's own chain breaks execution whenever the wallet holds no USDC
-    # there — 1Tx returns "No chain has sufficient USDC balance" instead of
-    # bridging. If balances are unavailable, omit sourceChainId and let 1Tx
-    # auto-select. An explicit source_chain_id (config/metadata) overrides all.
-    vault = vaults_by_id.get(instrument_id)
-    vault_chain = vault.chain_id if vault is not None else None
-    return _select_source_chain(vault_chain, leg_usd, balances_by_chain)
-
-
-class FundingLedger:
-    """Per-chain USDC as it actually is DURING a plan, not as it was before it.
-
-    A sell frees USDC on the chain the position sat on, and a buy spends it on
-    the chain it sources from. Both happen inside one batch, ordered sells-first,
-    so the balances that matter to leg N are the starting balances plus every
-    credit and debit from legs 0..N-1. Planning every buy against the balances
-    the wallet held BEFORE the batch is what makes 1Tx reject a sell-funded buy
-    with "No chain has sufficient USDC balance" — the money is there by the time
-    the transaction runs, just not when the plan was built.
-
-    Not a forecast of settlement: 1Tx still validates, and a sell that reverts is
-    caught by reconcile. This only stops the planner from asking for something it
-    has itself already made possible.
-    """
-
-    def __init__(
-        self,
-        balances: Mapping[int, float] | None = None,
-        *,
-        reserve_usd: float = 0.0,
-    ) -> None:
-        # `reserve_usd` is held back per chain because gas is paid in USDC out of
-        # this same balance. A book deployed to the last cent cannot pay for the
-        # transaction that deploys it, and the failure lands on the final op —
-        # the least recoverable place for it.
-        self._reserve = max(0.0, float(reserve_usd))
-        self._available: dict[int, float] = {
-            int(chain): max(0.0, float(usdc) - self._reserve)
-            for chain, usdc in (balances or {}).items()
-            if isinstance(chain, int) and not isinstance(chain, bool)
-        }
-
-    @property
-    def available(self) -> dict[int, float]:
-        return dict(self._available)
-
-    def credit(self, chain: int | None, usd: float) -> None:
-        """Proceeds of a sell, landing on the chain the position was held on.
-
-        Credited in full: the reserve is a floor on the wallet, not a toll on
-        every movement, and it was already withheld when the chain was opened.
-        """
-        if chain is None or usd <= 0:
-            return
-        if chain not in self._available:
-            self._available[chain] = -self._reserve
-        self._available[chain] = self._available.get(chain, 0.0) + float(usd)
-
-    def debit(self, chain: int, usd: float) -> None:
-        """Spend from a chain the planner already chose to source a buy from."""
-        if usd <= 0:
-            return
-        self._available[chain] = self._available.get(chain, 0.0) - float(usd)
-
-    def plan_sources(
-        self,
-        vault_chain: int | None,
-        amount: float | None,
-        *,
-        allow_partial: bool = False,
-    ) -> tuple[tuple[int, float], ...]:
-        """Which chains fund this buy, and for how much each. Debits as it goes.
-
-        Prefers the vault's own chain so no bridge is needed, then draws from the
-        best-funded chains. When one chain cannot cover the leg the buy is SPLIT
-        across several — 1Tx bridges each source to the destination over CCTP, so
-        several smaller ops succeed where one large one cannot.
-
-        An empty result means "let 1Tx auto-select": either nothing is funded or
-        the amount is unknown, and inventing a source there would pin the buy to
-        a chain for no reason.
-
-        `allow_partial` returns whatever is fundable right now instead of
-        refusing. That is for the staged executor, which broadcasts what it can,
-        waits for the money to land, and comes back for the remainder — as
-        opposed to a single batch, where a buy that can only be part-funded is
-        better left for 1Tx to reject than half-sent.
-        """
-        required = float(amount) if amount is not None else 0.0
-        funded = {c: u for c, u in self._available.items() if u > _DUST_USDC}
-        if not funded or required <= 0:
-            return ()
-
-        order = sorted(
-            funded,
-            key=lambda chain: (chain != vault_chain, -funded[chain], chain),
-        )
-        sources: list[tuple[int, float]] = []
-        remaining = required
-        for chain in order:
-            if remaining <= _DUST_USDC:
-                break
-            take = min(funded[chain], remaining)
-            if take <= _DUST_USDC:
-                continue
-            sources.append((chain, take))
-            remaining -= take
-
-        if remaining > _DUST_USDC and not allow_partial:
-            # Underfunded even in aggregate. Debit nothing and hand 1Tx the
-            # single best chain, so the shortfall is reported by the venue
-            # rather than silently split into ops that cannot all settle.
-            return ()
-
-        for chain, take in sources:
-            self._available[chain] = self._available.get(chain, 0.0) - take
-        return tuple(sources)
-
-
-def _select_source_chain(
-    vault_chain: int | None,
-    amount: float | None,
-    balances_by_chain: Mapping[int, float] | None,
-) -> int | None:
-    if not balances_by_chain:
-        return None
-    funded = {chain: usdc for chain, usdc in balances_by_chain.items() if usdc > 0}
-    if not funded:
-        return None
-
-    required = amount if amount is not None else 0.0
-    sufficient = {chain: usdc for chain, usdc in funded.items() if usdc >= required}
-    # Prefer the vault's own chain when it can cover the leg (no bridge needed).
-    if vault_chain in sufficient:
-        return vault_chain
-    if sufficient:
-        return max(sufficient, key=lambda chain: sufficient[chain])
-    # No single chain can cover the leg. Stay bridge-free when possible, then
-    # fall back to the best-funded chain; 1Tx surfaces the shortfall.
-    if vault_chain in funded:
-        return vault_chain
-    return max(funded, key=lambda chain: funded[chain])
-
-
-def _idle_usdc_by_chain(client: object, address: str) -> dict[int, float]:
-    getter = getattr(client, "balances", None)
-    if not callable(getter):
-        return {}
-    try:
-        response = getter(address)
-    except Exception:  # noqa: BLE001 - routing degrades to 1Tx auto-select
-        return {}
-
-    raw_balances = _attr(response, "balances")
-    if raw_balances is None or isinstance(raw_balances, str | bytes | bytearray):
-        return {}
-    if not isinstance(raw_balances, Iterable):
-        return {}
-
-    result: dict[int, float] = {}
-    for item in raw_balances:
-        chain = _attr(item, "chain_id", "chainId")
-        usdc = _attr(item, "usdc_balance", "usdcBalance")
-        if not isinstance(chain, int) or isinstance(chain, bool):
-            continue
-        try:
-            result[chain] = float(usdc)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            continue
-    return result
 
 
 def _attr(obj: object, *names: str) -> object | None:
@@ -1388,95 +941,12 @@ def _attr(obj: object, *names: str) -> object | None:
     return None
 
 
-def _copy_config_value(
-    body: dict[str, object],
-    body_key: str,
-    config: object | None,
-    attr: str,
-) -> None:
-    value = _config_value(config, attr)
-    if value is not None:
-        body[body_key] = value
-
-
 def _config_value(config: object | None, attr: str) -> object | None:
     if config is None:
         return None
     if isinstance(config, Mapping):
         return config.get(attr)
     return getattr(config, attr, None)
-
-
-def _raw_transactions(response: object) -> tuple[Mapping[str, object], ...]:
-    if isinstance(response, Mapping):
-        transactions = response.get("transactions")
-    else:
-        transactions = response
-
-    if not isinstance(transactions, Sequence) or isinstance(
-        transactions,
-        str | bytes | bytearray,
-    ):
-        raise TransactionPlanError("buy response does not contain transactions")
-
-    raw_steps: list[Mapping[str, object]] = []
-    for item in transactions:
-        if not isinstance(item, Mapping):
-            raise TransactionPlanError("transaction step is not an object")
-        raw_steps.append(item)
-    return tuple(raw_steps)
-
-
-def _tx_step(
-    raw_step: Mapping[str, object],
-    step_index: int,
-    step_count: int,
-) -> TxStep:
-    try:
-        return TxStep(
-            to=str(raw_step["to"]),
-            data=str(raw_step["data"]),
-            value=_int_value(raw_step.get("value", 0)),
-            chain_id=_int_value(raw_step["chainId"]),
-            kind=_tx_kind(raw_step, step_index, step_count),
-        )
-    except KeyError as error:
-        field = error.args[0]
-        raise TransactionPlanError(f"transaction missing field: {field}") from error
-    except (TypeError, ValueError) as error:
-        raise TransactionPlanError("transaction has invalid field values") from error
-
-
-def _tx_kind(
-    raw_step: Mapping[str, object],
-    step_index: int,
-    step_count: int,
-) -> Literal["approve", "buy", "sell"]:
-    raw_kind = raw_step.get("kind", raw_step.get("type"))
-    if isinstance(raw_kind, str):
-        normalized = raw_kind.casefold()
-        if normalized in {"approve", "approval"}:
-            return "approve"
-        if normalized == "sell":
-            return "sell"
-        if normalized in {"buy", "deposit", "router", "swap"}:
-            return "buy"
-    if step_count > 1 and step_index < step_count - 1:
-        return "approve"
-    return "buy"
-
-
-def _int_value(value: object) -> int:
-    if isinstance(value, str):
-        return int(value, 0)
-    return int(value)
-
-
-def _plan_summary(allocation: Allocation, steps: Sequence[TxStep]) -> str:
-    return (
-        f"Build buy transactions for {len(allocation.legs)} allocation legs "
-        f"across {len(steps)} transaction steps"
-    )
 
 
 def _paymaster_gas_message(note: Mapping[str, object]) -> str:
@@ -1679,18 +1149,6 @@ def _store_mark_completed(
         add(key)
 
 
-def _mark_leg_if_complete(
-    ref: _StepRef,
-    step_refs: Sequence[_StepRef],
-    store: object | None,
-) -> None:
-    leg_refs = [item for item in step_refs if item.leg_index == ref.leg_index]
-    if leg_refs and all(
-        _store_completed(store, item.idempotency_key) for item in leg_refs
-    ):
-        _store_mark_completed(store, _leg_key(ref.leg_index, ref.instrument_id), True)
-
-
 def _write_checkpoint(
     config: object | None,
     stage: str,
@@ -1741,53 +1199,8 @@ def _append_allocation_log(
     )
 
 
-def _path_config_value(config: object | None, attr: str) -> Path | None:
-    value = _config_value(config, attr)
-    if value is None:
-        return None
-    return Path(value)
-
-
-def _completed_keys(
-    step_refs: Sequence[_StepRef],
-    execution_steps: Sequence[ExecutionStepReport],
-) -> tuple[str, ...]:
-    completed_step_keys = {
-        step.idempotency_key
-        for step in execution_steps
-        if step.idempotency_key is not None and step.status in {"sent", "skipped"}
-    }
-    keys = set(completed_step_keys)
-    for ref in step_refs:
-        leg_refs = [item for item in step_refs if item.leg_index == ref.leg_index]
-        if leg_refs and all(
-            item.idempotency_key in completed_step_keys for item in leg_refs
-        ):
-            keys.add(ref.idempotency_key.rsplit(":step:", 1)[0])
-    return tuple(sorted(keys))
-
-
 def _leg_key(leg_index: int, instrument_id: str) -> str:
     return f"leg:{leg_index}:{instrument_id}"
-
-
-def _step_key(leg_index: int, instrument_id: str, step_index: int) -> str:
-    return f"leg:{leg_index}:{instrument_id}:step:{step_index}"
-
-
-def _is_in_progress_payload(payload: object) -> bool:
-    for value in _walk_values(payload):
-        if isinstance(value, str) and value.casefold() in _PENDING_STATUSES:
-            return True
-    return False
-
-
-def _messages(payloads: Sequence[object]) -> tuple[str, ...]:
-    messages: list[str] = []
-    for payload in payloads:
-        if _is_in_progress_payload(payload):
-            messages.append("cross-chain buy is in progress")
-    return tuple(messages)
 
 
 def _walk_values(value: object) -> Iterable[object]:
@@ -1804,7 +1217,6 @@ def _walk_values(value: object) -> Iterable[object]:
 
 
 __all__ = [
-    "FundingLedger",
     "ExecutionBroadcastError",
     "ExecutionError",
     "ExecutionReport",

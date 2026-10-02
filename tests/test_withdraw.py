@@ -36,16 +36,6 @@ ADDRESS = "0x0000000000000000000000000000000000000001"
 
 
 @dataclass
-class MockWithdrawClient:
-    responses: list[dict[str, Any]]
-    sell_bodies: list[dict[str, object]] = field(default_factory=list)
-
-    def build_sell(self, body: dict[str, object]) -> dict[str, Any]:
-        self.sell_bodies.append(body)
-        return self.responses.pop(0)
-
-
-@dataclass
 class MockSigner:
     sent: list[tuple[TxStep, str]] = field(default_factory=list)
 
@@ -151,21 +141,6 @@ def permissive_policy() -> Policy:
     )
 
 
-def sell_response(**extra: object) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "transactions": [
-            {
-                "to": "0x0000000000000000000000000000000000000002",
-                "data": "0xsell",
-                "value": 0,
-                "chainId": 8453,
-            }
-        ]
-    }
-    payload.update(extra)
-    return payload
-
-
 def test_a_confirmed_exit_logs_the_price_it_sold_at(tmp_path: Path) -> None:
     """The cost-basis wiring, end to end.
 
@@ -178,12 +153,12 @@ def test_a_confirmed_exit_logs_the_price_it_sold_at(tmp_path: Path) -> None:
     log_path = tmp_path / "allocation-log.jsonl"
 
     report = withdraw(
-        MockWithdrawClient([sell_response(expectedUsdc="99.50")]),
-        MockSigner(),
+        MockCalldataWithdrawClient(),
+        BatchingWithdrawSigner(),
         position,
         permissive_policy(),
         confirm=True,
-        config=Config(_allocation_log_path=log_path),
+        config=CalldataConfig(_allocation_log_path=log_path),
     )
 
     entry = read_allocation_log(log_path=log_path)[0]
@@ -198,34 +173,6 @@ def test_a_confirmed_exit_logs_the_price_it_sold_at(tmp_path: Path) -> None:
     assert entry.usd == pytest.approx(100.0)
 
 
-def test_full_exit_sends_exact_share_balance_as_yield_token_amount() -> None:
-    position = holding(share_balance="74.999123")
-    client = MockWithdrawClient([sell_response(expectedUsdc="99.50")])
-    signer = MockSigner()
-
-    report = withdraw(
-        client,
-        signer,
-        position,
-        permissive_policy(),
-        confirm=True,
-        config=Config(),
-    )
-
-    assert report.status == "success"
-    assert report.withdraw_plan.full_exit is True
-    assert report.withdraw_plan.yield_token_amount == "74.999123"
-    assert client.sell_bodies == [
-        {
-            "userAddress": ADDRESS,
-            "instrumentId": "base-aave-usdc",
-            "yieldTokenAmount": "74.999123",
-        }
-    ]
-    assert report.sell.expected_usdc == "99.50"
-    assert [sent[0].kind for sent in signer.sent] == ["sell"]
-
-
 def test_partial_exit_converts_usd_to_rounded_down_shares_without_oversell() -> None:
     position = holding(usd_value="10", share_balance="3.000000")
 
@@ -234,83 +181,26 @@ def test_partial_exit_converts_usd_to_rounded_down_shares_without_oversell() -> 
     assert plan.full_exit is False
     assert plan.yield_token_amount == "2.999999"
 
-    client = MockWithdrawClient([sell_response()])
-    withdraw(
-        client,
-        MockSigner(),
-        position,
-        permissive_policy(),
-        amount=9.999999,
-        confirm=True,
-        config=Config(),
-    )
-
-    assert client.sell_bodies[0]["yieldTokenAmount"] == "2.999999"
-    assert client.sell_bodies[0]["yieldTokenAmount"] != position.share_balance
-
-
-def test_sell_payload_has_no_usd_denominated_amount_regression() -> None:
-    client = MockWithdrawClient([sell_response()])
-
-    withdraw(
-        client,
-        MockSigner(),
-        holding(),
-        permissive_policy(),
-        amount=25,
-        confirm=True,
-        config=Config(),
-    )
-
-    body = client.sell_bodies[0]
-    assert set(body) == {"userAddress", "instrumentId", "yieldTokenAmount"}
-    assert not {
-        "amount",
-        "amountUsd",
-        "amountUsdc",
-        "sellAmount",
-        "usd",
-        "usdc",
-    } & set(body)
-
-
-def test_without_confirm_returns_plan_and_does_not_send() -> None:
-    client = MockWithdrawClient([sell_response()])
-    signer = MockSigner()
-
-    report = withdraw(
-        client,
-        signer,
-        holding(),
-        permissive_policy(),
-        amount=25,
-        confirm=False,
-        config=Config(),
-    )
-
-    assert report.status == "planned"
-    assert report.messages == ("dry-run only; no transactions broadcast",)
-    assert client.sell_bodies[0]["yieldTokenAmount"] == "18.74978"
-    assert signer.sent == []
-
 
 def test_withdraw_composes_with_position_holding_output_shape() -> None:
     position = holding(instrument_id="vault-from-positions")
     payload = positions_snapshot(position).model_dump(mode="json")
     selected = payload["holdings"][0]
-    client = MockWithdrawClient([sell_response()])
+    client = MockCalldataWithdrawClient()
 
     report = withdraw(
         client,
-        MockSigner(),
+        BatchingWithdrawSigner(),
         selected,
         permissive_policy().model_dump(mode="json"),
         confirm=True,
-        config=Config(),
+        config=CalldataConfig(),
     )
 
     assert report.withdraw_plan.instrument_id == "vault-from-positions"
-    assert client.sell_bodies[0]["yieldTokenAmount"] == position.share_balance
+    assert [(item, query.amount) for item, query in client.requests] == [
+        ("vault-from-positions", "max")
+    ]
 
 
 def test_zero_rounding_partial_withdraw_is_rejected() -> None:
@@ -490,9 +380,8 @@ def test_partial_exit_without_raw_underlying_fails_closed(
 
 
 def test_partial_exit_plans_against_a_zero_raw_balance() -> None:
-    # Planning runs before either transaction API is chosen: a venue reporting
-    # balance_raw as "0" against a live usd_value must still produce a legacy
-    # plan, which redeems shares and never reads calldata_amount.
+    # A venue reporting balance_raw as "0" against a live usd_value must still
+    # produce a plan; only building its calldata fails closed.
     position = recipe_holding(
         balance="3",
         balance_raw="0",
@@ -536,12 +425,12 @@ class PendingWithdrawSigner:
 def test_a_proposed_exit_is_not_reported_as_a_completed_withdrawal() -> None:
     """Nothing has been redeemed until the co-signers execute it."""
     report = withdraw(
-        MockWithdrawClient([sell_response(expectedUsdc="99.50")]),
+        MockCalldataWithdrawClient(),
         PendingWithdrawSigner(),
         holding(share_balance="74.999123"),
         permissive_policy(),
         confirm=True,
-        config=Config(),
+        config=CalldataConfig(),
     )
 
     assert report.status == "in_progress"
@@ -549,7 +438,7 @@ def test_a_proposed_exit_is_not_reported_as_a_completed_withdrawal() -> None:
     assert any("awaiting threshold" in message for message in report.messages)
 
 
-# --- calldata API (ONE_TX_TRANSACTION_API=calldata) --------------------------
+# --- calldata fixtures -------------------------------------------------------
 
 BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 CALLDATA_FIXTURES = Path(__file__).parent / "fixtures"
@@ -606,13 +495,9 @@ class MockCalldataWithdrawClient:
         payload.update(self.overrides)
         return InstrumentCalldataResponse.model_validate(payload)
 
-    def build_sell(self, body: dict[str, object]) -> dict[str, Any]:
-        raise AssertionError("the calldata path must not call the legacy builder")
-
 
 @dataclass(frozen=True)
 class CalldataConfig(Config):
-    transaction_api: str = "calldata"
     slippage_bps: int = 50
     token_balance_reader: object = lambda _chain, _rpc, _token, _account: 10**30
     referral_fee_bps: int = 0

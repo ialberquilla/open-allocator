@@ -377,7 +377,6 @@ class Config:
     world: World
     circle: Circle
     source_chain_id: int | None = BASE
-    transaction_api: str = "calldata"
     slippage_bps: int = 30
     fast_transfer: bool = True
     referral_fee_bps: int = 0

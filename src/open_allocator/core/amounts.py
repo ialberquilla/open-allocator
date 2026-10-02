@@ -87,10 +87,9 @@ def underlying_withdraw_amount(
     decimals, or the exit rounds down to zero units — so a calldata request for
     it fails closed at the point one is actually built.
 
-    It never raises for an underivable amount, because both transaction APIs
-    plan through here: a venue reporting ``balance_raw`` as "0" against a live
-    ``usd_value`` must not fail a legacy plan, which sells shares and never
-    reads this.
+    It never raises for an underivable amount: a venue reporting
+    ``balance_raw`` as "0" against a live ``usd_value`` must not fail planning
+    itself, only the calldata request that would need the amount.
     """
     if not holdings:
         raise ValueError("cannot withdraw from no holdings")

@@ -7,7 +7,7 @@ Use this stage to compare current positions to a target allocation and execute d
 1. Snapshot current holdings: `open-allocator positions --address <wallet>`.
 2. Build or load the target allocation artifact and run `simulate` plus `check-policy` on it.
 3. Dry-run deltas: `open-allocator rebalance --current <positions.json> --target <allocation.json> --policy <policy.yaml> --min-trade-usd <usd>`.
-4. Review sells before buys, skipped dust deltas, share amounts for exits, gas needs, and policy result. With `ONE_TX_TRANSACTION_API=calldata`, also review the `funding` rows (a shortfall is a blocker), `preparations`, and every buy the dry run sized down to fit its chain's balance and sell proceeds; a rebalance that needs proceeds to cross chains is refused.
+4. Review sells before buys, skipped dust deltas, share amounts for exits, gas needs, and policy result. Also review the `funding` rows (a shortfall is a blocker), `preparations`, and every buy the dry run sized down to fit its chain's balance and sell proceeds; a rebalance that needs proceeds to cross chains is refused.
 5. Announce exact exits, deposits, chains, amounts, risks, and expected transactions.
 6. Wait for human approval, then run the same command with `--confirm`.
 
