@@ -34,8 +34,10 @@ dev = [
     "eth-tester==0.13.0b1",
     "py-evm==0.12.1b1",
     "mcp==2.2.0",
+    "oa-server",
     "pytest==9.1.1",
     "ruff==0.15.19",
+    "testcontainers[postgres]==4.15.0",
 ]
 
 [project.scripts]
@@ -51,8 +53,15 @@ mcp = [
 default-groups = ["dev"]
 exclude-newer = "7 days"
 
+[tool.uv.workspace]
+members = ["apps/server"]
+
+[tool.uv.sources]
+oa-server = { workspace = true }
+
 [tool.ruff]
 target-version = "py312"
+src = ["src", "apps/server/src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

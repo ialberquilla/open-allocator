@@ -367,9 +367,7 @@ def plan_calldata_allocation(
         config,
         idempotency_store,
     )
-    policy_result = policy_core.check(allocation_model, policy_model, known)
-    if not policy_result.ok:
-        raise PolicyCheckFailed(policy_result)
+    policy_result = _checked_policy(allocation_model, policy_model, known)
     fitted = _calldata_deposit_plan(
         client,
         signer,
@@ -381,6 +379,45 @@ def plan_calldata_allocation(
         caps=policy_model.caps,
     )
     return replace(fitted, policy_result=policy_result)
+
+
+def check_allocation_policy(
+    client: object,
+    signer: Signer,
+    allocation: Allocation | Mapping[str, object],
+    policy: Policy | Mapping[str, object],
+    *,
+    known_instruments: Iterable[Vault | Mapping[str, object]] | None = None,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> policy_core.PolicyResult:
+    """The policy check planning runs, on today's instruments; raises
+    `PolicyCheckFailed` on a violation.
+
+    Approval runs it again before applying a stored plan, so a plan built under
+    one policy or shelf does not run once either has moved against it.
+    """
+    allocation_model = _allocation(allocation)
+    known = _with_effective_loop_parameters(
+        client,
+        tuple(known_instruments or ()),
+        allocation_model,
+        signer.address(),
+        config,
+        idempotency_store,
+    )
+    return _checked_policy(allocation_model, _policy(policy), known)
+
+
+def _checked_policy(
+    allocation: Allocation,
+    policy: Policy,
+    known: tuple[Vault | Mapping[str, object], ...],
+) -> policy_core.PolicyResult:
+    result = policy_core.check(allocation, policy, known)
+    if not result.ok:
+        raise PolicyCheckFailed(result)
+    return result
 
 
 def _with_effective_loop_parameters(

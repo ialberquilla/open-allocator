@@ -9,6 +9,7 @@ import pytest
 from test_cli import (
     DEPOSIT_KINDS,
     ExecutionOneTxClient,
+    execution_policy,
     install_execution_surface_mocks,
     write_execution_files,
 )
@@ -151,6 +152,39 @@ def test_an_expired_or_unknown_plan_is_not_applied(
     assert expired.value.code == "plan_expired"
     assert unknown.value.code == "plan_not_found"
     assert signer.sent == []
+
+
+def test_approval_rechecks_the_plan_against_the_operator_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_execution_surface_mocks(monkeypatch)
+    proposal = planned(tmp_path)
+    loose = tmp_path / "loose.yaml"
+    loose.write_text(json.dumps(execution_policy()), encoding="utf-8")
+    strict = tmp_path / "strict.yaml"
+    strict_policy = execution_policy()
+    strict_policy["gates"]["max_deploy_per_cycle_usd"] = 10
+    strict.write_text(json.dumps(strict_policy), encoding="utf-8")
+
+    refusing = InMemoryPlanStore()
+    refused = execution_service.propose(refusing, proposal)
+    with pytest.raises(ServiceError) as raised:
+        execution_service.apply_approved(refusing, refused["plan_hash"], policy=strict)
+    assert raised.value.code == "policy_violation"
+    assert "max_deploy_per_cycle_usd" in raised.value.detail
+    assert signer.sent == []
+    # A refused plan stays used: approving it again does not retry it.
+    with pytest.raises(ServiceError) as again:
+        execution_service.apply_approved(refusing, refused["plan_hash"], policy=loose)
+    assert again.value.code == "plan_used"
+
+    allowing = InMemoryPlanStore()
+    allowed = execution_service.propose(allowing, proposal)
+    report = execution_service.apply_approved(
+        allowing, allowed["plan_hash"], policy=loose
+    )
+    assert report["status"] == "success"
 
 
 def test_store_hash_is_canonical_and_a_used_plan_stays_used() -> None:

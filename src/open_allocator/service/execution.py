@@ -22,7 +22,9 @@ from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig
 from open_allocator.exec.execute import (
     ExecutionReport,
+    PolicyCheckFailed,
     apply_allocation_plan,
+    check_allocation_policy,
     plan_allocation,
 )
 from open_allocator.service._common import JsonObject, model_payload, signer_from_config
@@ -164,8 +166,50 @@ def apply_execute(
     return model_payload(report)
 
 
-# What applies each kind of stored plan.
+def recheck_execute_policy(
+    plan: AllocationPlan | Mapping[str, Any],
+    *,
+    policy: Policy | Path = DEFAULT_POLICY_PATH,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """Check a stored plan's allocation against `policy` on today's shelf.
+
+    The plan carries the policy result it was built under, against the policy the
+    caller chose then. Approval checks it again against the operator's policy
+    before anything is sent. Raises `ServiceError` `policy_violation`.
+    """
+    planned = (
+        plan
+        if isinstance(plan, AllocationPlan)
+        else AllocationPlan.model_validate(plan)
+    )
+    policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    with OneTxClient(config) as client:
+        known_instruments = discover_vaults_from_client(
+            client, enrich=True, loops=True, on_warning=on_warning
+        )
+        try:
+            result = check_allocation_policy(
+                client,
+                signer,  # type: ignore[arg-type]
+                planned.allocation,
+                policy_model,
+                known_instruments=known_instruments,
+                config=config,
+                idempotency_store=idempotency_store(
+                    config, allocation_scope(planned.allocation)
+                ),
+            )
+        except PolicyCheckFailed as failed:
+            raise ServiceError("policy_violation", str(failed)) from failed
+    return model_payload(result)
+
+
+# What applies each kind of stored plan, and what re-checks its policy first.
 _APPLY: dict[str, Callable[..., JsonObject]] = {EXECUTE: apply_execute}
+_RECHECK: dict[str, Callable[..., JsonObject]] = {EXECUTE: recheck_execute_policy}
 
 
 def propose(store: PlanStore, proposal: Mapping[str, Any]) -> JsonObject:
@@ -185,14 +229,27 @@ def propose(store: PlanStore, proposal: Mapping[str, Any]) -> JsonObject:
     }
 
 
-def apply_approved(store: PlanStore, approved_hash: str) -> JsonObject:
+def apply_approved(
+    store: PlanStore,
+    approved_hash: str,
+    *,
+    policy: Policy | Path | None = None,
+) -> JsonObject:
     """Apply the stored plan a human approved by hash, at most once.
 
-    The plan is marked used before it runs, so a repeated approval cannot send
-    it twice; a failed run needs a new plan.
+    The plan is marked used before anything else, so a repeated approval cannot
+    send it twice; a refused or failed run needs a new plan. With `policy`, the
+    plan's allocation is checked against it on today's shelf before it is
+    applied, and refused on a violation.
     """
     stored = store.take(approved_hash)
     apply = _APPLY.get(stored.kind)
     if apply is None:
         raise ServiceError("invalid_input", f"no plan kind {stored.kind}")
+    if plan_hash(stored.kind, stored.plan) != approved_hash:
+        raise ServiceError(
+            "plan_mismatch", "the stored plan does not match the approved hash"
+        )
+    if policy is not None:
+        _RECHECK[stored.kind](stored.plan, policy=policy)
     return apply(stored.plan, expected_hash=approved_hash)

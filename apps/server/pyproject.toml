@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oa-server"
+version = "0.1.0"
+description = "Local server for Open Allocator: HTTP API, MCP over HTTP, approval and chat."
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Ivan Alberquilla" }]
+dependencies = [
+    "open-allocator[mcp]",
+    "alembic==1.20.0",
+    "fastapi==0.141.1",
+    "psycopg[binary]==3.3.6",
+    "sqlalchemy==2.1.1",
+    "uvicorn[standard]==0.54.0",
+]
+
+[project.scripts]
+open-allocator-ui = "oa_server.launcher:main"
+
+[tool.uv.sources]
+open-allocator = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oa_server"]

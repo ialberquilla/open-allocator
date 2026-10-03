@@ -5,7 +5,7 @@ A local dashboard and chat on top of the library.
 ## Layers
 
 - **`open_allocator.service`**: the logic behind each command, as functions that take typed arguments and return the JSON object the CLI prints. They never print or exit, and raise `ServiceError(code, detail)` for failures the caller can act on.
-- **Adapters** stay thin and must not diverge: the CLI (`cli.py`) and the MCP server (`open_allocator/mcp.py`). An HTTP API belongs in a separate app that the library never imports.
+- **Adapters** stay thin and must not diverge: the CLI (`cli.py`) and the MCP server (`open_allocator/mcp.py`). The HTTP API lives in a separate app, `apps/server` (`oa_server`), that the library never imports.
 
 ## MCP server
 
@@ -42,9 +42,56 @@ The MCP `execute` tool takes the `allocation` object from `build-allocation`. It
 {"plan_required": true, "kind": "execute", "plan_hash": "…", "expires_at": "…", "plan": {"status": "planned", …}, "warnings": []}
 ```
 
-Nothing in the MCP adapter can apply a plan. `apply_approved(store, plan_hash)` is the approval entry point for a human-facing surface (the local server's Approve button): it marks the stored plan used before running it, so a plan runs at most once, and refuses unknown (`plan_not_found`), expired (`plan_expired`, 15 minutes by default) or used (`plan_used`) plans. The stdio server keeps plans in memory and has no approval surface yet. Over stdio, approve by running `execute --confirm` yourself.
+Nothing in the MCP adapter can apply a plan. `apply_approved(store, plan_hash, policy=...)` is the approval entry point for a human-facing surface (the local server's Approve route). It marks the stored plan used before anything else, so a plan runs at most once, and refuses unknown (`plan_not_found`), expired (`plan_expired`, 15 minutes by default) or used (`plan_used`) plans, and a stored plan that no longer hashes to the approved hash (`plan_mismatch`). With `policy`, it then re-checks the plan's allocation against that policy on today's shelf (`recheck_execute_policy`) and refuses on a violation (`policy_violation`). A refused or failed approval leaves the plan used: plan again.
 
-Not yet split: `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`. Policy is not re-checked at approval yet; the plan carries the result it was built under.
+The stdio server keeps plans in memory and has no approval surface. Over stdio, approve by running `execute --confirm` yourself.
+
+Not yet split: `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`.
+
+## Local server (`apps/server`)
+
+`oa_server` is a separate package in the uv workspace. It depends on the library; the library never imports it. One process serves:
+
+- `/mcp`: the same MCP server over streamable HTTP, storing plans in Postgres (`PostgresPlanStore`).
+- `GET /api/plans/{hash}`: the stored plan an approval would apply. A UI shows this, not the chat's copy.
+- `POST /api/approve {"plan_hash"}`: applies that stored plan once, after re-checking it against the operator's policy (`OA_POLICY_PATH`, default `policy.yaml`), whatever policy the model planned under. Records the result or error on the plan row. `404` unknown, `410` expired, `409` used or mismatched, `422` policy violation.
+- `POST /api/chat {"message", "session_id"?}`: one chat turn as server-sent events (`session`, `text`, `tool_use`, `tool_result`, `plan_required`, `result`, `error`).
+- `GET /api/health`: the only route that needs no token.
+
+Run it from the directory with the CLI's `.env`:
+
+```bash
+docker compose up -d          # Postgres on 127.0.0.1:5442
+uv run open-allocator-ui      # migrates, then serves http://127.0.0.1:8787
+```
+
+It prints a token generated at start. Send it as `Authorization: Bearer <token>` (or the `oa_token` cookie). Settings: `OA_DATABASE_URL`, `OA_HOST`, `OA_PORT`, `OA_POLICY_PATH`, `OA_CLAUDE_BIN`.
+
+### Access
+
+- Binds `127.0.0.1`. A request whose `Host` is not the server's own is refused (`421`, against DNS rebinding), as is one with a foreign `Origin` (`403`) or without the token (`401`).
+- Signer keys stay in the server process. No response carries them.
+
+### Chat
+
+Each turn spawns the user's own `claude` CLI (`claude -p … --output-format stream-json`), so it runs on their Claude login. The child process:
+
+- runs in a scratch directory, not the repository, with an environment reduced to `PATH`, `HOME`, locale and Claude auth variables: no signer, 1Tx or database secrets;
+- has no built-in tools (`--tools ""`), only this server's MCP tools (`--strict-mcp-config`, `--allowedTools mcp__open-allocator__*`), no settings sources (`--setting-sources ""`) and no skills;
+- gets its MCP config from a `0600` file holding the server's URL and token;
+- is killed if the client disconnects mid-turn. A session runs one turn at a time (`409` otherwise). A missing `claude` is a `503`.
+
+The bridge never approves. A `plan_required` event names the stored plan; approving it is a separate request to `/api/approve`.
+
+### Storage
+
+SQLAlchemy models in `oa_server/db/models.py`; Alembic migrations are autogenerated from them (`uv run --directory apps/server alembic revision --autogenerate -m "…"`), never hand-written. The launcher runs `upgrade head` at start. `test_migrations.py` runs `alembic check`, so a model change without its migration fails.
+
+Tables: `plan` (hash, kind, plan, created/expires/used, result, error).
+
+### Tests
+
+`uv run pytest apps/server/tests`. Postgres comes from `OA_TEST_DATABASE_URL`, or a throwaway container when Docker is running; without either the database tests skip.
 
 ## Invariants
 
