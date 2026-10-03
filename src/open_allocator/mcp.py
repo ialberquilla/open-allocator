@@ -339,6 +339,57 @@ def build_mcp(
         )
         return {**scorecard, "warnings": warnings}
 
+    @server.tool(name="backtest", annotations=READ_ONLY)
+    def backtest(
+        allocation: Annotated[
+            dict[str, Any],
+            Field(description="The `allocation` object from build-allocation."),
+        ],
+    ) -> JsonObject:
+        """Daily-compounded NAV backtest of an allocation against a TVL-weighted
+        universe benchmark, over the history 1Tx serves. Yield path only: no
+        principal, depeg or contract loss. Descriptive, not predictive."""
+        warnings: list[JsonObject] = []
+        report = _call(
+            allocation_service.backtest, allocation, on_warning=warnings.append
+        )
+        return {**report, "warnings": warnings}
+
+    @server.tool(name="check-policy", annotations=READ_ONLY)
+    def check_policy(
+        allocation: Annotated[
+            dict[str, Any],
+            Field(description="The `allocation` object from build-allocation."),
+        ],
+        policy_path: Annotated[
+            str,
+            Field(description="Policy YAML, relative to the server's directory."),
+        ] = str(allocation_service.DEFAULT_POLICY_PATH),
+        against: Annotated[
+            dict[str, Any] | None,
+            Field(
+                description="A positions book, as the `positions` tool returns it. "
+                "Scores the book the allocation would leave instead of the buy "
+                "in isolation."
+            ),
+        ] = None,
+    ) -> JsonObject:
+        """Score an allocation against the policy on today's shelf: `ok` and
+        each violation with its rule, entity, limit and actual value. Stop on
+        any violation."""
+        warnings: list[JsonObject] = []
+        if against is not None:
+            # The `positions` tool's own warnings are not part of the book.
+            against = {k: v for k, v in against.items() if k != "warnings"}
+        result = _call(
+            allocation_service.check_policy,
+            allocation,
+            policy=Path(policy_path),
+            against=against,
+            on_warning=warnings.append,
+        )
+        return {**result, "warnings": warnings}
+
     @server.tool(name="execute", annotations=READ_ONLY)
     def execute(
         allocation: Annotated[

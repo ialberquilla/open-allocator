@@ -8,8 +8,10 @@ from typing import Any
 
 from open_allocator.core import allocator as allocation_core
 from open_allocator.core import apy_accounting, eligibility, fixed_rate, metrics
+from open_allocator.core import backtest as backtest_core
 from open_allocator.core import costs as costs_core
 from open_allocator.core import policy as policy_core
+from open_allocator.core import positions as positions_core
 from open_allocator.core import screen as screen_core
 from open_allocator.core import simulate as simulate_core
 from open_allocator.core import strategies as strategies_core
@@ -169,6 +171,52 @@ def simulate(
             benchmark=benchmark,
             vaults=vaults,
         ).model_dump(mode="json")
+
+
+def backtest(
+    allocation: Allocation | Mapping[str, Any],
+    *,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """Read-only daily-compounded NAV backtest of an allocation vs. a
+    TVL-weighted universe benchmark. Yield-path only; descriptive not
+    predictive."""
+    allocation = parse_allocation(allocation)
+    discovered = discover_vaults(enrich=True, on_warning=on_warning)
+    apy_series_by_id = {vault.instrument_id: vault.apy_series for vault in discovered}
+    tvl_by_id = {vault.instrument_id: vault.tvl_usd for vault in discovered}
+    weights = {leg.instrument_id: leg.weight for leg in allocation.legs}
+    return backtest_core.run(weights, apy_series_by_id, tvl_by_id).model_dump(
+        mode="json"
+    )
+
+
+def check_policy(
+    allocation: Allocation | Mapping[str, Any],
+    *,
+    policy: Policy | Path = DEFAULT_POLICY_PATH,
+    against: positions_core.Positions | Mapping[str, Any] | None = None,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """The allocation scored against the policy on today's shelf.
+
+    With `against`, a positions book, scores the book the allocation would leave
+    behind instead of the buy in isolation.
+    """
+    allocation = parse_allocation(allocation)
+    if not isinstance(policy, Policy):
+        policy = load_policy(policy)
+    known_instruments = discover_vaults(enrich=True, on_warning=on_warning)
+    if against is None:
+        result = policy_core.check(allocation, policy, known_instruments)
+    else:
+        result = policy_core.check_incremental(
+            allocation,
+            policy,
+            known_instruments,
+            positions_core.held_usd_by_instrument(against),
+        )
+    return result.model_dump(mode="json")
 
 
 def _live_cost_params(

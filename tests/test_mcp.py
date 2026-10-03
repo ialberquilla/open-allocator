@@ -8,6 +8,7 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 
 from open_allocator import mcp as mcp_module
+from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
 from open_allocator.core import universe as universe_core
 from open_allocator.core.types import Vault
@@ -85,6 +86,8 @@ def test_tools_are_cli_commands_that_change_nothing() -> None:
         "screen",
         "build-allocation",
         "simulate",
+        "backtest",
+        "check-policy",
         "execute",
         "rebalance",
         "withdraw",
@@ -211,6 +214,8 @@ def vault(instrument_id: str, *, chain_id: int, apy: float) -> Vault:
     )
 
 
+POLICY_OK = policy_core.PolicyResult(ok=True, violations=())
+
 SHELF = [
     vault("base-aave-usdc", chain_id=8453, apy=4.0),
     vault("arb-morpho-usdc", chain_id=42161, apy=5.0),
@@ -312,6 +317,77 @@ def test_build_allocation_requires_an_amount() -> None:
         "error": "amount required: pass --amount or set amount_usd in the spec",
         "code": "invalid_input",
     }
+
+
+def test_backtest_takes_the_allocation_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        allocation_service, "discover_vaults", lambda **_kwargs: list(SHELF)
+    )
+    allocation = {
+        "legs": [
+            {"instrument_id": "base-aave-usdc", "weight": 0.5, "usd": 500.0},
+            {"instrument_id": "arb-morpho-usdc", "weight": 0.5, "usd": 500.0},
+        ],
+        "total_usd": 1000.0,
+        "metadata": {},
+    }
+
+    result = call("backtest", {"allocation": allocation})
+
+    assert not result.is_error
+    payload = result.structured_content
+    assert payload == {
+        **allocation_service.backtest(allocation),
+        "warnings": [],
+    }
+    assert payload["label"] == "descriptive-not-predictive"
+
+
+def test_check_policy_scores_the_buy_or_the_resulting_book(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        allocation_service, "discover_vaults", lambda **_kwargs: list(SHELF)
+    )
+    checked: list[object] = []
+    monkeypatch.setattr(
+        policy_core,
+        "check",
+        lambda *_args: checked.append("buy") or POLICY_OK,
+    )
+
+    def check_incremental(*args: object) -> object:
+        checked.append(args[3])
+        return POLICY_OK
+
+    monkeypatch.setattr(policy_core, "check_incremental", check_incremental)
+    allocation = {
+        "legs": [{"instrument_id": "base-aave-usdc", "weight": 1.0, "usd": 100.0}],
+        "total_usd": 100.0,
+        "metadata": {},
+    }
+    policy = str(ROOT / "policy.yaml")
+    book = {
+        "address": WALLET,
+        "holdings": [],
+        "idle_balances": [],
+        "total_position_usd": 0,
+        "total_idle_usdc": 0,
+        "total_usd": 0,
+        "warnings": ["the positions tool's own"],
+    }
+
+    alone = call("check-policy", {"allocation": allocation, "policy_path": policy})
+    with_book = call(
+        "check-policy",
+        {"allocation": allocation, "policy_path": policy, "against": book},
+    )
+
+    assert alone.structured_content == {"ok": True, "violations": [], "warnings": []}
+    assert with_book.structured_content == alone.structured_content
+    assert checked == ["buy", {}]
 
 
 def test_execute_stores_the_plan_for_approval_and_sends_nothing(

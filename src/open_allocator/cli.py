@@ -10,10 +10,8 @@ from typing import Annotated, Any, ParamSpec, TypeVar
 import typer
 
 from open_allocator.core import allocator as allocation_core
-from open_allocator.core import backtest as backtest_core
 from open_allocator.core import drift as drift_core
 from open_allocator.core import mandate as mandate_core
-from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
 from open_allocator.core import (
     universe,
@@ -780,13 +778,9 @@ def backtest(
     """Read-only daily-compounded NAV backtest of an allocation vs. a
     TVL-weighted universe benchmark. Yield-path only; descriptive not
     predictive."""
-    allocation = _read_allocation(allocation_path)
-    discovered = _discover_vaults(enrich=True)
-    apy_series_by_id = {vault.instrument_id: vault.apy_series for vault in discovered}
-    tvl_by_id = {vault.instrument_id: vault.tvl_usd for vault in discovered}
-    weights = {leg.instrument_id: leg.weight for leg in allocation.legs}
-    report = backtest_core.run(weights, apy_series_by_id, tvl_by_id)
-    return report.model_dump(mode="json")
+    return allocation_service.backtest(
+        _read_allocation(allocation_path), on_warning=_warn
+    )
 
 
 @app.command("check-policy")
@@ -814,22 +808,12 @@ def check_policy(
         ),
     ] = None,
 ) -> JsonObject:
-    allocation = _read_allocation(allocation_path)
-    policy = load_policy(policy_path)
-    known_instruments = _discover_vaults(enrich=True)
-    if against_path is None:
-        return policy_core.check(
-            allocation,
-            policy,
-            known_instruments,
-        ).model_dump(mode="json")
-    held_usd = positions_core.held_usd_by_instrument(_read_positions(against_path))
-    return policy_core.check_incremental(
-        allocation,
-        policy,
-        known_instruments,
-        held_usd,
-    ).model_dump(mode="json")
+    return allocation_service.check_policy(
+        _read_allocation(allocation_path),
+        policy=policy_path,
+        against=_read_positions(against_path) if against_path is not None else None,
+        on_warning=_warn,
+    )
 
 
 @app.command("validate-mandate")

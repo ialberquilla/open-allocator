@@ -22,11 +22,12 @@ Tools are named after the CLI commands and return the same objects, with these d
 
 - Every tool except `wallet-status`, `safe-address` and `rewards` adds a `warnings` list. The CLI prints those warnings to stderr; over stdio, stdout is the protocol.
 - `list-vaults` returns `{"vaults": [...], "warnings": [...]}` instead of a bare array.
-- `build-allocation` returns `{"allocation": {...}, "warnings": [...]}`. The `allocation` object is what `simulate` takes, unchanged, in place of the CLI's `--allocation` file.
+- `build-allocation` returns `{"allocation": {...}, "warnings": [...]}`. The `allocation` object is what `simulate`, `backtest` and `check-policy` take, unchanged, in place of the CLI's `--allocation` file.
+- `check-policy` takes an optional `against` book, the `positions` tool result (its `warnings` are ignored), in place of the CLI's `--against` file.
 - Arguments are typed values, not CLI strings: `pins` and `strategy_params` are objects, `spec` is an allocation-spec object rather than a path. `policy_path` is still a path, resolved against the server's working directory.
 - Errors come back as `{"error": ..., "code": ...}` in the tool result; `code` is present for `ServiceError`.
 
-Exposed tools: `wallet-status`, `safe-address`, `positions`, `rewards`, `list-vaults`, `score-vault`, `screen`, `build-allocation`, `simulate`, `execute`, `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`. None of them changes anything on chain.
+Exposed tools: `wallet-status`, `safe-address`, `positions`, `rewards`, `list-vaults`, `score-vault`, `screen`, `build-allocation`, `simulate`, `backtest`, `check-policy`, `execute`, `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`. None of them changes anything on chain. `drift` and `validate-mandate` are not exposed.
 
 ## Plans and approval
 

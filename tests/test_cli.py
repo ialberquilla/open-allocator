@@ -1163,7 +1163,7 @@ def test_backtest_command_reports_portfolio_and_benchmark(
 ) -> None:
     from open_allocator.core.types import Vault
 
-    def _vaults(*, enrich: bool = False) -> list[Vault]:
+    def _vaults(**_kwargs: object) -> list[Vault]:
         return [
             Vault(
                 instrument_id="a",
@@ -1185,7 +1185,7 @@ def test_backtest_command_reports_portfolio_and_benchmark(
             ),
         ]
 
-    monkeypatch.setattr(cli, "_discover_vaults", _vaults)
+    patch_surface(monkeypatch, "discover_vaults", _vaults)
 
     allocation_path = tmp_path / "allocation.json"
     allocation_path.write_text(
