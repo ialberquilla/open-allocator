@@ -70,7 +70,7 @@ select = ["E", "F", "I"]
 packages = ["src/open_allocator"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "apps/server/tests"]
 markers = ["integration: hits live 1Tx API / RPC; skipped without creds"]
 
 [tool.hatch.build.targets.sdist]
