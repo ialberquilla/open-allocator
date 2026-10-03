@@ -14,6 +14,7 @@ from open_allocator.core.types import Vault
 from open_allocator.exec import execute as execute_exec
 from open_allocator.exec import gas as gas_module
 from open_allocator.exec import loops as loops_exec
+from open_allocator.exec import rebalance as rebalance_exec
 from open_allocator.exec import withdraw as withdraw_exec
 from open_allocator.exec.client import RewardsResponse
 from open_allocator.mcp import build_mcp
@@ -82,6 +83,7 @@ def test_tools_are_cli_commands_that_change_nothing() -> None:
         "build-allocation",
         "simulate",
         "execute",
+        "rebalance",
         "withdraw",
     }
     assert {tool.name for tool in tools} <= cli_inventory()
@@ -417,15 +419,60 @@ def test_withdraw_stores_the_plan_for_approval_and_sends_nothing(
     assert stored.plan == document
 
 
+def test_rebalance_stores_the_plan_for_approval_and_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = {"account": WALLET, "rebalance_plan": {"trades": []}}
+    report = {"status": "planned", "messages": ["dry-run only"]}
+    target = {"legs": [], "total_usd": 0}
+
+    def fake_plan(allocation: object, **kwargs: Any) -> dict[str, Any]:
+        assert allocation == target
+        assert kwargs["min_trade_usd"] == 5.0
+        kwargs["on_warning"]({"warning": "unread_position", "message": "loop"})
+        return {
+            "kind": "rebalance",
+            "plan": document,
+            "plan_hash": plan_hash("rebalance", document),
+            "report": report,
+        }
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an execution tool applied a plan")
+
+    monkeypatch.setattr(execution_service, "plan_rebalance", fake_plan)
+    monkeypatch.setattr(execution_service, "apply_rebalance", refuse)
+    monkeypatch.setattr(rebalance_exec, "apply_rebalancing_plan", refuse)
+    store = InMemoryPlanStore()
+
+    result = anyio.run(
+        build_mcp(store).call_tool,
+        "rebalance",
+        {"target": target, "min_trade_usd": 5},
+    )
+
+    payload = result.structured_content
+    assert payload["plan_required"] is True
+    assert payload["kind"] == "rebalance"
+    assert payload["plan_hash"] == plan_hash("rebalance", document)
+    assert payload["plan"] == report
+    assert payload["warnings"] == [{"warning": "unread_position", "message": "loop"}]
+    stored = store.get(payload["plan_hash"])
+    assert stored is not None and stored.used_at is None
+    assert stored.plan == document
+
+
 def test_nothing_in_the_mcp_adapter_can_apply_a_plan() -> None:
     source = Path(mcp_module.__file__).read_text(encoding="utf-8")
 
     for name in (
         "apply_execute",
         "apply_withdraw",
+        "apply_rebalance",
         "apply_approved",
         "apply_allocation_plan",
         "apply_withdrawal_plan",
+        "apply_rebalancing_plan",
         "take(",
         "reject(",
     ):

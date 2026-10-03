@@ -13,6 +13,7 @@ import {
   api,
   type ExecuteReview,
   type PlanResponse,
+  type RebalanceReview,
   type Review as PlanReview,
   type ReviewBundle,
   type WithdrawReview,
@@ -183,7 +184,14 @@ export function Approve({ hash }: { hash: string }) {
 }
 
 function Review({ review }: { review: PlanReview }) {
-  return review.kind === "withdraw" ? <WithdrawDetails review={review} /> : <ExecuteDetails review={review} />;
+  switch (review.kind) {
+    case "withdraw":
+      return <WithdrawDetails review={review} />;
+    case "rebalance":
+      return <RebalanceDetails review={review} />;
+    default:
+      return <ExecuteDetails review={review} />;
+  }
 }
 
 function ExecuteDetails({ review }: { review: ExecuteReview }) {
@@ -207,30 +215,7 @@ function ExecuteDetails({ review }: { review: ExecuteReview }) {
 
       <AccountCard chainId={review.bundles[0]?.chain_id} address={review.account} />
 
-      <Card>
-        <CardHeader
-          title="Policy"
-          description="The result when the plan was built. Approval checks it again against the server's policy on today's shelf."
-        />
-        <CardContent>
-          {review.policy.ok ? (
-            <Badge variant="success">No violations</Badge>
-          ) : (
-            <Table head={["Rule", "Entity", "Limit", "Actual"]} minWidth={480}>
-              {review.policy.violations.map((violation, index) => (
-                <tr key={index}>
-                  <Cell>{violation.rule}</Cell>
-                  <Cell className="font-mono text-xs">{violation.entity}</Cell>
-                  <Cell numeric>{String(violation.limit)}</Cell>
-                  <Cell numeric className="text-destructive">
-                    {String(violation.actual)}
-                  </Cell>
-                </tr>
-              ))}
-            </Table>
-          )}
-        </CardContent>
-      </Card>
+      <Policy policy={review.policy} />
 
       <Card>
         <CardHeader title="Legs" description="What the allocation asked for, and what the plan deposits." />
@@ -316,6 +301,123 @@ function WithdrawDetails({ review }: { review: WithdrawReview }) {
 
       <Notes notes={review.notes} />
     </>
+  );
+}
+
+const pct = (weight: number): string => `${(weight * 100).toFixed(1)}%`;
+
+function RebalanceDetails({ review }: { review: RebalanceReview }) {
+  const chains = [...new Set(review.bundles.map((bundle) => bundle.chain_id))];
+  const unfunded = review.funding.filter((item) => !item.ok);
+  const sells = review.trades.filter((trade) => trade.action === "sell").length;
+  return (
+    <>
+      <Blockers blockers={review.blockers} />
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatTile
+          label="Moves"
+          value={usd(Math.max(review.total_sell_usd, review.total_buy_usd))}
+          sub={`sell ${usd(review.total_sell_usd)} · buy ${usd(review.total_buy_usd)}`}
+        />
+        <StatTile
+          label="Trades"
+          value={review.trades.length}
+          sub={`${sells} sell${sells === 1 ? "" : "s"}, ${review.trades.length - sells} buy${review.trades.length - sells === 1 ? "" : "s"}`}
+        />
+        <StatTile label="Chains" value={chains.length} sub={chains.map(chainName).join(", ") || "—"} />
+        <StatTile
+          label="Funding"
+          value={unfunded.length === 0 ? "Covered" : "Short"}
+          tone={unfunded.length === 0 ? "success" : "destructive"}
+          sub={unfunded.length === 0 ? "sells fund buys on each chain" : `${unfunded.length} shortfall(s)`}
+        />
+      </div>
+
+      <AccountCard chainId={review.bundles[0]?.chain_id} address={review.account} />
+
+      <Policy policy={review.policy} />
+
+      <Card>
+        <CardHeader
+          title="Trades"
+          description={`From the book as held when planned (${usd(review.book_usd)}) to the target (${usd(review.target_usd)}). Each chain sells before it buys.`}
+        />
+        <CardContent>
+          <Table head={["Action", "Instrument", "Now", "Target", "Trade", "Planned"]} minWidth={640}>
+            {review.trades.map((trade) => (
+              <tr key={trade.trade_index}>
+                <Cell>
+                  <Badge variant={trade.action === "sell" ? "ghost" : "success"}>{trade.action}</Badge>
+                </Cell>
+                <Cell className="font-mono text-xs">{trade.instrument_id}</Cell>
+                <Cell numeric>
+                  {usd(trade.current_usd)}
+                  <span className="block text-xs text-muted-foreground">{pct(trade.current_weight)}</span>
+                </Cell>
+                <Cell numeric>
+                  {usd(trade.target_usd)}
+                  <span className="block text-xs text-muted-foreground">{pct(trade.target_weight)}</span>
+                </Cell>
+                <Cell numeric>{usd(trade.usd)}</Cell>
+                <Cell numeric>
+                  {trade.action === "sell" ? (
+                    "—"
+                  ) : trade.deposit_usd == null ? (
+                    <Badge variant="ghost">skipped</Badge>
+                  ) : (
+                    usd(trade.deposit_usd)
+                  )}
+                </Cell>
+              </tr>
+            ))}
+          </Table>
+          {review.skipped.length > 0 && (
+            <p className="mt-3 text-xs text-muted-foreground">
+              Left alone, under the {usd(review.min_trade_usd)} minimum trade:{" "}
+              {review.skipped
+                .map((delta) => `${delta.instrument_id} (${delta.action} ${usd(Math.abs(delta.delta_usd))})`)
+                .join(", ")}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      <Transactions bundles={review.bundles} />
+
+      <Funding funding={review.funding} />
+
+      <Notes notes={review.notes} />
+    </>
+  );
+}
+
+function Policy({ policy }: { policy: ExecuteReview["policy"] }) {
+  return (
+    <Card>
+      <CardHeader
+        title="Policy"
+        description="The result when the plan was built. Approval checks it again against the server's policy on today's shelf."
+      />
+      <CardContent>
+        {policy.ok ? (
+          <Badge variant="success">No violations</Badge>
+        ) : (
+          <Table head={["Rule", "Entity", "Limit", "Actual"]} minWidth={480}>
+            {policy.violations.map((violation, index) => (
+              <tr key={index}>
+                <Cell>{violation.rule}</Cell>
+                <Cell className="font-mono text-xs">{violation.entity}</Cell>
+                <Cell numeric>{String(violation.limit)}</Cell>
+                <Cell numeric className="text-destructive">
+                  {String(violation.actual)}
+                </Cell>
+              </tr>
+            ))}
+          </Table>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

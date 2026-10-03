@@ -177,7 +177,7 @@ export interface components {
              */
             expires_at: string;
             /** Review */
-            review: (components["schemas"]["ExecuteReview"] | components["schemas"]["WithdrawReview"]) | null;
+            review: (components["schemas"]["ExecuteReview"] | components["schemas"]["WithdrawReview"] | components["schemas"]["RebalanceReview"]) | null;
             /** Review Error */
             review_error: string | null;
             /** Plan */
@@ -214,6 +214,41 @@ export interface components {
              * Format: date-time
              */
             expires_at: string;
+        };
+        /** RebalanceReview */
+        RebalanceReview: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "rebalance";
+            /** Account */
+            account: string;
+            /** Book Usd */
+            book_usd: number;
+            /** Target Usd */
+            target_usd: number | null;
+            /** Total Sell Usd */
+            total_sell_usd: number;
+            /** Total Buy Usd */
+            total_buy_usd: number;
+            /** Min Trade Usd */
+            min_trade_usd: number;
+            /** Trades */
+            trades: components["schemas"]["ReviewTrade"][];
+            /** Skipped */
+            skipped: components["schemas"]["ReviewSkipped"][];
+            /** Bundles */
+            bundles: components["schemas"]["ReviewBundle"][];
+            /** Funding */
+            funding: components["schemas"]["ReviewFunding"][];
+            policy: components["schemas"]["ReviewPolicy"];
+            /** Notes */
+            notes: string[];
+            /** Blockers */
+            blockers: string[];
+            /** Transactions */
+            transactions: number;
         };
         /** RejectResponse */
         RejectResponse: {
@@ -285,6 +320,42 @@ export interface components {
             ok: boolean;
             /** Violations */
             violations: components["schemas"]["ReviewViolation"][];
+        };
+        /** ReviewSkipped */
+        ReviewSkipped: {
+            /** Instrument Id */
+            instrument_id: string;
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "sell" | "buy";
+            /** Delta Usd */
+            delta_usd: number;
+        };
+        /** ReviewTrade */
+        ReviewTrade: {
+            /** Trade Index */
+            trade_index: number;
+            /** Instrument Id */
+            instrument_id: string;
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "sell" | "buy";
+            /** Usd */
+            usd: number;
+            /** Current Usd */
+            current_usd: number;
+            /** Target Usd */
+            target_usd: number;
+            /** Current Weight */
+            current_weight: number;
+            /** Target Weight */
+            target_weight: number;
+            /** Deposit Usd */
+            deposit_usd: number | null;
         };
         /** ReviewViolation */
         ReviewViolation: {

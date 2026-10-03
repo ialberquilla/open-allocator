@@ -9,6 +9,7 @@ from pydantic import Field
 
 from open_allocator.core import amounts
 from open_allocator.core import policy as policy_core
+from open_allocator.core import positions as positions_core
 from open_allocator.core import rebalance as rebalance_core
 from open_allocator.core.state import backend_from_config
 from open_allocator.core.types import (
@@ -20,6 +21,7 @@ from open_allocator.core.types import (
     Vault,
 )
 from open_allocator.exec import bundle_execution, calldata, deposit_sizing
+from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.execute import (
     ExecutionStepReport,
     GasCheck,
@@ -89,6 +91,28 @@ def _refuse_levered_trades(
         )
 
 
+class RebalancingPlan(FrozenModel):
+    """A rebalance, complete enough to execute as it stands.
+
+    What a dry run shows and what a confirmation executes: applying it submits
+    these bundles and never plans again. ``positions`` and ``min_trade_usd`` are
+    what it was planned from: applying reads share baselines from ``positions``,
+    and the caller binds the same idempotency scope from all three.
+    """
+
+    kind: Literal["rebalance"] = "rebalance"
+    account: str
+    positions: positions_core.Positions
+    min_trade_usd: float = Field(ge=0)
+    rebalance_plan: rebalance_core.RebalancePlan
+    plan: TxPlan
+    preparation: PlanPreparation
+    # Sizing notes, one per deposit sized down or skipped.
+    messages: tuple[str, ...] = ()
+    # What each planned deposit actually spends, by trade index.
+    deposit_usd: dict[int, float] = Field(default_factory=dict)
+
+
 def execute_rebalance(
     client: object,
     signer: Signer,
@@ -104,19 +128,11 @@ def execute_rebalance(
     min_trade_usd: float = 1.0,
 ) -> RebalanceExecutionReport:
     known = tuple(known_instruments or ())
-    rebalance_plan = rebalance_core.plan_rebalance(
-        positions,
-        target,
-        policy,
-        known_instruments=known,
-        min_trade_usd=min_trade_usd,
-    )
-    _refuse_levered_trades(positions, rebalance_plan.trades, known)
+    rebalance_plan = _trades_plan(positions, target, policy, known, min_trade_usd)
     should_execute = confirm or autonomous
     if autonomous and not confirm:
         _require_autonomous_rebalance(rebalance_plan, policy)
-
-    return _calldata_rebalance(
+    planned = _rebalancing_plan(
         client,
         signer,
         positions,
@@ -124,53 +140,100 @@ def execute_rebalance(
         known,
         config,
         idempotency_store,
-        execute=should_execute,
+    )
+    if not should_execute:
+        return dry_run_report(planned)
+    return apply_rebalancing_plan(
+        client,
+        signer,
+        planned,
+        config=config,
+        idempotency_store=idempotency_store,
     )
 
 
-def _calldata_rebalance(
+def plan_rebalancing(
     client: object,
     signer: Signer,
     positions: object,
-    rebalance_plan: rebalance_core.RebalancePlan,
-    known: Sequence[Vault | Mapping[str, object]],
-    config: object | None,
-    idempotency_store: object | None,
+    target: Allocation | Mapping[str, object],
+    policy: Policy | Mapping[str, object],
     *,
-    execute: bool,
-) -> RebalanceExecutionReport:
-    """A same-chain rebalance: each chain's withdrawals, then its deposits.
-
-    Each chain's calls go in one atomic operation. Deposits are logged with the
-    shares read from positions afterwards, not the simulated amounts.
-    """
-    address = signer.address()
-    built = _calldata_rebalance_plan(
+    known_instruments: Iterable[Vault | Mapping[str, object]] | None = None,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+    min_trade_usd: float = 1.0,
+) -> RebalancingPlan:
+    """The rebalance ``rebalance`` would submit toward ``target``, not sent."""
+    known = tuple(known_instruments or ())
+    return _rebalancing_plan(
         client,
         signer,
-        address,
         positions,
-        rebalance_plan,
+        _trades_plan(positions, target, policy, known, min_trade_usd),
         known,
         config,
         idempotency_store,
     )
-    if not execute:
-        return RebalanceExecutionReport(
-            status="planned",
-            rebalance_plan=rebalance_plan,
-            policy_result=rebalance_plan.policy_result,
-            plan=built.plan,
-            preparations=built.preparation.preparations,
-            funding=built.preparation.funding,
-            messages=(
-                "dry-run only; no transactions broadcast",
-                *built.messages,
-                *built.preparation.messages,
-                *built.preparation.blockers,
-            ),
+
+
+def dry_run_report(planned: RebalancingPlan) -> RebalanceExecutionReport:
+    """The ``rebalance`` dry-run report: the plan, its preparation and blockers."""
+    preparation = planned.preparation
+    return RebalanceExecutionReport(
+        status="planned",
+        rebalance_plan=planned.rebalance_plan,
+        policy_result=planned.rebalance_plan.policy_result,
+        plan=planned.plan,
+        preparations=preparation.preparations,
+        funding=preparation.funding,
+        messages=(
+            "dry-run only; no transactions broadcast",
+            *planned.messages,
+            *preparation.messages,
+            *preparation.blockers,
+        ),
+    )
+
+
+def apply_rebalancing_plan(
+    client: object,
+    signer: Signer,
+    planned: RebalancingPlan,
+    *,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> RebalanceExecutionReport:
+    """Execute exactly ``planned``, refusing it when it no longer describes the
+    account: another signer, or a trade submitted since it was built.
+
+    Each chain's withdrawals go before its deposits in one atomic operation.
+    Deposits are logged with the shares read from positions afterwards, not the
+    simulated amounts.
+    """
+    address = signer.address()
+    if address.casefold() != planned.account.casefold():
+        raise TransactionPlanError(
+            f"the plan was built for {planned.account}, but the signer is {address}"
+        )
+    # Planning skips a trade already sent; one sent since means a resend.
+    stale = sorted(
+        key
+        for key in {
+            _leg_key(bundle.leg_index, bundle.instrument_id)
+            for bundle in planned.plan.bundles
+        }
+        if _store_completed(idempotency_store, key)
+    )
+    if stale:
+        raise TransactionPlanError(
+            "the plan is stale: "
+            + ", ".join(stale)
+            + " was sent after it was built; plan again"
         )
 
+    rebalance_plan = planned.rebalance_plan
+    positions = planned.positions
     attribution_required = (
         backend_from_config(config, needs="allocation_log_path") is not None
     )
@@ -204,14 +267,14 @@ def _calldata_rebalance(
                 )
         return bundle_execution.BundleLog(
             action_type="buy",
-            usd=built.deposit_usd.get(bundle.leg_index),
+            usd=planned.deposit_usd.get(bundle.leg_index),
             shares=shares,
         )
 
     result = bundle_execution.execute_plan(
         client,
         signer,
-        built.plan,
+        planned.plan,
         stage="rebalance",
         policy_result=rebalance_plan.policy_result,
         completion_key=lambda bundle: _leg_key(bundle.leg_index, bundle.instrument_id),
@@ -238,7 +301,7 @@ def _calldata_rebalance(
         preparations=result.preparations,
         funding=result.funding,
         in_progress=result.in_progress,
-        messages=(*built.messages, *result.messages, *unobserved),
+        messages=(*planned.messages, *result.messages, *unobserved),
     )
     _write_checkpoint(
         config,
@@ -247,6 +310,57 @@ def _calldata_rebalance(
         completed_keys=(*earlier, *result.completed_keys),
     )
     return report
+
+
+def _trades_plan(
+    positions: object,
+    target: Allocation | Mapping[str, object],
+    policy: Policy | Mapping[str, object],
+    known: Sequence[Vault | Mapping[str, object]],
+    min_trade_usd: float,
+) -> rebalance_core.RebalancePlan:
+    """The policy-checked trades toward ``target``, refused if one is levered."""
+    rebalance_plan = rebalance_core.plan_rebalance(
+        positions,  # type: ignore[arg-type]
+        target,
+        policy,
+        known_instruments=known,
+        min_trade_usd=min_trade_usd,
+    )
+    _refuse_levered_trades(positions, rebalance_plan.trades, known)
+    return rebalance_plan
+
+
+def _rebalancing_plan(
+    client: object,
+    signer: Signer,
+    positions: object,
+    rebalance_plan: rebalance_core.RebalancePlan,
+    known: Sequence[Vault | Mapping[str, object]],
+    config: object | None,
+    idempotency_store: object | None,
+) -> RebalancingPlan:
+    address = signer.address()
+    built = _calldata_rebalance_plan(
+        client,
+        signer,
+        address,
+        positions,
+        rebalance_plan,
+        known,
+        config,
+        idempotency_store,
+    )
+    return RebalancingPlan(
+        account=address,
+        positions=rebalance_core._positions(positions),  # type: ignore[arg-type]  # noqa: SLF001
+        min_trade_usd=rebalance_plan.min_trade_usd,
+        rebalance_plan=rebalance_plan,
+        plan=built.plan,
+        preparation=built.preparation,
+        messages=built.messages,
+        deposit_usd=dict(built.deposit_usd),
+    )
 
 
 def _calldata_rebalance_plan(
@@ -528,5 +642,9 @@ def _money_decimal(value: object, name: str) -> Decimal:
 __all__ = [
     "RebalanceAuthorizationError",
     "RebalanceExecutionReport",
+    "RebalancingPlan",
+    "apply_rebalancing_plan",
+    "dry_run_report",
     "execute_rebalance",
+    "plan_rebalancing",
 ]

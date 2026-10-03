@@ -126,7 +126,50 @@ class WithdrawReview(Strict):
     transactions: int
 
 
-Review = Annotated[ExecuteReview | WithdrawReview, Field(discriminator="kind")]
+class ReviewTrade(Strict):
+    trade_index: int
+    instrument_id: str
+    action: Literal["sell", "buy"]
+    usd: float
+    current_usd: float
+    target_usd: float
+    current_weight: float
+    target_weight: float
+    # A buy's spend after sizing; None for a sell or a buy planning skipped.
+    deposit_usd: float | None
+
+
+class ReviewSkipped(Strict):
+    instrument_id: str
+    action: Literal["sell", "buy"]
+    delta_usd: float
+
+
+class RebalanceReview(Strict):
+    kind: Literal["rebalance"]
+    account: str
+    # The book's value when the plan was built, idle USDC included.
+    book_usd: float
+    target_usd: float | None
+    total_sell_usd: float
+    total_buy_usd: float
+    min_trade_usd: float
+    trades: list[ReviewTrade]
+    # Deltas under `min_trade_usd`, left alone.
+    skipped: list[ReviewSkipped]
+    bundles: list[ReviewBundle]
+    funding: list[ReviewFunding]
+    # The policy result the target was planned under. Approval checks it again
+    # against the operator's policy.
+    policy: ReviewPolicy
+    notes: list[str]
+    blockers: list[str]
+    transactions: int
+
+
+Review = Annotated[
+    ExecuteReview | WithdrawReview | RebalanceReview, Field(discriminator="kind")
+]
 
 
 class PlanSummary(BaseModel):

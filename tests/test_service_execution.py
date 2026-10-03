@@ -9,9 +9,11 @@ import pytest
 from test_cli import (
     DEPOSIT_KINDS,
     ExecutionOneTxClient,
+    RebalanceOneTxClient,
     WithdrawOneTxClient,
     execution_policy,
     install_execution_surface_mocks,
+    install_rebalance_surface_mocks,
     install_withdraw_surface_mocks,
     write_execution_files,
     write_rebalance_files,
@@ -392,3 +394,202 @@ def test_a_withdrawal_review_describes_the_exit(
         "token": None,
     }
     assert review["transactions"] == 1
+
+
+def planned_rebalance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> dict[str, Any]:
+    positions_path, target_path, policy_path = write_rebalance_files(tmp_path)
+    book = Positions.model_validate_json(positions_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        loops_exec,
+        "read_book",
+        lambda _client, _address, _config=None: (book, ["loop unreadable"]),
+    )
+    warnings: list[dict[str, Any]] = []
+    proposal = execution_service.plan_rebalance(
+        read_allocation(target_path), policy=policy_path, on_warning=warnings.append
+    )
+    assert {"warning": "unread_position", "message": "loop unreadable"} in warnings
+    return json.loads(json.dumps(proposal))
+
+
+def test_a_rebalance_plan_is_the_dry_run_and_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_rebalance_surface_mocks(monkeypatch)
+
+    proposal = planned_rebalance(monkeypatch, tmp_path)
+
+    assert proposal["kind"] == "rebalance"
+    assert proposal["plan_hash"] == plan_hash("rebalance", proposal["plan"])
+    assert proposal["report"]["status"] == "planned"
+    assert proposal["report"]["plan"] == proposal["plan"]["plan"]
+    trades = proposal["plan"]["rebalance_plan"]["trades"]
+    assert [(trade["action"], trade["instrument_id"]) for trade in trades] == [
+        ("sell", "vault-a"),
+        ("buy", "vault-b"),
+    ]
+    assert signer.sent == []
+
+
+def test_a_rebalance_is_planned_from_a_given_book(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_rebalance_surface_mocks(monkeypatch)
+    positions_path, target_path, policy_path = write_rebalance_files(tmp_path)
+
+    def unread(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the live book was read")
+
+    monkeypatch.setattr(loops_exec, "read_book", unread)
+
+    proposal = execution_service.plan_rebalance(
+        read_allocation(target_path),
+        positions=json.loads(positions_path.read_text(encoding="utf-8")),
+        policy=policy_path,
+    )
+
+    assert proposal["plan"]["positions"]["total_usd"] == 100.0
+
+
+def test_an_approved_rebalance_runs_the_stored_plan_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_rebalance_surface_mocks(
+        monkeypatch, idempotency_store_path=tmp_path / "idempotency.json"
+    )
+    store = InMemoryPlanStore()
+    response = execution_service.propose(
+        store, planned_rebalance(monkeypatch, tmp_path)
+    )
+    RebalanceOneTxClient.calls = []
+
+    report = execution_service.apply_approved(store, response["plan_hash"])
+    with pytest.raises(ServiceError) as again:
+        execution_service.apply_approved(store, response["plan_hash"])
+
+    assert report["status"] == "success"
+    assert [getattr(sent[0], "kind") for sent in signer.sent] == [
+        "withdraw",
+        *DEPOSIT_KINDS,
+    ]
+    assert RebalanceOneTxClient.calls == []
+    assert again.value.code == "plan_used"
+
+
+def test_a_rebalance_sent_since_it_was_planned_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_rebalance_surface_mocks(
+        monkeypatch, idempotency_store_path=tmp_path / "idempotency.json"
+    )
+    proposal = planned_rebalance(monkeypatch, tmp_path)
+    execution_service.apply_rebalance(proposal["plan"])
+    sent = len(signer.sent)
+
+    with pytest.raises(TransactionPlanError, match="stale"):
+        execution_service.apply_rebalance(
+            proposal["plan"], expected_hash=proposal["plan_hash"]
+        )
+
+    assert len(signer.sent) == sent
+
+
+def test_a_tampered_rebalance_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_rebalance_surface_mocks(monkeypatch)
+    proposal = planned_rebalance(monkeypatch, tmp_path)
+    tampered = json.loads(json.dumps(proposal["plan"]))
+    tampered["account"] = "0x" + "22" * 20
+
+    with pytest.raises(ServiceError) as raised:
+        execution_service.apply_rebalance(tampered, expected_hash=proposal["plan_hash"])
+    with pytest.raises(TransactionPlanError, match="built for"):
+        execution_service.apply_rebalance(tampered)
+
+    assert raised.value.code == "plan_mismatch"
+    assert signer.sent == []
+
+
+def test_approval_rechecks_a_rebalance_target_against_the_operator_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_rebalance_surface_mocks(monkeypatch)
+    proposal = planned_rebalance(monkeypatch, tmp_path)
+    strict = tmp_path / "strict.yaml"
+    strict_policy = execution_policy()
+    strict_policy["caps"]["max_weight_per_instrument"] = 0.4
+    strict.write_text(json.dumps(strict_policy), encoding="utf-8")
+    store = InMemoryPlanStore()
+    response = execution_service.propose(store, proposal)
+
+    with pytest.raises(ServiceError) as raised:
+        execution_service.apply_approved(store, response["plan_hash"], policy=strict)
+
+    assert raised.value.code == "policy_violation"
+    assert "max_weight_per_instrument" in raised.value.detail
+    assert signer.sent == []
+
+
+def test_a_rebalance_target_outside_the_policy_is_not_planned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_rebalance_surface_mocks(monkeypatch)
+    positions_path, target_path, _policy_path = write_rebalance_files(tmp_path)
+    strict = tmp_path / "strict.yaml"
+    strict_policy = execution_policy()
+    strict_policy["caps"]["max_weight_per_instrument"] = 0.4
+    strict.write_text(json.dumps(strict_policy), encoding="utf-8")
+
+    with pytest.raises(ServiceError) as raised:
+        execution_service.plan_rebalance(
+            read_allocation(target_path),
+            positions=json.loads(positions_path.read_text(encoding="utf-8")),
+            policy=strict,
+        )
+
+    assert raised.value.code == "policy_violation"
+    assert RebalanceOneTxClient.calls == []
+
+
+def test_a_rebalance_review_describes_the_trades(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_rebalance_surface_mocks(monkeypatch)
+    proposal = planned_rebalance(monkeypatch, tmp_path)
+
+    review = execution_service.review_plan("rebalance", proposal["plan"])
+
+    assert review["kind"] == "rebalance"
+    assert review["account"] == proposal["plan"]["account"]
+    assert (review["book_usd"], review["target_usd"]) == (100.0, 100.0)
+    assert (review["total_sell_usd"], review["total_buy_usd"]) == (30.0, 30.0)
+    assert [
+        (trade["action"], trade["instrument_id"], trade["usd"])
+        for trade in review["trades"]
+    ] == [("sell", "vault-a", 30.0), ("buy", "vault-b", 30.0)]
+    assert review["trades"][0]["deposit_usd"] is None
+    assert review["trades"][1]["deposit_usd"] == 30.0
+    withdraw, deposit = review["bundles"]
+    assert withdraw["steps"] == ["withdraw"]
+    # A partial sell's calldata amount is in the underlying, not the yield token.
+    assert withdraw["amount_in"] == {
+        "raw": "30000000",
+        "amount": "30",
+        "symbol": "USDC",
+        "token": None,
+    }
+    assert deposit["steps"] == DEPOSIT_KINDS
+    assert review["policy"] == {"ok": True, "violations": []}
+    assert review["transactions"] == 1 + len(DEPOSIT_KINDS)

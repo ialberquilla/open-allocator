@@ -15,8 +15,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
 from open_allocator.core.policy_loader import load_policy
+from open_allocator.core.rebalance import RebalancePolicyError
 from open_allocator.core.state import ScopedIdempotencyStore, backend_from_config
 from open_allocator.core.types import Allocation, BundleToken, Policy, TxBundle, TxStep
 from open_allocator.core.withdraw import WithdrawPlan
@@ -31,6 +33,12 @@ from open_allocator.exec.execute import (
     plan_allocation,
 )
 from open_allocator.exec.funding import FundingRequirement
+from open_allocator.exec.rebalance import (
+    RebalancingPlan,
+    apply_rebalancing_plan,
+    plan_rebalancing,
+)
+from open_allocator.exec.rebalance import dry_run_report as rebalance_dry_run_report
 from open_allocator.exec.withdraw import (
     WithdrawalPlan,
     apply_withdrawal_plan,
@@ -50,6 +58,7 @@ from open_allocator.service.universe import OnWarning, discover_vaults_from_clie
 
 EXECUTE = "execute"
 WITHDRAW = "withdraw"
+REBALANCE = "rebalance"
 
 
 def idempotency_store(config: object, scope: str) -> ScopedIdempotencyStore | None:
@@ -78,6 +87,21 @@ def withdraw_scope(
     amount: float | str | None,
 ) -> str:
     payload = {"position": position.model_dump(mode="json"), "amount": amount}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def rebalance_scope(
+    positions: positions_core.Positions,
+    target: Allocation,
+    *,
+    min_trade_usd: float,
+) -> str:
+    payload = {
+        "positions": positions.model_dump(mode="json"),
+        "target": target.model_dump(mode="json"),
+        "min_trade_usd": min_trade_usd,
+    }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -503,6 +527,226 @@ def review_withdraw(plan: WithdrawalPlan | Mapping[str, Any]) -> JsonObject:
     }
 
 
+def plan_rebalance(
+    target: Allocation | Mapping[str, Any],
+    *,
+    positions: positions_core.Positions | Mapping[str, Any] | None = None,
+    min_trade_usd: float = 1.0,
+    policy: Policy | Path = DEFAULT_POLICY_PATH,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """`{"kind", "plan", "plan_hash", "report"}` for rebalancing toward `target`.
+
+    `positions` is the book to trade from; omitted, the signer's book is read
+    live. Trades under `min_trade_usd` are skipped. Sends nothing; `report` is
+    the dry run `rebalance` prints.
+    """
+    target_model = parse_allocation(target)
+    policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    from open_allocator.exec import loops as loops_exec
+
+    with OneTxClient(config) as client:
+        if positions is None:
+            book, warnings = loops_exec.read_book(
+                client, signer_address(config), config
+            )
+            if on_warning is not None:
+                for warning in warnings:
+                    on_warning({"warning": "unread_position", "message": warning})
+        elif isinstance(positions, positions_core.Positions):
+            book = positions
+        else:
+            book = positions_core.Positions.model_validate(positions)
+        known_instruments = discover_vaults_from_client(
+            client, enrich=True, loops=True, on_warning=on_warning
+        )
+        try:
+            planned = plan_rebalancing(
+                client,
+                signer,  # type: ignore[arg-type]
+                book,
+                target_model,
+                policy_model,
+                known_instruments=known_instruments,
+                config=config,
+                # Read only: trades already sent are not planned again.
+                idempotency_store=idempotency_store(
+                    config,
+                    rebalance_scope(book, target_model, min_trade_usd=min_trade_usd),
+                ),
+                min_trade_usd=min_trade_usd,
+            )
+        except RebalancePolicyError as failed:
+            raise ServiceError("policy_violation", str(failed)) from failed
+    document = planned.model_dump(mode="json")
+    return {
+        "kind": REBALANCE,
+        "plan": document,
+        "plan_hash": plan_hash(REBALANCE, document),
+        "report": model_payload(rebalance_dry_run_report(planned)),
+    }
+
+
+def apply_rebalance(
+    plan: RebalancingPlan | Mapping[str, Any],
+    *,
+    expected_hash: str | None = None,
+) -> JsonObject:
+    """Execute a plan from `plan_rebalance` exactly; the rebalance report payload.
+
+    With `expected_hash`, a plan that does not hash to it is refused before
+    anything is read or sent.
+    """
+    document = (
+        plan.model_dump(mode="json")
+        if isinstance(plan, RebalancingPlan)
+        else dict(plan)
+    )
+    if expected_hash is not None and plan_hash(REBALANCE, document) != expected_hash:
+        raise ServiceError(
+            "plan_mismatch", "the plan does not match the approved plan hash"
+        )
+    planned = (
+        plan
+        if isinstance(plan, RebalancingPlan)
+        else RebalancingPlan.model_validate(document)
+    )
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    with OneTxClient(config) as client:
+        report = apply_rebalancing_plan(
+            client,
+            signer,  # type: ignore[arg-type]
+            planned,
+            config=config,
+            idempotency_store=idempotency_store(
+                config,
+                rebalance_scope(
+                    planned.positions,
+                    planned.rebalance_plan.target,
+                    min_trade_usd=planned.min_trade_usd,
+                ),
+            ),
+        )
+    return model_payload(report)
+
+
+def recheck_rebalance_policy(
+    plan: RebalancingPlan | Mapping[str, Any],
+    *,
+    policy: Policy | Path = DEFAULT_POLICY_PATH,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """Check a stored rebalance's target against `policy` on today's shelf.
+
+    The same check planning ran, so a target built under one policy or shelf
+    does not run once either has moved against it. Raises `ServiceError`
+    `policy_violation`.
+    """
+    planned = (
+        plan
+        if isinstance(plan, RebalancingPlan)
+        else RebalancingPlan.model_validate(plan)
+    )
+    policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
+    with OneTxClient(AllocatorConfig()) as client:
+        known_instruments = discover_vaults_from_client(
+            client, enrich=True, loops=True, on_warning=on_warning
+        )
+    result = policy_core.check(
+        planned.rebalance_plan.target, policy_model, known_instruments
+    )
+    if not result.ok:
+        raise ServiceError("policy_violation", str(RebalancePolicyError(result)))
+    return model_payload(result)
+
+
+def review_rebalance(plan: RebalancingPlan | Mapping[str, Any]) -> JsonObject:
+    """What a person approving a stored `rebalance` plan reads, from the plan alone.
+
+    Withdrawal amounts are shown in the underlying, as for a withdrawal: 1Tx
+    takes a partial sell in raw underlying units, not in the yield token.
+    """
+    planned = (
+        plan
+        if isinstance(plan, RebalancingPlan)
+        else RebalancingPlan.model_validate(plan)
+    )
+    trades_plan = planned.rebalance_plan
+    bundles = planned.plan.bundles
+    tokens = _tokens(bundles)
+    steps = planned.plan.steps
+    preparation = planned.preparation
+    holdings: dict[str, positions_core.PositionHolding] = {}
+    for holding in planned.positions.holdings:
+        holdings.setdefault(holding.instrument_id, holding)
+
+    def reviewed(bundle: TxBundle) -> JsonObject:
+        entry = _bundle(bundle, steps)
+        holding = holdings.get(bundle.instrument_id)
+        if (
+            bundle.action == "withdraw"
+            and bundle.amount != "max"
+            and holding is not None
+            and holding.decimals is not None
+        ):
+            entry["amount_in"] = {
+                "raw": bundle.amount,
+                "amount": format(
+                    Decimal(bundle.amount).scaleb(-holding.decimals).normalize(), "f"
+                ),
+                "symbol": holding.symbol,
+                "token": None,
+            }
+        return entry
+
+    return {
+        "kind": REBALANCE,
+        "account": planned.account,
+        "book_usd": planned.positions.total_usd,
+        "target_usd": trades_plan.target.total_usd,
+        "total_sell_usd": trades_plan.total_sell_usd,
+        "total_buy_usd": trades_plan.total_buy_usd,
+        "min_trade_usd": planned.min_trade_usd,
+        "trades": [
+            {
+                "trade_index": index,
+                "instrument_id": trade.instrument_id,
+                "action": trade.action,
+                "usd": trade.usd,
+                "current_usd": trade.current_usd,
+                "target_usd": trade.target_usd,
+                "current_weight": trade.current_weight,
+                "target_weight": trade.target_weight,
+                # A buy's actual spend after sizing; None when it was skipped.
+                "deposit_usd": (
+                    planned.deposit_usd.get(index) if trade.action == "buy" else None
+                ),
+            }
+            for index, trade in enumerate(trades_plan.trades)
+        ],
+        "skipped": [
+            {
+                "instrument_id": delta.instrument_id,
+                "action": delta.action,
+                "delta_usd": delta.delta_usd,
+            }
+            for delta in trades_plan.skipped_deltas
+        ],
+        "bundles": [reviewed(bundle) for bundle in bundles],
+        "funding": [
+            _funding(item, tokens.get((item.chain_id, item.token.lower())))
+            for item in preparation.funding
+        ],
+        "policy": trades_plan.policy_result.model_dump(mode="json"),
+        "notes": [*planned.messages, *preparation.messages],
+        "blockers": list(preparation.blockers),
+        "transactions": len(steps),
+    }
+
+
 def review_plan(kind: str, plan: Mapping[str, Any]) -> JsonObject:
     """The review of a stored plan of any kind."""
     review = _REVIEW.get(kind)
@@ -513,15 +757,21 @@ def review_plan(kind: str, plan: Mapping[str, Any]) -> JsonObject:
 
 # What applies each kind of stored plan, re-checks its policy first, and
 # describes it to the person approving it. A withdrawal has no re-check: the
-# policy bounds what is entered, and an exit is never refused for it.
+# policy bounds what is entered, and an exit is never refused for it. A
+# rebalance enters positions, so its target is re-checked.
 _APPLY: dict[str, Callable[..., JsonObject]] = {
     EXECUTE: apply_execute,
     WITHDRAW: apply_withdraw,
+    REBALANCE: apply_rebalance,
 }
-_RECHECK: dict[str, Callable[..., JsonObject]] = {EXECUTE: recheck_execute_policy}
+_RECHECK: dict[str, Callable[..., JsonObject]] = {
+    EXECUTE: recheck_execute_policy,
+    REBALANCE: recheck_rebalance_policy,
+}
 _REVIEW: dict[str, Callable[..., JsonObject]] = {
     EXECUTE: review_execute,
     WITHDRAW: review_withdraw,
+    REBALANCE: review_rebalance,
 }
 
 

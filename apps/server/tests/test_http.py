@@ -15,6 +15,7 @@ from test_cli import (
     DEPOSIT_KINDS,
     ExecutionSignerSpy,
     install_execution_surface_mocks,
+    install_rebalance_surface_mocks,
     install_withdraw_surface_mocks,
     write_execution_files,
     write_rebalance_files,
@@ -343,6 +344,46 @@ def test_an_mcp_withdrawal_is_reviewed_and_runs_on_approval(
     assert approved.status_code == 200, approved.text
     assert approved.json()["result"]["status"] == "success"
     assert [getattr(sent[0], "kind") for sent in signer.sent] == ["withdraw"]
+
+
+def test_an_mcp_rebalance_is_reviewed_and_runs_on_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer: ExecutionSignerSpy = install_rebalance_surface_mocks(monkeypatch)
+    positions_path, target_path, policy_path = write_rebalance_files(tmp_path)
+    book = Positions.model_validate_json(positions_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        loops_exec, "read_book", lambda _client, _address, _config=None: (book, [])
+    )
+    target = json.loads(target_path.read_text(encoding="utf-8"))
+    app = create_app(settings(policy_path), InMemoryPlanStore())
+
+    with TestClient(app, base_url=BASE_URL) as client:
+        proposal = McpSession(client).call_tool(
+            "rebalance", {"target": target, "policy_path": str(policy_path)}
+        )
+        assert proposal["kind"] == "rebalance"
+        assert signer.sent == []
+        stored = client.get(f"/api/plans/{proposal['plan_hash']}", headers=authorized())
+        approved = client.post(
+            "/api/approve",
+            json={"plan_hash": proposal["plan_hash"]},
+            headers=authorized(Origin=BASE_URL),
+        )
+
+    assert stored.status_code == 200
+    assert stored.json()["review_error"] is None
+    review = stored.json()["review"]
+    assert review["kind"] == "rebalance"
+    trades = [(trade["action"], trade["instrument_id"]) for trade in review["trades"]]
+    assert trades == [("sell", "vault-a"), ("buy", "vault-b")]
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["status"] == "success"
+    assert [getattr(sent[0], "kind") for sent in signer.sent] == [
+        "withdraw",
+        *DEPOSIT_KINDS,
+    ]
 
 
 def test_a_rejected_plan_never_runs(

@@ -245,13 +245,9 @@ def _rebalance_scope(
     *,
     min_trade_usd: float,
 ) -> str:
-    payload = {
-        "positions": positions.model_dump(mode="json"),
-        "target": target.model_dump(mode="json"),
-        "min_trade_usd": min_trade_usd,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.rebalance_scope(
+        positions, target, min_trade_usd=min_trade_usd
+    )
 
 
 def _loop_close_idempotency_store(

@@ -366,6 +366,39 @@ def build_mcp(
         )
         return {**_proposed(proposal), "warnings": warnings}
 
+    @server.tool(name="rebalance", annotations=READ_ONLY)
+    def rebalance(
+        target: Annotated[
+            dict[str, Any],
+            Field(description="The target `allocation` object from build-allocation."),
+        ],
+        min_trade_usd: Annotated[
+            float,
+            Field(ge=0, description="Trades smaller than this USD are skipped."),
+        ] = 1.0,
+        policy_path: Annotated[
+            str,
+            Field(description="Policy YAML, relative to the server's directory."),
+        ] = str(allocation_service.DEFAULT_POLICY_PATH),
+    ) -> JsonObject:
+        """Plan the trades that move the signer's current book to a target
+        allocation (each chain's withdrawals before its deposits) and submit the
+        plan for human approval. Broadcasts nothing. Levered loops are not
+        traded. Returns `plan_required: true`, the `plan_hash` a human approves,
+        `expires_at`, and `plan`: the dry-run report (trades, skipped deltas,
+        steps, funding, blockers), and `approval_url` when the server has an
+        approval page. Show the trades and blockers and give the user the link;
+        only the user can approve it, outside this conversation."""
+        warnings: list[JsonObject] = []
+        proposal = _call(
+            execution_service.plan_rebalance,
+            target,
+            min_trade_usd=min_trade_usd,
+            policy=Path(policy_path),
+            on_warning=warnings.append,
+        )
+        return {**_proposed(proposal), "warnings": warnings}
+
     @server.tool(name="withdraw", annotations=READ_ONLY)
     def withdraw(
         position: Annotated[
