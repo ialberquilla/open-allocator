@@ -88,15 +88,26 @@ def _call(function: Callable[..., JsonObject], *args: Any, **kwargs: Any) -> Jso
         raise ToolError(json.dumps({"error": str(error)})) from error
 
 
-def build_mcp(plan_store: PlanStore | None = None) -> MCPServer:
+def build_mcp(
+    plan_store: PlanStore | None = None,
+    *,
+    approval_url: Callable[[str], str] | None = None,
+) -> MCPServer:
     """The MCP app. `plan_store` holds the plans execution tools propose; the
-    default keeps them in this process."""
+    default keeps them in this process. `approval_url` maps a plan hash to the
+    page where a human approves it, when the host serves one."""
     plans = plan_store if plan_store is not None else InMemoryPlanStore()
     server = MCPServer(
         name="open-allocator",
         version=__version__,
         instructions=INSTRUCTIONS,
     )
+
+    def _proposed(proposal: JsonObject) -> JsonObject:
+        response = execution_service.propose(plans, proposal)
+        if approval_url is not None:
+            response["approval_url"] = approval_url(response["plan_hash"])
+        return response
 
     @server.tool(name="wallet-status", annotations=READ_ONLY)
     def wallet_status() -> JsonObject:
@@ -342,8 +353,10 @@ def build_mcp(plan_store: PlanStore | None = None) -> MCPServer:
         """Plan the deposits for an allocation and submit the plan for human
         approval. Broadcasts nothing. Returns `plan_required: true`, the
         `plan_hash` a human approves, `expires_at`, and `plan`: the dry-run
-        report (steps, funding, wallet preparation, blockers). Show the plan and
-        its blockers; only the user can approve it, outside this conversation."""
+        report (steps, funding, wallet preparation, blockers), and `approval_url`
+        when the server has an approval page. Show the plan and its blockers and
+        give the user the link; only the user can approve it, outside this
+        conversation."""
         warnings: list[JsonObject] = []
         proposal = _call(
             execution_service.plan_execute,
@@ -351,7 +364,7 @@ def build_mcp(plan_store: PlanStore | None = None) -> MCPServer:
             policy=Path(policy_path),
             on_warning=warnings.append,
         )
-        return {**execution_service.propose(plans, proposal), "warnings": warnings}
+        return {**_proposed(proposal), "warnings": warnings}
 
     return server
 

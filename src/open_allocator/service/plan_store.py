@@ -38,12 +38,20 @@ class StoredPlan:
     created_at: datetime
     expires_at: datetime
     used_at: datetime | None = None
+    # What applying the plan returned, or why it was refused, failed or
+    # rejected; only for stores that keep outcomes.
+    result: dict[str, Any] | None = None
+    error: str | None = None
 
 
 class PlanStore(Protocol):
     def put(self, kind: str, plan: Mapping[str, Any]) -> StoredPlan: ...
 
     def get(self, plan_hash: str) -> StoredPlan | None: ...
+
+    def recent(self, limit: int) -> list[StoredPlan]:
+        """The most recently proposed plans, newest first."""
+        ...
 
     def take(self, plan_hash: str) -> StoredPlan:
         """Mark the plan used and return it, atomically.
@@ -89,6 +97,13 @@ class InMemoryPlanStore:
     def get(self, plan_hash: str) -> StoredPlan | None:
         with self._lock:
             return self._plans.get(plan_hash)
+
+    def recent(self, limit: int) -> list[StoredPlan]:
+        with self._lock:
+            plans = sorted(
+                self._plans.values(), key=lambda plan: plan.created_at, reverse=True
+            )
+        return plans[:limit]
 
     def take(self, plan_hash: str) -> StoredPlan:
         with self._lock:

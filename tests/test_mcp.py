@@ -341,13 +341,47 @@ def test_execute_stores_the_plan_for_approval_and_sends_nothing(
     assert payload["warnings"] == [
         {"warning": "skipped_instruments", "instruments": []}
     ]
+    # Over stdio there is no approval page to link to.
+    assert "approval_url" not in payload
     stored = store.get(payload["plan_hash"])
     assert stored is not None and stored.used_at is None
     assert stored.plan == document
 
 
+def test_execute_links_to_the_approval_page_when_the_host_has_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = {"account": WALLET, "plan": {"steps": []}}
+
+    def fake_plan(_allocation: object, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "kind": "execute",
+            "plan": document,
+            "plan_hash": plan_hash("execute", document),
+            "report": {"status": "planned"},
+        }
+
+    monkeypatch.setattr(execution_service, "plan_execute", fake_plan)
+    server = build_mcp(
+        InMemoryPlanStore(), approval_url=lambda digest: f"http://host/approve/{digest}"
+    )
+
+    result = anyio.run(
+        server.call_tool, "execute", {"allocation": {"legs": [], "total_usd": 0}}
+    )
+
+    payload = result.structured_content
+    assert payload["approval_url"] == f"http://host/approve/{payload['plan_hash']}"
+
+
 def test_nothing_in_the_mcp_adapter_can_apply_a_plan() -> None:
     source = Path(mcp_module.__file__).read_text(encoding="utf-8")
 
-    for name in ("apply_execute", "apply_approved", "apply_allocation_plan", "take("):
+    for name in (
+        "apply_execute",
+        "apply_approved",
+        "apply_allocation_plan",
+        "take(",
+        "reject(",
+    ):
         assert name not in source, name

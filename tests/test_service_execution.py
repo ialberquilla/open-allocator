@@ -199,3 +199,48 @@ def test_store_hash_is_canonical_and_a_used_plan_stays_used() -> None:
     assert again.used_at is not None
     with pytest.raises(ServiceError):
         store.take(first.plan_hash)
+
+
+def test_review_describes_the_stored_plan_in_token_units(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_execution_surface_mocks(monkeypatch)
+    proposal = planned(tmp_path)
+
+    review = execution_service.review_plan("execute", proposal["plan"])
+
+    assert review["kind"] == "execute"
+    assert review["account"] == proposal["plan"]["account"]
+    assert [leg["instrument_id"] for leg in review["legs"]] == [
+        leg["instrument_id"] for leg in proposal["plan"]["allocation"]["legs"]
+    ]
+    (bundle,) = review["bundles"]
+    raw = proposal["plan"]["plan"]["bundles"][0]
+    decimals = raw["token_in"]["decimals"]
+    assert bundle["amount_in"]["raw"] == raw["amount"]
+    assert bundle["amount_in"]["amount"] == str(int(raw["amount"]) // 10**decimals)
+    assert bundle["amount_in"]["symbol"] == raw["token_in"]["symbol"]
+    assert bundle["steps"] == DEPOSIT_KINDS
+    assert review["transactions"] == len(DEPOSIT_KINDS)
+    assert review["funding"][0]["required"]["symbol"] == raw["token_in"]["symbol"]
+    assert review["policy"] == {"ok": True, "violations": []}
+    assert review["blockers"] == []
+
+
+def test_review_refuses_an_unknown_kind() -> None:
+    with pytest.raises(ServiceError) as refused:
+        execution_service.review_plan("teleport", {})
+
+    assert refused.value.code == "invalid_input"
+
+
+def test_a_rejected_plan_cannot_be_approved() -> None:
+    store = InMemoryPlanStore()
+    stored = store.put("execute", {"a": 1})
+
+    execution_service.reject(store, stored.plan_hash)
+    with pytest.raises(ServiceError) as approved:
+        execution_service.apply_approved(store, stored.plan_hash)
+
+    assert approved.value.code == "plan_used"

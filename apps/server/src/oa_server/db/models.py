@@ -24,7 +24,8 @@ class PlanRow(Base):
     plan: Mapped[dict[str, Any]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    # Set when a human approves it, before it runs; a plan runs at most once.
+    # Set when a human approves or rejects it, before it runs; a plan runs at
+    # most once.
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)

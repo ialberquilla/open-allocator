@@ -18,7 +18,7 @@ from test_cli import (
     write_execution_files,
 )
 
-from oa_server.approval import PostgresPlanStore, approve
+from oa_server.approval import PostgresPlanStore, approve, plan_status, reject
 from oa_server.db.models import PlanRow
 from open_allocator.service import ServiceError
 from open_allocator.service import execution as execution_service
@@ -117,6 +117,9 @@ def test_approve_applies_the_stored_plan_once_and_records_it(
         assert row.result is not None and row.result["status"] == "success"
         # The repeated approval did not overwrite the outcome.
         assert row.error is None
+    applied = store.get(response["plan_hash"])
+    assert applied is not None
+    assert plan_status(applied, datetime.now(UTC)) == "applied"
 
 
 def test_approve_refuses_a_plan_the_policy_no_longer_allows(
@@ -167,3 +170,44 @@ def test_approve_refuses_a_stored_plan_that_changed_since_it_was_proposed(
 
     assert refused.value.code == "plan_mismatch"
     assert signer.sent == []
+
+
+def test_a_rejected_plan_is_recorded_and_cannot_be_approved(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_execution_surface_mocks(monkeypatch)
+    store = PostgresPlanStore(engine)
+    proposal, policy_path = proposed(tmp_path)
+    response = execution_service.propose(store, proposal)
+
+    reject(store, response["plan_hash"])
+    with pytest.raises(ServiceError) as approved:
+        approve(store, response["plan_hash"], policy=policy_path)
+    with pytest.raises(ServiceError) as again:
+        reject(store, response["plan_hash"])
+
+    assert approved.value.code == "plan_used"
+    assert again.value.code == "plan_used"
+    assert signer.sent == []
+    stored = store.get(response["plan_hash"])
+    assert stored is not None
+    assert plan_status(stored, datetime.now(UTC)) == "rejected"
+
+
+def test_plan_status_follows_expiry_and_outcome(engine: Engine) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    store = PostgresPlanStore(engine, ttl=timedelta(minutes=15), clock=lambda: now)
+    pending = store.put("execute", {"a": 1})
+    failed = store.put("execute", {"a": 2})
+    store.take(failed.plan_hash)
+    store.record(failed.plan_hash, error="boom")
+    applying = store.take(store.put("execute", {"a": 3}).plan_hash)
+
+    assert plan_status(pending, now) == "pending"
+    assert plan_status(pending, now + timedelta(minutes=15)) == "expired"
+    failed_now = store.get(failed.plan_hash)
+    assert failed_now is not None
+    assert plan_status(failed_now, now) == "failed"
+    assert plan_status(applying, now) == "applying"

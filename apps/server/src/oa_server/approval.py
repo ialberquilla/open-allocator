@@ -18,6 +18,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from oa_server.db.models import PlanRow
+from oa_server.schemas import PlanStatus
 from open_allocator.service import ServiceError
 from open_allocator.service import execution as execution_service
 from open_allocator.service.plan_store import (
@@ -32,6 +33,9 @@ JsonObject = dict[str, Any]
 # Refusals that leave the plan as it was: this approval did not take it.
 _NOT_TAKEN = frozenset({"plan_not_found", "plan_expired", "plan_used"})
 
+# The recorded outcome of a plan a human turned down.
+REJECTED = "rejected"
+
 
 def _stored(row: PlanRow) -> StoredPlan:
     return StoredPlan(
@@ -41,6 +45,8 @@ def _stored(row: PlanRow) -> StoredPlan:
         created_at=row.created_at,
         expires_at=row.expires_at,
         used_at=row.used_at,
+        result=row.result,
+        error=row.error,
     )
 
 
@@ -93,6 +99,11 @@ class PostgresPlanStore:
         with self._session() as session:
             row = session.get(PlanRow, plan_hash)
             return None if row is None else _stored(row)
+
+    def recent(self, limit: int) -> list[StoredPlan]:
+        statement = select(PlanRow).order_by(PlanRow.created_at.desc()).limit(limit)
+        with self._session() as session:
+            return [_stored(row) for row in session.execute(statement).scalars()]
 
     def take(self, plan_hash: str) -> StoredPlan:
         now = self._clock()
@@ -155,3 +166,21 @@ def approve(store: PlanStore, approved_hash: str, *, policy: Path) -> JsonObject
     if callable(record):
         record(approved_hash, result=result)
     return result
+
+
+def reject(store: PlanStore, rejected_hash: str) -> None:
+    """Retire the stored plan with this hash without applying it."""
+    execution_service.reject(store, rejected_hash)
+    record = getattr(store, "record", None)
+    if callable(record):
+        record(rejected_hash, error=REJECTED)
+
+
+def plan_status(stored: StoredPlan, now: datetime) -> PlanStatus:
+    if stored.used_at is None:
+        return "pending" if now < stored.expires_at else "expired"
+    if stored.error == REJECTED:
+        return "rejected"
+    if stored.error is not None:
+        return "failed"
+    return "applied" if stored.result is not None else "applying"

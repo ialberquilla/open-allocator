@@ -11,12 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from open_allocator.core.policy_loader import load_policy
 from open_allocator.core.state import ScopedIdempotencyStore, backend_from_config
-from open_allocator.core.types import Allocation, Policy
+from open_allocator.core.types import Allocation, BundleToken, Policy
 from open_allocator.exec.allocation_plan import AllocationPlan
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig
@@ -27,6 +28,7 @@ from open_allocator.exec.execute import (
     check_allocation_policy,
     plan_allocation,
 )
+from open_allocator.exec.funding import FundingRequirement
 from open_allocator.service._common import JsonObject, model_payload, signer_from_config
 from open_allocator.service.allocation import DEFAULT_POLICY_PATH, parse_allocation
 from open_allocator.service.errors import ServiceError
@@ -207,9 +209,126 @@ def recheck_execute_policy(
     return model_payload(result)
 
 
-# What applies each kind of stored plan, and what re-checks its policy first.
+def _token_amount(raw: str | None, token: BundleToken | None) -> JsonObject | None:
+    """A raw amount with its token, and the decimal amount when it is known."""
+    if raw is None:
+        return None
+    amount = None
+    if raw != "max" and token is not None:
+        amount = format(Decimal(raw).scaleb(-token.decimals).normalize(), "f")
+    return {
+        "raw": raw,
+        "amount": amount,
+        "symbol": token.symbol if token is not None else None,
+        "token": token.address if token is not None else None,
+    }
+
+
+def _funding(item: FundingRequirement, token: BundleToken | None) -> JsonObject:
+    return {
+        "chain_id": item.chain_id,
+        "required": _token_amount(item.required_raw, token),
+        "available": _token_amount(item.available_raw, token),
+        "shortfall": _token_amount(item.shortfall_raw, token),
+        "includes_gas_charge": item.includes_gas_charge,
+        "ok": item.ok,
+    }
+
+
+def review_execute(plan: AllocationPlan | Mapping[str, Any]) -> JsonObject:
+    """What a person approving a stored `execute` plan reads, from the plan alone.
+
+    Amounts are the plan's own: nothing is re-read or re-quoted, so the review
+    describes exactly what an approval would submit.
+    """
+    planned = (
+        plan
+        if isinstance(plan, AllocationPlan)
+        else AllocationPlan.model_validate(plan)
+    )
+    bundles = planned.plan.bundles
+    tokens: dict[tuple[int, str], BundleToken] = {}
+    for bundle in bundles:
+        for token in (bundle.token_in, bundle.token_out):
+            tokens.setdefault((bundle.chain_id, token.address.lower()), token)
+    for chain_id, deposit_token in planned.deposit_tokens.items():
+        tokens.setdefault(
+            (chain_id, deposit_token.address.lower()),
+            BundleToken(
+                address=deposit_token.address,
+                symbol="USDC",
+                decimals=deposit_token.decimals,
+            ),
+        )
+    steps = planned.plan.steps
+    preparation = planned.preparation
+    return {
+        "kind": EXECUTE,
+        "account": planned.account,
+        "target_usd": planned.allocation.total_usd,
+        "deposit_usd": sum(planned.deposit_usd.values()),
+        "legs": [
+            {
+                "leg_index": index,
+                "instrument_id": leg.instrument_id,
+                "target_usd": leg.usd,
+                # None when the leg was skipped while planning.
+                "deposit_usd": planned.deposit_usd.get(index),
+                "leverage": leg.leverage,
+            }
+            for index, leg in enumerate(planned.allocation.legs)
+        ],
+        "bundles": [
+            {
+                "bundle_id": bundle.bundle_id,
+                "leg_index": bundle.leg_index,
+                "instrument_id": bundle.instrument_id,
+                "action": bundle.action,
+                "chain_id": bundle.chain_id,
+                "amount_in": _token_amount(bundle.amount, bundle.token_in),
+                "expected_out": _token_amount(bundle.expected_out, bundle.token_out),
+                "min_out": _token_amount(bundle.min_out, bundle.token_out),
+                "steps": [steps[index].kind for index in bundle.step_indexes],
+                "expires_at": bundle.expires_at,
+                "bridge": (
+                    None
+                    if bundle.bridge is None
+                    else {
+                        "to_chain_id": bundle.bridge.to_chain_id,
+                        "fast": bundle.bridge.fast,
+                        "max_fee": _token_amount(
+                            bundle.bridge.max_fee, bundle.token_in
+                        ),
+                    }
+                ),
+            }
+            for bundle in bundles
+        ],
+        "loops": [loop.model_dump(mode="json") for loop in planned.loops],
+        "funding": [
+            _funding(item, tokens.get((item.chain_id, item.token.lower())))
+            for item in preparation.funding
+        ],
+        "policy": planned.policy_result.model_dump(mode="json"),
+        "notes": [*planned.messages, *preparation.messages],
+        "blockers": list(preparation.blockers),
+        "transactions": len(steps),
+    }
+
+
+def review_plan(kind: str, plan: Mapping[str, Any]) -> JsonObject:
+    """The review of a stored plan of any kind."""
+    review = _REVIEW.get(kind)
+    if review is None:
+        raise ServiceError("invalid_input", f"no plan kind {kind}")
+    return review(plan)
+
+
+# What applies each kind of stored plan, re-checks its policy first, and
+# describes it to the person approving it.
 _APPLY: dict[str, Callable[..., JsonObject]] = {EXECUTE: apply_execute}
 _RECHECK: dict[str, Callable[..., JsonObject]] = {EXECUTE: recheck_execute_policy}
+_REVIEW: dict[str, Callable[..., JsonObject]] = {EXECUTE: review_execute}
 
 
 def propose(store: PlanStore, proposal: Mapping[str, Any]) -> JsonObject:
@@ -253,3 +372,8 @@ def apply_approved(
     if policy is not None:
         _RECHECK[stored.kind](stored.plan, policy=policy)
     return apply(stored.plan, expected_hash=approved_hash)
+
+
+def reject(store: PlanStore, rejected_hash: str) -> None:
+    """Retire a stored plan without applying it. Same refusals as an approval."""
+    store.take(rejected_hash)

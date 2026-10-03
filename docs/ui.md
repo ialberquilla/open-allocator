@@ -39,10 +39,14 @@ Execution is split in the service layer (`open_allocator.service.execution`):
 The MCP `execute` tool takes the `allocation` object from `build-allocation`. It calls `plan_execute`, stores the plan in a `PlanStore` (`service/plan_store.py`) and returns:
 
 ```json
-{"plan_required": true, "kind": "execute", "plan_hash": "…", "expires_at": "…", "plan": {"status": "planned", …}, "warnings": []}
+{"plan_required": true, "kind": "execute", "plan_hash": "…", "expires_at": "…", "plan": {"status": "planned", …}, "approval_url": "http://127.0.0.1:8787/approve/…", "warnings": []}
 ```
 
-Nothing in the MCP adapter can apply a plan. `apply_approved(store, plan_hash, policy=...)` is the approval entry point for a human-facing surface (the local server's Approve route). It marks the stored plan used before anything else, so a plan runs at most once, and refuses unknown (`plan_not_found`), expired (`plan_expired`, 15 minutes by default) or used (`plan_used`) plans, and a stored plan that no longer hashes to the approved hash (`plan_mismatch`). With `policy`, it then re-checks the plan's allocation against that policy on today's shelf (`recheck_execute_policy`) and refuses on a violation (`policy_violation`). A refused or failed approval leaves the plan used: plan again.
+`approval_url` is present when the host serves an approval page (`build_mcp(store, approval_url=...)`); the stdio server has none.
+
+Nothing in the MCP adapter can apply or reject a plan. `apply_approved(store, plan_hash, policy=...)` is the approval entry point for a human-facing surface (the local server's Approve route). It marks the stored plan used before anything else, so a plan runs at most once, and refuses unknown (`plan_not_found`), expired (`plan_expired`, 15 minutes by default) or used (`plan_used`) plans, and a stored plan that no longer hashes to the approved hash (`plan_mismatch`). With `policy`, it then re-checks the plan's allocation against that policy on today's shelf (`recheck_execute_policy`) and refuses on a violation (`policy_violation`). A refused or failed approval leaves the plan used: plan again. `reject(store, plan_hash)` retires a plan without applying it, with the same refusals.
+
+`review_plan(kind, plan)` describes a stored plan for the person approving it, from the plan alone: account, legs (target and planned USD), bundles in submission order (action, chain, amounts in token units, step kinds, quote expiry, bridge), loops, funding against balances read at planning, the policy result, notes and blockers.
 
 The stdio server keeps plans in memory and has no approval surface. Over stdio, approve by running `execute --confirm` yourself.
 
@@ -53,34 +57,42 @@ Not yet split: `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`.
 `oa_server` is a separate package in the uv workspace. It depends on the library; the library never imports it. One process serves:
 
 - `/mcp`: the same MCP server over streamable HTTP, storing plans in Postgres (`PostgresPlanStore`).
-- `GET /api/plans/{hash}`: the stored plan an approval would apply. A UI shows this, not the model's copy.
+- `/` and `/approve/<hash>`: the web app (`apps/web`): recent plans, and one plan's review with Approve and Reject.
+- `GET /api/plans`: recent plans, newest first, with their status (`pending`, `expired`, `applying`, `applied`, `failed`, `rejected`).
+- `GET /api/plans/{hash}`: the stored plan an approval would apply, its `review` and status, and the recorded result or error. The page shows this, not the model's copy.
 - `POST /api/approve {"plan_hash"}`: applies that stored plan once, after re-checking it against the operator's policy (`OA_POLICY_PATH`, default `policy.yaml`), whatever policy the model planned under. Records the result or error on the plan row. `404` unknown, `410` expired, `409` used or mismatched, `422` policy violation.
-- `GET /api/health`: the only route that needs no token.
+- `POST /api/reject {"plan_hash"}`: retires that stored plan without applying it.
+- `GET /api/health`: needs no token.
 
 Run it from the directory with the CLI's `.env`:
 
 ```bash
-docker compose up -d          # Postgres on 127.0.0.1:5442
-uv run open-allocator-ui      # migrates, then serves http://127.0.0.1:8787
+make install                  # uv sync + the web app's dependencies (Node 22, corepack pnpm)
+make serve                    # builds the web app, starts Postgres, migrates, serves http://127.0.0.1:8787
 ```
 
-It prints a token generated at start. Send it as `Authorization: Bearer <token>` (or the `oa_token` cookie). Settings: `OA_DATABASE_URL`, `OA_HOST`, `OA_PORT`, `OA_POLICY_PATH`.
+The server prints a sign-in link and opens it in the browser (`--no-browser` to skip), and prints the `claude mcp add` command for its MCP endpoint. Settings: `OA_DATABASE_URL`, `OA_HOST`, `OA_PORT`, `OA_POLICY_PATH`, `OA_MCP_TOKEN`.
+
+From a terminal instead of the page: `uv run open-allocator-ui approve <hash>` or `reject <hash>`, against the same database and `.env`.
+
+For web development, run the server, then `make dev` (Vite on `:5173`, proxying `/api` and `/login` to `:8787`). `make types` regenerates `apps/web/src/lib/api-types.ts` from the server's OpenAPI; the review's shape is pinned in `oa_server/schemas.py`.
 
 ### Access
 
-- Binds `127.0.0.1`. A request whose `Host` is not the server's own is refused (`421`, against DNS rebinding), as is one with a foreign `Origin` (`403`) or without the token (`401`).
+- Binds `127.0.0.1`. A request whose `Host` is not the server's own is refused (`421`, against DNS rebinding), as is one with a foreign `Origin` (`403`) or without the right token (`401`).
+- Two tokens. The **MCP token** opens `/mcp` only; it is kept in `.open_allocator/mcp-token` (`0600`, or `OA_MCP_TOKEN`) so a client is configured once. It sits in the client's config, where a model with file access could read it, so it can propose plans but never approve or reject them. The **browser token** is new at every start and opens everything else. The sign-in link (`/login?token=…`) swaps it for an `HttpOnly`, `SameSite=Lax` cookie and redirects to a path on this server; page code never sees it.
 - Signer keys stay in the server process. No response carries them.
 
 ### MCP clients
 
-Point any MCP client that speaks streamable HTTP at `http://127.0.0.1:8787/mcp` with the header `Authorization: Bearer <token>`. For Claude Code:
+Point any MCP client that speaks streamable HTTP at `http://127.0.0.1:8787/mcp` with the header `Authorization: Bearer <MCP token>`. For Claude Code:
 
 ```bash
 claude mcp add --transport http open-allocator http://127.0.0.1:8787/mcp \
-  --header "Authorization: Bearer <token>"
+  --header "Authorization: Bearer <MCP token>"
 ```
 
-Plans proposed over this endpoint land in Postgres, where `/api/approve` can take them. The client never approves: a `plan_required` result names the stored plan, and approving it is a separate human action against this server.
+Plans proposed over this endpoint land in Postgres. The client never approves: a `plan_required` result carries the `approval_url`, and approving is a click on that page (or the `approve` command), never an MCP call.
 
 ### Storage
 
