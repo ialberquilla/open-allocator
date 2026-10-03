@@ -430,6 +430,107 @@ def build_mcp(
         )
         return {**_proposed(proposal), "warnings": warnings}
 
+    @server.tool(name="loop-open", annotations=READ_ONLY)
+    def loop_open(
+        loop: Annotated[
+            str,
+            Field(description="Loop id from list-vaults' levered loop rows."),
+        ],
+        amount: Annotated[
+            float,
+            Field(
+                gt=0, description="Equity in USD, from idle USDC on the loop's chain."
+            ),
+        ],
+        leverage: Annotated[
+            float,
+            Field(ge=1, description="Target leverage of the opened loop."),
+        ],
+        policy_path: Annotated[
+            str,
+            Field(description="Policy YAML, relative to the server's directory."),
+        ] = str(allocation_service.DEFAULT_POLICY_PATH),
+    ) -> JsonObject:
+        """Plan opening one levered loop from idle USDC, scored against the
+        signer's current book, and submit the plan for human approval. Broadcasts
+        nothing. Returns `plan_required: true`, the `plan_hash` a human approves,
+        `expires_at`, and `plan`: the dry-run report (policy result, the loop
+        announcement with its modelled and simulated health factor, account
+        config change and other positions in the pool, steps), and `approval_url`
+        when the server has an approval page. Show the announcement and give the
+        user the link; only the user can approve it, outside this conversation."""
+        warnings: list[JsonObject] = []
+        proposal = _call(
+            execution_service.plan_loop_open,
+            loop,
+            equity_usd=amount,
+            leverage=leverage,
+            policy=Path(policy_path),
+            on_warning=warnings.append,
+        )
+        return {**_proposed(proposal), "warnings": warnings}
+
+    @server.tool(name="loop-close", annotations=READ_ONLY)
+    def loop_close(
+        loop: Annotated[
+            str,
+            Field(description="Loop id of a levered loop the signer holds."),
+        ],
+        policy_path: Annotated[
+            str,
+            Field(description="Policy YAML, relative to the server's directory."),
+        ] = str(allocation_service.DEFAULT_POLICY_PATH),
+    ) -> JsonObject:
+        """Plan unwinding one levered loop and submit the plan for human
+        approval. Broadcasts nothing. Returns `plan_required: true`, the
+        `plan_hash` a human approves, `expires_at`, and `plan`: the dry-run report
+        (the loop announcement: what is repaid and returned, account config
+        change, other positions in the pool, steps), and `approval_url` when the
+        server has an approval page. Show the announcement and give the user the
+        link; only the user can approve it, outside this conversation."""
+        warnings: list[JsonObject] = []
+        proposal = _call(
+            execution_service.plan_loop_close,
+            loop,
+            policy=Path(policy_path),
+            on_warning=warnings.append,
+        )
+        return {**_proposed(proposal), "warnings": warnings}
+
+    @server.tool(name="bridge", annotations=READ_ONLY)
+    def bridge(
+        from_chain: Annotated[int, Field(ge=1, description="Source chain id.")],
+        to_chain: Annotated[int, Field(ge=1, description="Destination chain id.")],
+        amount: Annotated[float, Field(gt=0, description="USDC to move.")],
+        ref: Annotated[
+            str | None,
+            Field(
+                description="Names a new transfer with the same arguments as one "
+                "already settled."
+            ),
+        ] = None,
+    ) -> JsonObject:
+        """Plan moving the Safe's USDC from one chain to another over CCTP, with
+        no deposit, and submit the plan for human approval. Broadcasts nothing.
+        The same arguments name the same transfer: while it waits on Circle's
+        attestation, calling this again plans advancing it (the mint into the
+        Safe), which also needs approval. Returns `plan_required: true`, the
+        `plan_hash` a human approves, `expires_at`, and `plan`: the dry-run report
+        (the burn, funding, blockers, or the transfer under way), and
+        `approval_url` when the server has an approval page. Show the plan and
+        give the user the link; only the user can approve it, outside this
+        conversation."""
+        warnings: list[JsonObject] = []
+        proposal = _call(
+            execution_service.plan_bridge,
+            from_chain,
+            to_chain,
+            amount,
+            ref=ref,
+            on_warning=warnings.append,
+        )
+        return {**_proposed(proposal), "warnings": warnings}
+
     return server
 
 

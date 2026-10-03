@@ -167,8 +167,57 @@ class RebalanceReview(Strict):
     transactions: int
 
 
+class LoopOpenReview(Strict):
+    kind: Literal["loop-open"]
+    account: str
+    loop_id: str
+    # Idle USDC supplied, and the leverage it is levered to.
+    equity_usd: float
+    leverage: float
+    bundles: list[ReviewBundle]
+    # The levered operation, as the CLI announces it.
+    loop: JsonObject
+    # The policy result the open was planned under, scored against the book it
+    # joins. Approval checks it again against the operator's policy.
+    policy: ReviewPolicy
+    notes: list[str]
+    transactions: int
+
+
+class LoopCloseReview(Strict):
+    kind: Literal["loop-close"]
+    account: str
+    loop_id: str
+    bundles: list[ReviewBundle]
+    # The levered operation, as the CLI announces it.
+    loop: JsonObject
+    transactions: int
+
+
+class BridgeReview(Strict):
+    kind: Literal["bridge"]
+    account: str
+    from_chain_id: int
+    to_chain_id: int
+    amount_usdc: float
+    ref: str | None
+    # The transfer under way this plan advances; None for a new burn.
+    advances: JsonObject | None
+    bundles: list[ReviewBundle]
+    funding: list[ReviewFunding]
+    notes: list[str]
+    blockers: list[str]
+    transactions: int
+
+
 Review = Annotated[
-    ExecuteReview | WithdrawReview | RebalanceReview, Field(discriminator="kind")
+    ExecuteReview
+    | WithdrawReview
+    | RebalanceReview
+    | LoopOpenReview
+    | LoopCloseReview
+    | BridgeReview,
+    Field(discriminator="kind"),
 ]
 
 

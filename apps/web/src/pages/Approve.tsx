@@ -11,7 +11,10 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
   ApiError,
   api,
+  type BridgeReview,
   type ExecuteReview,
+  type LoopCloseReview,
+  type LoopOpenReview,
   type PlanResponse,
   type RebalanceReview,
   type Review as PlanReview,
@@ -22,6 +25,10 @@ import { addressUrl, chainName, txUrl } from "@/lib/chains";
 import { countdown, dateTime, label, shortHash, tokenAmount, usd } from "@/lib/format";
 
 type Decision = "idle" | "confirming" | "approving" | "rejecting";
+
+// Kinds the server re-checks against the operator's policy before sending:
+// those that enter positions. Exits and transfers are never refused for it.
+const RECHECKED = new Set(["execute", "rebalance", "loop-open"]);
 
 function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now());
@@ -55,7 +62,9 @@ export function Approve({ hash }: { hash: string }) {
   const now = useNow(pending);
   const remaining = plan ? new Date(plan.expires_at).getTime() - now : 0;
   const expired = pending && remaining <= 0;
-  const blocked = (plan?.review?.blockers.length ?? 0) > 0;
+  // A loop plan has no blockers: planning refuses one that cannot be confirmed.
+  const planReview = plan?.review;
+  const blocked = planReview != null && "blockers" in planReview && planReview.blockers.length > 0;
 
   const decide = async (action: "approve" | "reject") => {
     setDecision(action === "approve" ? "approving" : "rejecting");
@@ -103,7 +112,7 @@ export function Approve({ hash }: { hash: string }) {
           <p className="max-w-2xl text-sm text-muted-foreground">
             This is the stored plan, read by the server, not the model's description of it. Approving sends exactly
             these transactions
-            {plan.kind === "withdraw" ? "." : " after the server re-checks it against your policy."}
+            {RECHECKED.has(plan.kind) ? " after the server re-checks it against your policy." : "."}
           </p>
         )}
       </header>
@@ -189,6 +198,12 @@ function Review({ review }: { review: PlanReview }) {
       return <WithdrawDetails review={review} />;
     case "rebalance":
       return <RebalanceDetails review={review} />;
+    case "loop-open":
+      return <LoopOpenDetails review={review} />;
+    case "loop-close":
+      return <LoopCloseDetails review={review} />;
+    case "bridge":
+      return <BridgeDetails review={review} />;
     default:
       return <ExecuteDetails review={review} />;
   }
@@ -388,6 +403,153 @@ function RebalanceDetails({ review }: { review: RebalanceReview }) {
       <Funding funding={review.funding} />
 
       <Notes notes={review.notes} />
+    </>
+  );
+}
+
+function LoopOpenDetails({ review }: { review: LoopOpenReview }) {
+  const chainId = review.bundles[0]?.chain_id;
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatTile label="Equity" value={usd(review.equity_usd)} sub="idle USDC on the loop's chain" />
+        <StatTile label="Leverage" value={`${review.leverage}×`} sub="requested" />
+        <StatTile label="Chain" value={chainName(chainId ?? null)} sub={`${review.transactions} transaction${review.transactions === 1 ? "" : "s"}`} />
+        <StatTile label="Submission" value="Atomic" sub="one operation, whole or not at all" />
+      </div>
+
+      <AccountCard chainId={chainId} address={review.account} />
+
+      <Policy policy={review.policy} />
+
+      <LoopAnnouncement loop={review.loop} />
+
+      <Transactions bundles={review.bundles} />
+
+      <Notes notes={review.notes} />
+    </>
+  );
+}
+
+function LoopCloseDetails({ review }: { review: LoopCloseReview }) {
+  const chainId = review.bundles[0]?.chain_id;
+  const returned = review.bundles[0]?.expected_out;
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatTile label="Unwind" value="Full" sub="debt repaid, collateral withdrawn" />
+        <StatTile label="Returns" value={returned ? tokenAmount(returned) : "unknown"} sub="expected" />
+        <StatTile label="Chain" value={chainName(chainId ?? null)} sub={`${review.transactions} transaction${review.transactions === 1 ? "" : "s"}`} />
+        <StatTile label="Submission" value="Atomic" sub="one operation, whole or not at all" />
+      </div>
+
+      <AccountCard chainId={chainId} address={review.account} />
+
+      <LoopAnnouncement loop={review.loop} />
+
+      <Transactions bundles={review.bundles} />
+    </>
+  );
+}
+
+function BridgeDetails({ review }: { review: BridgeReview }) {
+  const unfunded = review.funding.filter((item) => !item.ok);
+  const advances = review.advances as { state?: string; source_transaction_hash?: string | null } | null;
+  return (
+    <>
+      <Blockers blockers={review.blockers} />
+
+      {advances && (
+        <Notice>
+          This advances a transfer already under way ({label(advances.state ?? "unknown")}): it burns nothing and
+          redeems the attested USDC into the Safe when Circle's attestation is ready.
+        </Notice>
+      )}
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatTile label="Amount" value={`${review.amount_usdc} USDC`} sub={review.ref ? `ref ${review.ref}` : "over CCTP"} />
+        <StatTile label="From" value={chainName(review.from_chain_id)} sub="burned here" />
+        <StatTile label="To" value={chainName(review.to_chain_id)} sub="minted into the Safe" />
+        {advances ? (
+          <StatTile label="State" value={label(advances.state ?? "unknown")} sub="as recorded at planning" />
+        ) : (
+          <StatTile
+            label="Funding"
+            value={unfunded.length === 0 ? "Covered" : "Short"}
+            tone={unfunded.length === 0 ? "success" : "destructive"}
+            sub={unfunded.length === 0 ? "balances read at planning" : `${unfunded.length} shortfall(s)`}
+          />
+        )}
+      </div>
+
+      <AccountCard chainId={review.from_chain_id} address={review.account} />
+
+      {review.bundles.length > 0 && <Transactions bundles={review.bundles} />}
+
+      {review.funding.length > 0 && <Funding funding={review.funding} />}
+
+      <Notes notes={review.notes} />
+    </>
+  );
+}
+
+type LegAmount = { amount?: string; symbol?: string | null } | null | undefined;
+type PoolPosition = { instrument_id?: string; symbol?: string; usd_value?: number };
+
+const legAmount = (value: unknown): string => {
+  const leg = value as LegAmount;
+  return leg?.amount ? `${leg.amount} ${leg.symbol ?? ""}`.trim() : "—";
+};
+
+function LoopAnnouncement({ loop }: { loop: Loop }) {
+  const pool = Array.isArray(loop.pool_positions) ? (loop.pool_positions as PoolPosition[]) : null;
+  const facts: [string, string][] = [
+    ["Collateral", legAmount(loop.collateral)],
+    ["Debt", legAmount(loop.debt)],
+    ["Equity", legAmount(loop.equity)],
+    ["Account config", loop.requires_account_config ? String(loop.account_config ?? "changes") : "unchanged"],
+  ];
+  // A same-asset loop has no depeg buffer to show.
+  if (loop.modelled_depeg_buffer_bps != null || loop.simulated_depeg_buffer_bps != null) {
+    facts.push([
+      "Depeg buffer (bps)",
+      `${num(loop.modelled_depeg_buffer_bps, 0)} model · ${num(loop.simulated_depeg_buffer_bps, 0)} sim`,
+    ]);
+  }
+  return (
+    <>
+      <Loops loops={[loop]} />
+      <Card>
+        <CardHeader
+          title="Announcement"
+          description="What the bundle moves, and every other position it re-prices in the same pool."
+        />
+        <CardContent className="flex flex-col gap-4">
+          <dl className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
+            {facts.map(([name, value]) => (
+              <div key={name} className="flex justify-between gap-3 border-b border-border/50 py-1">
+                <dt className="text-muted-foreground">{name}</dt>
+                <dd className="text-right font-mono text-xs break-all">{value}</dd>
+              </div>
+            ))}
+          </dl>
+          {pool === null ? (
+            <Notice tone="warning">The other positions in this pool could not be read.</Notice>
+          ) : pool.length > 0 ? (
+            <Table head={["Also in the pool", "Symbol", "Value"]} minWidth={480}>
+              {pool.map((position) => (
+                <tr key={position.instrument_id}>
+                  <Cell className="font-mono text-xs">{position.instrument_id}</Cell>
+                  <Cell>{position.symbol}</Cell>
+                  <Cell numeric>{usd(position.usd_value ?? null)}</Cell>
+                </tr>
+              ))}
+            </Table>
+          ) : (
+            <p className="text-sm text-muted-foreground">No other positions in this pool.</p>
+          )}
+        </CardContent>
+      </Card>
     </>
   );
 }

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
@@ -259,9 +258,7 @@ def _loop_close_idempotency_store(
 
 
 def _loop_close_scope(loop_id: str, account: str) -> str:
-    payload = {"loop_id": loop_id, "account": account}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.loop_close_scope(loop_id, account)
 
 
 def _loop_open_idempotency_store(
@@ -273,9 +270,7 @@ def _loop_open_idempotency_store(
 
 
 def _loop_open_scope(loop_id: str, account: str) -> str:
-    payload = {"loop_id": loop_id, "account": account, "action": "open"}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.loop_open_scope(loop_id, account)
 
 
 def _withdraw_scope(
@@ -1141,18 +1136,9 @@ def _bridge_scope(
     amount: float,
     ref: str | None,
 ) -> str:
-    """The same arguments resume the same transfer; --ref starts another."""
-    payload = {
-        "bridge": {
-            "account": address.casefold(),
-            "from": from_chain_id,
-            "to": to_chain_id,
-            "amount": amount,
-            "ref": ref,
-        }
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.bridge_scope(
+        address, from_chain_id, to_chain_id, amount, ref
+    )
 
 
 def main() -> None:

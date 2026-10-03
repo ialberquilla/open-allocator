@@ -20,6 +20,11 @@ from test_cli import (
     write_execution_files,
     write_rebalance_files,
 )
+from test_loops import CROSS, SAME
+from test_loops import _close_client as close_client
+from test_loops import _open_client as open_client
+from test_loops import _open_policy as open_policy
+from test_service_execution import Transfers, install_loop_surface
 
 from oa_server.app import create_app
 from oa_server.auth import TOKEN_COOKIE
@@ -384,6 +389,105 @@ def test_an_mcp_rebalance_is_reviewed_and_runs_on_approval(
         "withdraw",
         *DEPOSIT_KINDS,
     ]
+
+
+def test_an_mcp_loop_open_is_reviewed_and_runs_on_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_loop_surface(monkeypatch, tmp_path, open_client())
+    policy_path = tmp_path / "policy.yaml"
+    # JSON is YAML: the operator's policy is the one the open was planned under.
+    policy_path.write_text(open_policy().model_dump_json(), encoding="utf-8")
+    app = create_app(settings(policy_path), InMemoryPlanStore())
+
+    with TestClient(app, base_url=BASE_URL) as client:
+        proposal = McpSession(client).call_tool(
+            "loop-open",
+            {
+                "loop": SAME,
+                "amount": 20,
+                "leverage": 3,
+                "policy_path": str(policy_path),
+            },
+        )
+        assert proposal["kind"] == "loop-open"
+        assert signer.batches == []
+        stored = client.get(f"/api/plans/{proposal['plan_hash']}", headers=authorized())
+        approved = client.post(
+            "/api/approve",
+            json={"plan_hash": proposal["plan_hash"]},
+            headers=authorized(Origin=BASE_URL),
+        )
+
+    assert stored.status_code == 200
+    assert stored.json()["review_error"] is None
+    review = stored.json()["review"]
+    assert (review["kind"], review["loop_id"], review["leverage"]) == (
+        "loop-open",
+        SAME,
+        3.0,
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["status"] == "success"
+    assert len(signer.batches) == 1
+
+
+def test_an_mcp_loop_close_is_reviewed_and_runs_on_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_loop_surface(monkeypatch, tmp_path, close_client())
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(open_policy().model_dump_json(), encoding="utf-8")
+    app = create_app(settings(policy_path), InMemoryPlanStore())
+
+    with TestClient(app, base_url=BASE_URL) as client:
+        proposal = McpSession(client).call_tool(
+            "loop-close", {"loop": CROSS, "policy_path": str(policy_path)}
+        )
+        stored = client.get(f"/api/plans/{proposal['plan_hash']}", headers=authorized())
+        approved = client.post(
+            "/api/approve",
+            json={"plan_hash": proposal["plan_hash"]},
+            headers=authorized(Origin=BASE_URL),
+        )
+
+    assert stored.json()["review_error"] is None
+    assert stored.json()["review"]["kind"] == "loop-close"
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["status"] == "success"
+    assert len(signer.batches) == 1
+
+
+def test_an_mcp_bridge_is_reviewed_and_burns_on_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transfers = Transfers()
+    transfers.install(monkeypatch, tmp_path)
+    app = create_app(settings(), InMemoryPlanStore())
+
+    with TestClient(app, base_url=BASE_URL) as client:
+        proposal = McpSession(client).call_tool(
+            "bridge", {"from_chain": 8453, "to_chain": 42161, "amount": 100}
+        )
+        assert proposal["kind"] == "bridge"
+        assert transfers.signer.batches == []
+        stored = client.get(f"/api/plans/{proposal['plan_hash']}", headers=authorized())
+        approved = client.post(
+            "/api/approve",
+            json={"plan_hash": proposal["plan_hash"]},
+            headers=authorized(Origin=BASE_URL),
+        )
+
+    assert stored.status_code == 200
+    assert stored.json()["review_error"] is None
+    review = stored.json()["review"]
+    assert (review["kind"], review["advances"]) == ("bridge", None)
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["status"] == "in_progress"
+    assert transfers.kinds() == [["approve", "bridge_burn"]]
 
 
 def test_a_rejected_plan_never_runs(

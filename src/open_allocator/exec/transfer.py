@@ -18,9 +18,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal
 
+from pydantic import Field
+
 from open_allocator.core import amounts
 from open_allocator.core import policy as policy_core
-from open_allocator.core.types import Vault
+from open_allocator.core.types import FrozenModel, TxPlan, Vault
 from open_allocator.exec import (
     bridge,
     bridge_state,
@@ -29,6 +31,7 @@ from open_allocator.exec import (
     chains,
     deposit_sizing,
 )
+from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.execute import (
     ExecutionReport,
     TransactionPlanError,
@@ -44,6 +47,34 @@ TRANSFER_LEG = bridge.leg_id(TRANSFER_INDEX, TRANSFER_INSTRUMENT)
 
 # A transfer touches no instrument, so there is no allocation to judge.
 _NO_ALLOCATION = policy_core.PolicyResult(ok=True)
+
+
+class TransferPlan(FrozenModel):
+    """A transfer, complete enough to execute as it stands.
+
+    What a dry run shows and what a confirmation executes: applying it submits
+    this burn and never plans again. A transfer already under way when it was
+    planned is carried as ``existing``: applying it then advances that transfer
+    and burns nothing. ``ref`` is the caller's, kept so applying binds the same
+    idempotency scope the plan was read from.
+    """
+
+    kind: Literal["bridge"] = "bridge"
+    account: str
+    from_chain_id: int
+    to_chain_id: int
+    amount_usdc: float
+    ref: str | None = None
+    existing: bridge_state.BridgeState | None = None
+    plan: TxPlan
+    preparation: PlanPreparation = PlanPreparation()
+    # The route note and sizing notes.
+    messages: tuple[str, ...] = ()
+    # What the mint may deposit into the Safe at most, in destination USDC.
+    wanted_deposit_raw: str | None = None
+    # The USDC of both chains, resolved while planning so applying needs no
+    # discovery.
+    deposit_tokens: dict[int, calldata.DepositToken] = Field(default_factory=dict)
 
 
 def execute_transfer(
@@ -63,29 +94,64 @@ def execute_transfer(
     Without ``confirm`` nothing is sent and the store is only read: a
     transfer already under way is reported as it stands, not planned again.
     """
+    planned = plan_transfer(
+        client,
+        signer,
+        from_chain_id=from_chain_id,
+        to_chain_id=to_chain_id,
+        amount_usdc=amount_usdc,
+        known_instruments=known_instruments,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+    if not confirm:
+        return dry_run_report(planned)
+    return apply_transfer_plan(
+        client,
+        signer,
+        planned,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+
+
+def plan_transfer(
+    client: object,
+    signer: object,
+    *,
+    from_chain_id: int,
+    to_chain_id: int,
+    amount_usdc: float,
+    known_instruments: Sequence[Vault],
+    ref: str | None = None,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> TransferPlan:
+    """The burn ``bridge`` would submit, sized and route-checked, not sent.
+
+    The store is only read: a transfer already under way is planned as itself,
+    to be advanced, not burned again.
+    """
     if from_chain_id == to_chain_id:
         raise ValueError("bridge source and destination chains must differ")
     bridge.require_cross_chain(signer, "a transfer is bridged")
     address = str(signer.address())  # type: ignore[attr-defined]
-
-    def token_for(chain_id: int) -> calldata.DepositToken:
-        return calldata.deposit_token(chain_id, known_instruments, config)
+    source = calldata.deposit_token(from_chain_id, known_instruments, config)
+    destination = calldata.deposit_token(to_chain_id, known_instruments, config)
+    planned = TransferPlan(
+        account=address,
+        from_chain_id=from_chain_id,
+        to_chain_id=to_chain_id,
+        amount_usdc=amount_usdc,
+        ref=ref,
+        plan=bundle_execution.assemble_plan([], "Advance a CCTP transfer"),
+        deposit_tokens={from_chain_id: source, to_chain_id: destination},
+    )
 
     existing = bridge_state.load(idempotency_store, TRANSFER_LEG)
     if existing is not None and existing.active:
-        if existing.state in ("completed", "failed") or not confirm:
-            return _existing_report(existing, confirm=confirm)
-        return _advance(
-            client,
-            signer,
-            existing,
-            token_for=token_for,
-            config=config,
-            idempotency_store=idempotency_store,
-        )
+        return planned.model_copy(update={"existing": existing})
 
-    source = token_for(from_chain_id)
-    destination = token_for(to_chain_id)
     wanted_raw = int(calldata.deposit_amount_raw(amount_usdc, source))
     fitted = deposit_sizing.fit(
         client,
@@ -117,47 +183,117 @@ def execute_transfer(
     burn_steps = [fitted.plan.steps[index] for index in burn.step_indexes]
     bridge.check_route(burn, burn_steps, bridge.cctp_config(client))
     assert burn.bridge is not None
-    notes = (
-        _route_note(
-            burn.amount, source, from_chain_id, to_chain_id, fast=burn.bridge.fast
-        ),
-        *fitted.messages,
+    return planned.model_copy(
+        update={
+            "plan": fitted.plan,
+            "preparation": fitted.preparation,
+            "messages": (
+                _route_note(
+                    burn.amount,
+                    source,
+                    from_chain_id,
+                    to_chain_id,
+                    fast=burn.bridge.fast,
+                ),
+                *fitted.messages,
+            ),
+            # What reaches the Safe is the attested mint; this only bounds it.
+            "wanted_deposit_raw": str(
+                calldata.deposit_amount_raw(
+                    amounts.from_raw_units(int(burn.amount), source.decimals),
+                    destination,
+                )
+            ),
+        }
     )
 
-    if not confirm:
-        return ExecutionReport(
-            status="planned",
-            policy_result=_NO_ALLOCATION,
-            plan=fitted.plan,
-            preparations=fitted.preparation.preparations,
-            funding=fitted.preparation.funding,
-            messages=(
-                "dry-run only; no transactions broadcast",
-                *notes,
-                *fitted.preparation.messages,
-                *fitted.preparation.blockers,
-            ),
+
+def dry_run_report(planned: TransferPlan) -> ExecutionReport:
+    """The ``bridge`` dry-run report, or the transfer under way as it stands."""
+    if planned.existing is not None:
+        return _existing_report(planned.existing, confirm=False)
+    preparation = planned.preparation
+    return ExecutionReport(
+        status="planned",
+        policy_result=_NO_ALLOCATION,
+        plan=planned.plan,
+        preparations=preparation.preparations,
+        funding=preparation.funding,
+        messages=(
+            "dry-run only; no transactions broadcast",
+            *planned.messages,
+            *preparation.messages,
+            *preparation.blockers,
+        ),
+    )
+
+
+def apply_transfer_plan(
+    client: object,
+    signer: object,
+    planned: TransferPlan,
+    *,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> ExecutionReport:
+    """Execute exactly ``planned``, refusing it when it no longer describes the
+    account: another signer, or a transfer started since it was built. A plan
+    of a transfer under way advances it as far as it can go now.
+    """
+    address = str(signer.address())  # type: ignore[attr-defined]
+    if address.casefold() != planned.account.casefold():
+        raise TransactionPlanError(
+            f"the plan was built for {planned.account}, but the signer is {address}"
         )
-    if fitted.preparation.blockers:
-        raise TransactionPlanError("; ".join(fitted.preparation.blockers))
+
+    def token_for(chain_id: int) -> calldata.DepositToken:
+        token = planned.deposit_tokens.get(chain_id)
+        if token is None:
+            raise calldata.CalldataAmountError(
+                f"no deposit token for chain {chain_id} was resolved when the plan "
+                "was built"
+            )
+        return token
+
+    current = bridge_state.load(idempotency_store, TRANSFER_LEG)
+    if planned.existing is not None:
+        if current is None or not current.active:
+            raise TransactionPlanError(
+                "the plan is stale: the transfer it advances is no longer under "
+                "way; plan again"
+            )
+        if current.state in ("completed", "failed"):
+            return _existing_report(current, confirm=True)
+        return _advance(
+            client,
+            signer,
+            current,
+            token_for=token_for,
+            config=config,
+            idempotency_store=idempotency_store,
+        )
+    if current is not None and current.active:
+        raise TransactionPlanError(
+            "the plan is stale: this transfer was started after it was built; "
+            "plan again"
+        )
+    if planned.preparation.blockers:
+        raise TransactionPlanError("; ".join(planned.preparation.blockers))
     if idempotency_store is None:
         raise TransactionPlanError(
             "a transfer spans several runs and needs an idempotency store to "
             "resume from; without one its burn could not be redeemed"
         )
 
-    planned = bridge.planned_state(
+    (burn,) = [item for item in planned.plan.bundles if item.action == "bridge"]
+    burn_steps = [planned.plan.steps[index] for index in burn.step_indexes]
+    assert planned.wanted_deposit_raw is not None
+    state = bridge.planned_state(
         burn,
         source_token_messenger=burn_steps[-1].to,
-        # What reaches the Safe is the attested mint; this only bounds it.
-        wanted_deposit_raw=int(
-            calldata.deposit_amount_raw(
-                amounts.from_raw_units(int(burn.amount), source.decimals),
-                destination,
-            )
-        ),
+        wanted_deposit_raw=int(planned.wanted_deposit_raw),
     ).model_copy(update={"deposit": False})
-    bridge_state.save(idempotency_store, planned)
+    bridge_state.save(idempotency_store, state)
 
     def on_submitted(
         item: bundle_execution.PlannedBundle,
@@ -167,13 +303,13 @@ def execute_transfer(
         if item.bundle.action == "bridge":
             bridge_state.save(
                 idempotency_store,
-                bridge.submitted_state(planned, item, operation, receipt),
+                bridge.submitted_state(state, item, operation, receipt),
             )
 
     result = bundle_execution.execute_plan(
         client,
         signer,
-        fitted.plan,
+        planned.plan,
         stage="bridge",
         policy_result=_NO_ALLOCATION,
         completion_key=bridge.burn_completion_key,
@@ -190,7 +326,7 @@ def execute_transfer(
         config=config,
         idempotency_store=idempotency_store,
         sent=result,
-        notes=notes,
+        notes=planned.messages,
     )
 
 
@@ -317,5 +453,9 @@ def _chain(chain_id: int) -> str:
 __all__ = [
     "TRANSFER_INSTRUMENT",
     "TRANSFER_LEG",
+    "TransferPlan",
+    "apply_transfer_plan",
+    "dry_run_report",
     "execute_transfer",
+    "plan_transfer",
 ]

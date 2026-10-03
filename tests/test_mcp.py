@@ -13,8 +13,11 @@ from open_allocator.core import universe as universe_core
 from open_allocator.core.types import Vault
 from open_allocator.exec import execute as execute_exec
 from open_allocator.exec import gas as gas_module
+from open_allocator.exec import loop_close as loop_close_exec
+from open_allocator.exec import loop_open as loop_open_exec
 from open_allocator.exec import loops as loops_exec
 from open_allocator.exec import rebalance as rebalance_exec
+from open_allocator.exec import transfer as transfer_exec
 from open_allocator.exec import withdraw as withdraw_exec
 from open_allocator.exec.client import RewardsResponse
 from open_allocator.mcp import build_mcp
@@ -85,6 +88,9 @@ def test_tools_are_cli_commands_that_change_nothing() -> None:
         "execute",
         "rebalance",
         "withdraw",
+        "loop-open",
+        "loop-close",
+        "bridge",
     }
     assert {tool.name for tool in tools} <= cli_inventory()
     for tool in tools:
@@ -462,6 +468,85 @@ def test_rebalance_stores_the_plan_for_approval_and_sends_nothing(
     assert stored.plan == document
 
 
+@pytest.mark.parametrize(
+    ("tool", "arguments", "planner", "expected", "appliers"),
+    [
+        (
+            "loop-open",
+            {"loop": "loop-a", "amount": 20, "leverage": 3},
+            "plan_loop_open",
+            (("loop-a",), {"equity_usd": 20.0, "leverage": 3.0}),
+            [
+                (execution_service, "apply_loop_open"),
+                (loop_open_exec, "apply_loop_opening_plan"),
+            ],
+        ),
+        (
+            "loop-close",
+            {"loop": "loop-a"},
+            "plan_loop_close",
+            (("loop-a",), {}),
+            [
+                (execution_service, "apply_loop_close"),
+                (loop_close_exec, "apply_loop_closing_plan"),
+            ],
+        ),
+        (
+            "bridge",
+            {"from_chain": 8453, "to_chain": 42161, "amount": 50, "ref": "r1"},
+            "plan_bridge",
+            ((8453, 42161, 50.0), {"ref": "r1"}),
+            [
+                (execution_service, "apply_bridge"),
+                (transfer_exec, "apply_transfer_plan"),
+            ],
+        ),
+    ],
+)
+def test_loop_and_bridge_tools_store_the_plan_for_approval_and_send_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    arguments: dict[str, Any],
+    planner: str,
+    expected: tuple[tuple[object, ...], dict[str, object]],
+    appliers: list[tuple[object, str]],
+) -> None:
+    document = {"account": WALLET, "plan": {"bundles": []}}
+    report = {"status": "planned", "messages": ["dry-run only"]}
+
+    def fake_plan(*args: object, **kwargs: Any) -> dict[str, Any]:
+        wanted_args, wanted_kwargs = expected
+        assert args == wanted_args
+        assert {name: kwargs[name] for name in wanted_kwargs} == wanted_kwargs
+        kwargs["on_warning"]({"warning": "skipped_instrument"})
+        return {
+            "kind": tool,
+            "plan": document,
+            "plan_hash": plan_hash(tool, document),
+            "report": report,
+        }
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an execution tool applied a plan")
+
+    monkeypatch.setattr(execution_service, planner, fake_plan)
+    for module, name in appliers:
+        monkeypatch.setattr(module, name, refuse)
+    store = InMemoryPlanStore()
+
+    result = anyio.run(build_mcp(store).call_tool, tool, arguments)
+
+    payload = result.structured_content
+    assert payload["plan_required"] is True
+    assert payload["kind"] == tool
+    assert payload["plan_hash"] == plan_hash(tool, document)
+    assert payload["plan"] == report
+    assert payload["warnings"] == [{"warning": "skipped_instrument"}]
+    stored = store.get(payload["plan_hash"])
+    assert stored is not None and stored.used_at is None
+    assert stored.plan == document
+
+
 def test_nothing_in_the_mcp_adapter_can_apply_a_plan() -> None:
     source = Path(mcp_module.__file__).read_text(encoding="utf-8")
 
@@ -469,10 +554,16 @@ def test_nothing_in_the_mcp_adapter_can_apply_a_plan() -> None:
         "apply_execute",
         "apply_withdraw",
         "apply_rebalance",
+        "apply_loop_open",
+        "apply_loop_close",
+        "apply_bridge",
         "apply_approved",
         "apply_allocation_plan",
         "apply_withdrawal_plan",
         "apply_rebalancing_plan",
+        "apply_loop_opening_plan",
+        "apply_loop_closing_plan",
+        "apply_transfer_plan",
         "take(",
         "reject(",
     ):

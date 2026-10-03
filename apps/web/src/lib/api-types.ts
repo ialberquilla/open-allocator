@@ -114,6 +114,38 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** BridgeReview */
+        BridgeReview: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "bridge";
+            /** Account */
+            account: string;
+            /** From Chain Id */
+            from_chain_id: number;
+            /** To Chain Id */
+            to_chain_id: number;
+            /** Amount Usdc */
+            amount_usdc: number;
+            /** Ref */
+            ref: string | null;
+            /** Advances */
+            advances: {
+                [key: string]: unknown;
+            } | null;
+            /** Bundles */
+            bundles: components["schemas"]["ReviewBundle"][];
+            /** Funding */
+            funding: components["schemas"]["ReviewFunding"][];
+            /** Notes */
+            notes: string[];
+            /** Blockers */
+            blockers: string[];
+            /** Transactions */
+            transactions: number;
+        };
         /** ExecuteReview */
         ExecuteReview: {
             /**
@@ -150,6 +182,53 @@ export interface components {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
         };
+        /** LoopCloseReview */
+        LoopCloseReview: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "loop-close";
+            /** Account */
+            account: string;
+            /** Loop Id */
+            loop_id: string;
+            /** Bundles */
+            bundles: components["schemas"]["ReviewBundle"][];
+            /** Loop */
+            loop: {
+                [key: string]: unknown;
+            };
+            /** Transactions */
+            transactions: number;
+        };
+        /** LoopOpenReview */
+        LoopOpenReview: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "loop-open";
+            /** Account */
+            account: string;
+            /** Loop Id */
+            loop_id: string;
+            /** Equity Usd */
+            equity_usd: number;
+            /** Leverage */
+            leverage: number;
+            /** Bundles */
+            bundles: components["schemas"]["ReviewBundle"][];
+            /** Loop */
+            loop: {
+                [key: string]: unknown;
+            };
+            policy: components["schemas"]["ReviewPolicy"];
+            /** Notes */
+            notes: string[];
+            /** Transactions */
+            transactions: number;
+        };
         /** PlanHashRequest */
         PlanHashRequest: {
             /** Plan Hash */
@@ -177,7 +256,7 @@ export interface components {
              */
             expires_at: string;
             /** Review */
-            review: (components["schemas"]["ExecuteReview"] | components["schemas"]["WithdrawReview"] | components["schemas"]["RebalanceReview"]) | null;
+            review: (components["schemas"]["ExecuteReview"] | components["schemas"]["WithdrawReview"] | components["schemas"]["RebalanceReview"] | components["schemas"]["LoopOpenReview"] | components["schemas"]["LoopCloseReview"] | components["schemas"]["BridgeReview"]) | null;
             /** Review Error */
             review_error: string | null;
             /** Plan */

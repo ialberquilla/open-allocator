@@ -20,7 +20,15 @@ from open_allocator.core import positions as positions_core
 from open_allocator.core.policy_loader import load_policy
 from open_allocator.core.rebalance import RebalancePolicyError
 from open_allocator.core.state import ScopedIdempotencyStore, backend_from_config
-from open_allocator.core.types import Allocation, BundleToken, Policy, TxBundle, TxStep
+from open_allocator.core.types import (
+    Allocation,
+    BundleToken,
+    FrozenModel,
+    Policy,
+    TxBundle,
+    TxPlan,
+    TxStep,
+)
 from open_allocator.core.withdraw import WithdrawPlan
 from open_allocator.exec.allocation_plan import AllocationPlan
 from open_allocator.exec.client import OneTxClient
@@ -33,12 +41,31 @@ from open_allocator.exec.execute import (
     plan_allocation,
 )
 from open_allocator.exec.funding import FundingRequirement
+from open_allocator.exec.loop_close import (
+    LoopClosingPlan,
+    apply_loop_closing_plan,
+    plan_loop_closing,
+)
+from open_allocator.exec.loop_close import dry_run_report as loop_close_dry_run_report
+from open_allocator.exec.loop_open import (
+    LoopOpeningPlan,
+    apply_loop_opening_plan,
+    check_opening_policy,
+    plan_loop_opening,
+)
+from open_allocator.exec.loop_open import dry_run_report as loop_open_dry_run_report
 from open_allocator.exec.rebalance import (
     RebalancingPlan,
     apply_rebalancing_plan,
     plan_rebalancing,
 )
 from open_allocator.exec.rebalance import dry_run_report as rebalance_dry_run_report
+from open_allocator.exec.transfer import (
+    TransferPlan,
+    apply_transfer_plan,
+    plan_transfer,
+)
+from open_allocator.exec.transfer import dry_run_report as transfer_dry_run_report
 from open_allocator.exec.withdraw import (
     WithdrawalPlan,
     apply_withdrawal_plan,
@@ -59,6 +86,9 @@ from open_allocator.service.universe import OnWarning, discover_vaults_from_clie
 EXECUTE = "execute"
 WITHDRAW = "withdraw"
 REBALANCE = "rebalance"
+LOOP_OPEN = "loop-open"
+LOOP_CLOSE = "loop-close"
+BRIDGE = "bridge"
 
 
 def idempotency_store(config: object, scope: str) -> ScopedIdempotencyStore | None:
@@ -101,6 +131,40 @@ def rebalance_scope(
         "positions": positions.model_dump(mode="json"),
         "target": target.model_dump(mode="json"),
         "min_trade_usd": min_trade_usd,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def loop_open_scope(loop_id: str, account: str) -> str:
+    payload = {"loop_id": loop_id, "account": account, "action": "open"}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def loop_close_scope(loop_id: str, account: str) -> str:
+    payload = {"loop_id": loop_id, "account": account}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def bridge_scope(
+    address: str,
+    from_chain_id: int,
+    to_chain_id: int,
+    amount: float,
+    ref: str | None,
+) -> str:
+    """The same arguments resume the same transfer; another `ref` starts another."""
+    payload = {
+        "bridge": {
+            "account": address.casefold(),
+            "from": from_chain_id,
+            "to": to_chain_id,
+            # A float, as the CLI passes it, so `100` and `100.0` are one scope.
+            "amount": float(amount),
+            "ref": ref,
+        }
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -747,6 +811,344 @@ def review_rebalance(plan: RebalancingPlan | Mapping[str, Any]) -> JsonObject:
     }
 
 
+def _approved_document(
+    kind: str,
+    plan: FrozenModel | Mapping[str, Any],
+    expected_hash: str | None,
+) -> JsonObject:
+    """`plan` as JSON, refused when it does not hash to `expected_hash`."""
+    document = (
+        plan.model_dump(mode="json") if isinstance(plan, FrozenModel) else dict(plan)
+    )
+    if expected_hash is not None and plan_hash(kind, document) != expected_hash:
+        raise ServiceError(
+            "plan_mismatch", "the plan does not match the approved plan hash"
+        )
+    return document
+
+
+def _loop_bundles(plan: TxPlan) -> list[JsonObject]:
+    return [_bundle(bundle, plan.steps) for bundle in plan.bundles]
+
+
+def plan_loop_open(
+    loop: str,
+    *,
+    equity_usd: float,
+    leverage: float,
+    policy: Policy | Path = DEFAULT_POLICY_PATH,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """`{"kind", "plan", "plan_hash", "report"}` for opening loop `loop`.
+
+    `equity_usd` is idle USDC on the loop's chain, levered to `leverage`. The
+    open is scored against the signer's book, read live. Sends nothing; `report`
+    is the dry run `loop-open` prints.
+    """
+    policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    with OneTxClient(config) as client:
+        known_instruments = discover_vaults_from_client(
+            client, enrich=True, on_warning=on_warning
+        )
+        try:
+            planned = plan_loop_opening(
+                client,
+                signer,  # type: ignore[arg-type]
+                loop,
+                equity_usd=equity_usd,
+                leverage=leverage,
+                policy=policy_model,
+                known_instruments=known_instruments,
+                config=config,
+            )
+        except PolicyCheckFailed as failed:
+            raise ServiceError("policy_violation", str(failed)) from failed
+    document = planned.model_dump(mode="json")
+    return {
+        "kind": LOOP_OPEN,
+        "plan": document,
+        "plan_hash": plan_hash(LOOP_OPEN, document),
+        "report": model_payload(loop_open_dry_run_report(planned)),
+    }
+
+
+def apply_loop_open(
+    plan: LoopOpeningPlan | Mapping[str, Any],
+    *,
+    expected_hash: str | None = None,
+) -> JsonObject:
+    """Execute a plan from `plan_loop_open` exactly; the loop-open report payload."""
+    document = _approved_document(LOOP_OPEN, plan, expected_hash)
+    planned = LoopOpeningPlan.model_validate(document)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    with OneTxClient(config) as client:
+        report = apply_loop_opening_plan(
+            client,
+            signer,  # type: ignore[arg-type]
+            planned,
+            config=config,
+            idempotency_store=idempotency_store(
+                config, loop_open_scope(planned.loop_id, planned.account)
+            ),
+        )
+    return model_payload(report)
+
+
+def recheck_loop_open_policy(
+    plan: LoopOpeningPlan | Mapping[str, Any],
+    *,
+    policy: Policy | Path = DEFAULT_POLICY_PATH,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """Score a stored open against `policy`, today's book and loop screen.
+
+    The check planning ran, so an open built under one policy or book does not
+    run once either has moved against it. Raises `ServiceError`
+    `policy_violation`.
+    """
+    planned = LoopOpeningPlan.model_validate(
+        plan.model_dump(mode="json") if isinstance(plan, LoopOpeningPlan) else plan
+    )
+    policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
+    config = AllocatorConfig()
+    with OneTxClient(config) as client:
+        known_instruments = discover_vaults_from_client(
+            client, enrich=True, on_warning=on_warning
+        )
+        result = check_opening_policy(
+            client,
+            planned,
+            policy_model,
+            known_instruments=known_instruments,
+            config=config,
+        )
+    if not result.ok:
+        raise ServiceError("policy_violation", str(PolicyCheckFailed(result)))
+    return model_payload(result)
+
+
+def review_loop_open(plan: LoopOpeningPlan | Mapping[str, Any]) -> JsonObject:
+    """What a person approving a stored `loop-open` plan reads, from the plan alone."""
+    planned = LoopOpeningPlan.model_validate(
+        plan.model_dump(mode="json") if isinstance(plan, LoopOpeningPlan) else plan
+    )
+    return {
+        "kind": LOOP_OPEN,
+        "account": planned.account,
+        "loop_id": planned.loop_id,
+        "equity_usd": planned.equity_usd,
+        "leverage": planned.leverage,
+        "bundles": _loop_bundles(planned.plan),
+        "loop": planned.announcement.model_dump(mode="json"),
+        "policy": planned.policy_result.model_dump(mode="json"),
+        "notes": list(planned.messages),
+        "transactions": len(planned.plan.steps),
+    }
+
+
+def plan_loop_close(
+    loop: str,
+    *,
+    policy: Policy | Path = DEFAULT_POLICY_PATH,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """`{"kind", "plan", "plan_hash", "report"}` for closing loop `loop`.
+
+    The policy's caps bound the venue's measurement of the unwind. Sends
+    nothing; `report` is the dry run `loop-close` prints.
+    """
+    policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    with OneTxClient(config) as client:
+        known_instruments = discover_vaults_from_client(
+            client, enrich=True, on_warning=on_warning
+        )
+        planned = plan_loop_closing(
+            client,
+            signer,  # type: ignore[arg-type]
+            loop,
+            policy=policy_model,
+            known_instruments=known_instruments,
+            config=config,
+        )
+    document = planned.model_dump(mode="json")
+    return {
+        "kind": LOOP_CLOSE,
+        "plan": document,
+        "plan_hash": plan_hash(LOOP_CLOSE, document),
+        "report": model_payload(loop_close_dry_run_report(planned)),
+    }
+
+
+def apply_loop_close(
+    plan: LoopClosingPlan | Mapping[str, Any],
+    *,
+    expected_hash: str | None = None,
+) -> JsonObject:
+    """Execute a plan from `plan_loop_close` exactly; the loop-close report payload."""
+    document = _approved_document(LOOP_CLOSE, plan, expected_hash)
+    planned = LoopClosingPlan.model_validate(document)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    with OneTxClient(config) as client:
+        report = apply_loop_closing_plan(
+            client,
+            signer,  # type: ignore[arg-type]
+            planned,
+            config=config,
+            idempotency_store=idempotency_store(
+                config, loop_close_scope(planned.loop_id, planned.account)
+            ),
+        )
+    return model_payload(report)
+
+
+def review_loop_close(plan: LoopClosingPlan | Mapping[str, Any]) -> JsonObject:
+    """What a person approving a stored `loop-close` plan reads, from the plan alone."""
+    planned = LoopClosingPlan.model_validate(
+        plan.model_dump(mode="json") if isinstance(plan, LoopClosingPlan) else plan
+    )
+    return {
+        "kind": LOOP_CLOSE,
+        "account": planned.account,
+        "loop_id": planned.loop_id,
+        "bundles": _loop_bundles(planned.plan),
+        "loop": planned.announcement.model_dump(mode="json"),
+        "transactions": len(planned.plan.steps),
+    }
+
+
+def plan_bridge(
+    from_chain_id: int,
+    to_chain_id: int,
+    amount: float,
+    *,
+    ref: str | None = None,
+    on_warning: OnWarning | None = None,
+) -> JsonObject:
+    """`{"kind", "plan", "plan_hash", "report"}` for moving `amount` USDC.
+
+    A CCTP transfer of the Safe's USDC from one chain to another, with no
+    deposit. The same arguments name the same transfer: one already under way is
+    planned as itself, to be advanced; a settled or failed one is refused, and a
+    new `ref` starts another. Sends nothing; `report` is the dry run `bridge`
+    prints.
+    """
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    address = signer_address(config)
+    with OneTxClient(config) as client:
+        known_instruments = discover_vaults_from_client(client, on_warning=on_warning)
+        planned = plan_transfer(
+            client,
+            signer,
+            from_chain_id=from_chain_id,
+            to_chain_id=to_chain_id,
+            amount_usdc=amount,
+            known_instruments=known_instruments,
+            ref=ref,
+            config=config,
+            # Read only: a transfer under way is advanced, not burned again.
+            idempotency_store=idempotency_store(
+                config,
+                bridge_scope(address, from_chain_id, to_chain_id, amount, ref),
+            ),
+        )
+    report = model_payload(transfer_dry_run_report(planned))
+    existing = planned.existing
+    if existing is not None and existing.state in ("completed", "failed"):
+        raise ServiceError("invalid_input", "; ".join(report["messages"]))
+    document = planned.model_dump(mode="json")
+    return {
+        "kind": BRIDGE,
+        "plan": document,
+        "plan_hash": plan_hash(BRIDGE, document),
+        "report": report,
+    }
+
+
+def apply_bridge(
+    plan: TransferPlan | Mapping[str, Any],
+    *,
+    expected_hash: str | None = None,
+) -> JsonObject:
+    """Execute a plan from `plan_bridge` exactly; the bridge report payload.
+
+    The burn and whatever of the transfer can follow it now. A transfer waiting
+    on Circle is advanced by planning and approving it again.
+    """
+    document = _approved_document(BRIDGE, plan, expected_hash)
+    planned = TransferPlan.model_validate(document)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    with OneTxClient(config) as client:
+        report = apply_transfer_plan(
+            client,
+            signer,
+            planned,
+            config=config,
+            idempotency_store=idempotency_store(
+                config,
+                bridge_scope(
+                    planned.account,
+                    planned.from_chain_id,
+                    planned.to_chain_id,
+                    planned.amount_usdc,
+                    planned.ref,
+                ),
+            ),
+        )
+    return model_payload(report)
+
+
+def review_bridge(plan: TransferPlan | Mapping[str, Any]) -> JsonObject:
+    """What a person approving a stored `bridge` plan reads, from the plan alone."""
+    planned = TransferPlan.model_validate(
+        plan.model_dump(mode="json") if isinstance(plan, TransferPlan) else plan
+    )
+    bundles = planned.plan.bundles
+    # A burn spends the chain's USDC, which 1Tx returns without a symbol; the
+    # plan resolved it, so name it.
+    usdc = {
+        (chain_id, token.address.lower()): BundleToken(
+            address=token.address, symbol="USDC", decimals=token.decimals
+        )
+        for chain_id, token in planned.deposit_tokens.items()
+    }
+    tokens = {**_tokens(bundles), **usdc}
+
+    def reviewed(bundle: TxBundle) -> JsonObject:
+        named = usdc.get((bundle.chain_id, bundle.token_in.address.lower()))
+        if named is not None:
+            bundle = bundle.model_copy(update={"token_in": named})
+        return _bundle(bundle, planned.plan.steps)
+
+    preparation = planned.preparation
+    existing = planned.existing
+    return {
+        "kind": BRIDGE,
+        "account": planned.account,
+        "from_chain_id": planned.from_chain_id,
+        "to_chain_id": planned.to_chain_id,
+        "amount_usdc": planned.amount_usdc,
+        "ref": planned.ref,
+        # The transfer under way this plan advances; None for a new burn.
+        "advances": None if existing is None else existing.model_dump(mode="json"),
+        "bundles": [reviewed(bundle) for bundle in bundles],
+        "funding": [
+            _funding(item, tokens.get((item.chain_id, item.token.lower())))
+            for item in preparation.funding
+        ],
+        "notes": [*planned.messages, *preparation.messages],
+        "blockers": list(preparation.blockers),
+        "transactions": len(planned.plan.steps),
+    }
+
+
 def review_plan(kind: str, plan: Mapping[str, Any]) -> JsonObject:
     """The review of a stored plan of any kind."""
     review = _REVIEW.get(kind)
@@ -756,22 +1158,30 @@ def review_plan(kind: str, plan: Mapping[str, Any]) -> JsonObject:
 
 
 # What applies each kind of stored plan, re-checks its policy first, and
-# describes it to the person approving it. A withdrawal has no re-check: the
-# policy bounds what is entered, and an exit is never refused for it. A
-# rebalance enters positions, so its target is re-checked.
+# describes it to the person approving it. A withdrawal or a loop close has no
+# re-check: the policy bounds what is entered, and an exit is never refused for
+# it. A rebalance or a loop open enters positions, so it is re-checked. A
+# transfer touches no instrument, so there is nothing to check it against.
 _APPLY: dict[str, Callable[..., JsonObject]] = {
     EXECUTE: apply_execute,
     WITHDRAW: apply_withdraw,
     REBALANCE: apply_rebalance,
+    LOOP_OPEN: apply_loop_open,
+    LOOP_CLOSE: apply_loop_close,
+    BRIDGE: apply_bridge,
 }
 _RECHECK: dict[str, Callable[..., JsonObject]] = {
     EXECUTE: recheck_execute_policy,
     REBALANCE: recheck_rebalance_policy,
+    LOOP_OPEN: recheck_loop_open_policy,
 }
 _REVIEW: dict[str, Callable[..., JsonObject]] = {
     EXECUTE: review_execute,
     WITHDRAW: review_withdraw,
     REBALANCE: review_rebalance,
+    LOOP_OPEN: review_loop_open,
+    LOOP_CLOSE: review_loop_close,
+    BRIDGE: review_bridge,
 }
 
 

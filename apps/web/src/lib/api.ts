@@ -11,7 +11,16 @@ export type PlanResponse = Schemas["PlanResponse"];
 export type ExecuteReview = Schemas["ExecuteReview"];
 export type WithdrawReview = Schemas["WithdrawReview"];
 export type RebalanceReview = Schemas["RebalanceReview"];
-export type Review = ExecuteReview | WithdrawReview | RebalanceReview;
+export type LoopOpenReview = Schemas["LoopOpenReview"];
+export type LoopCloseReview = Schemas["LoopCloseReview"];
+export type BridgeReview = Schemas["BridgeReview"];
+export type Review =
+  | ExecuteReview
+  | WithdrawReview
+  | RebalanceReview
+  | LoopOpenReview
+  | LoopCloseReview
+  | BridgeReview;
 export type ReviewBundle = Schemas["ReviewBundle"];
 export type TokenAmount = Schemas["TokenAmount"];
 export type ApproveResponse = Schemas["ApproveResponse"];

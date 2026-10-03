@@ -22,6 +22,7 @@ against.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal
 
 from open_allocator.core import amounts
 from open_allocator.core import positions as positions_core
@@ -55,6 +56,20 @@ class LoopCloseReport(FrozenModel):
     messages: tuple[str, ...] = ()
 
 
+class LoopClosingPlan(FrozenModel):
+    """A close, complete enough to execute as it stands.
+
+    What a dry run shows and what a confirmation executes: applying it submits
+    this bundle and never plans again.
+    """
+
+    kind: Literal["loop-close"] = "loop-close"
+    account: str
+    loop_id: str
+    announcement: loops_exec.LoopAnnouncement
+    plan: TxPlan
+
+
 def close(
     client: object,
     signer: Signer,
@@ -67,6 +82,35 @@ def close(
     idempotency_store: object | None = None,
 ) -> LoopCloseReport:
     """Plan, announce and — with ``confirm`` — send the close of one loop."""
+    planned = plan_loop_closing(
+        client,
+        signer,
+        loop_id,
+        policy=policy,
+        known_instruments=known_instruments,
+        config=config,
+    )
+    if not confirm:
+        return dry_run_report(planned)
+    return apply_loop_closing_plan(
+        client,
+        signer,
+        planned,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+
+
+def plan_loop_closing(
+    client: object,
+    signer: Signer,
+    loop_id: str,
+    *,
+    policy: Policy,
+    known_instruments: Sequence[Vault],
+    config: object | None = None,
+) -> LoopClosingPlan:
+    """The close ``loop-close`` would submit, announced, not sent."""
     address = signer.address()
     rows = loops_exec.loop_rows(client)
     vaults, _skipped = loops_exec.loop_vaults(rows, known_instruments)
@@ -93,24 +137,55 @@ def close(
     if not announcement.confirmable:
         raise TransactionPlanError("; ".join(announcement.blockers))
 
-    plan = bundle_execution.assemble_plan(
-        [bundle_execution.PlannedBundle(bundle=bundle, steps=steps)],
-        f"close loop {loop_id}",
+    return LoopClosingPlan(
+        account=address,
+        loop_id=loop_id,
+        announcement=announcement,
+        plan=bundle_execution.assemble_plan(
+            [bundle_execution.PlannedBundle(bundle=bundle, steps=steps)],
+            f"close loop {loop_id}",
+        ),
     )
-    if not confirm:
-        return LoopCloseReport(
-            status="planned",
-            loop_id=loop_id,
-            account=address,
-            announcement=announcement,
-            plan=plan,
+
+
+def dry_run_report(planned: LoopClosingPlan) -> LoopCloseReport:
+    """The ``loop-close`` dry-run report."""
+    return LoopCloseReport(
+        status="planned",
+        loop_id=planned.loop_id,
+        account=planned.account,
+        announcement=planned.announcement,
+        plan=planned.plan,
+    )
+
+
+def apply_loop_closing_plan(
+    client: object,
+    signer: Signer,
+    planned: LoopClosingPlan,
+    *,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> LoopCloseReport:
+    """Execute exactly ``planned``, refusing it when it no longer describes the
+    account: another signer, or the close sent since it was built.
+    """
+    address = signer.address()
+    if address.casefold() != planned.account.casefold():
+        raise TransactionPlanError(
+            f"the plan was built for {planned.account}, but the signer is {address}"
+        )
+    key = closing_key(planned)
+    if _store_completed(idempotency_store, key):
+        raise TransactionPlanError(
+            f"the plan is stale: the close of {planned.loop_id} was sent after it "
+            "was built; plan again"
         )
 
-    key = f"loop-close:{loop_id}:{bundle.digest}"
     result = bundle_execution.execute_plan(
         client,
         signer,
-        plan,
+        planned.plan,
         stage="withdraw",
         policy_result=_close_policy_result(),
         completion_key=lambda _bundle: key,
@@ -126,9 +201,9 @@ def close(
         completed_keys = (key,)
     report = LoopCloseReport(
         status=result.status,
-        loop_id=loop_id,
+        loop_id=planned.loop_id,
         account=address,
-        announcement=announcement,
+        announcement=planned.announcement,
         plan=result.plan,
         steps=result.steps,
         receipts=result.receipts,
@@ -140,6 +215,12 @@ def close(
     )
     _write_checkpoint(config, "loop-close", report, completed_keys=completed_keys)
     return report
+
+
+def closing_key(planned: LoopClosingPlan) -> str:
+    """The completion key of the planned bundle: marked once the close is sent."""
+    digest = planned.plan.bundles[0].digest if planned.plan.bundles else ""
+    return f"loop-close:{planned.loop_id}:{digest}"
 
 
 def _target(
@@ -221,4 +302,12 @@ def _close_policy_result() -> object:
     return PolicyResult(ok=True, violations=())
 
 
-__all__ = ["LoopCloseReport", "close"]
+__all__ = [
+    "LoopCloseReport",
+    "LoopClosingPlan",
+    "apply_loop_closing_plan",
+    "close",
+    "closing_key",
+    "dry_run_report",
+    "plan_loop_closing",
+]
