@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "open-allocator": {
+      "command": "uv",
+      "args": ["run", "--quiet", "--extra", "mcp", "open-allocator-mcp"]
+    }
+  }
+}

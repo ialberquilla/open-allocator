@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import time
 from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from functools import wraps
@@ -12,60 +10,36 @@ from typing import Annotated, Any, ParamSpec, TypeVar
 import typer
 
 from open_allocator.core import allocator as allocation_core
-from open_allocator.core import (
-    apy_accounting,
-    eligibility,
-    fixed_rate,
-    metrics,
-    universe,
-)
-from open_allocator.core import backtest as backtest_core
-from open_allocator.core import costs as costs_core
 from open_allocator.core import drift as drift_core
 from open_allocator.core import mandate as mandate_core
-from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
-from open_allocator.core import riskmetrics as riskmetrics_core
-from open_allocator.core import screen as screen_core
-from open_allocator.core import simulate as simulate_core
-from open_allocator.core import strategies as strategies_core
-from open_allocator.core.metrics import enrich as enrich_vaults
+from open_allocator.core import (
+    universe,
+)
 from open_allocator.core.policy_loader import load_policy
 from open_allocator.core.schema import validate
-from open_allocator.core.scoring import score_vault as score_vault_model
 from open_allocator.core.state import (
     ScopedIdempotencyStore,
-    backend_from_config,
-    json_safe,
 )
 from open_allocator.core.types import (
     Allocation,
-    Policy,
-    TxPlan,
-    Unknown,
     Vault,
-    VaultScore,
 )
-from open_allocator.exec import chains, safe_deployment
-from open_allocator.exec import gas as gas_module
-from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig, ReadOnlyOneTxConfig
-from open_allocator.exec.execute import TransactionPlanError, plan_calldata_allocation
+from open_allocator.exec.execute import TransactionPlanError
+from open_allocator.service import allocation as allocation_service
+from open_allocator.service import execution as execution_service
+from open_allocator.service import positions as positions_service
+from open_allocator.service import universe as universe_service
+from open_allocator.service import wallet as wallet_service
+from open_allocator.service._common import model_payload as _model_payload
+from open_allocator.service._common import signer_from_config
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonObject = dict[str, Any]
 P = ParamSpec("P")
 R = TypeVar("R", bound=JsonValue)
-
-# History window for every command that fetches metrics.
-#
-# Must exceed `diversify.MIN_OVERLAP` (60), the *shared* days a pair needs
-# before it is scored at all: below that every pair is unmeasured, unmeasured
-# fails closed to "one bet", and `caps.min_effective_positions` becomes
-# impossible to satisfy rather than merely strict. Single-instrument metrics
-# (coefficient of variation, reward dependence) read the same window.
-HISTORY_DAYS = 180
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -82,7 +56,7 @@ class RiskPreset(StrEnum):
     AGGRESSIVE = "aggressive"
 
 
-DEFAULT_POLICY_PATH = Path("policy.yaml")
+DEFAULT_POLICY_PATH = allocation_service.DEFAULT_POLICY_PATH
 
 
 def _write_json(payload: JsonValue, *, err: bool = False) -> None:
@@ -156,9 +130,14 @@ def _held_off_shelf(
     return off_shelf
 
 
+def _warn(warning: JsonObject) -> None:
+    # stderr, not stdout: every command's stdout is one JSON object and callers
+    # parse it.
+    _write_json(warning, err=True)
+
+
 def _discover_vaults(*, enrich: bool = False) -> list[Vault]:
-    with OneTxClient(ReadOnlyOneTxConfig()) as client:
-        return _discover_vaults_from_client(client, enrich=enrich)
+    return universe_service.discover_vaults(enrich=enrich, on_warning=_warn)
 
 
 def _discover_vaults_from_client(
@@ -167,106 +146,18 @@ def _discover_vaults_from_client(
     enrich: bool = False,
     loops: bool = False,
 ) -> list[Vault]:
-    """The discovered universe; with ``loops``, plus every loopable pair.
-
-    Loop rows are levered synthetic instruments keyed by their loop id. They
-    are added for execution, where an allocation may name one, and are not yet
-    on the scored shelf.
-    """
-    vaults, skipped = universe.discover_instruments(client)
-    if skipped:
-        # stderr, not stdout: every command's stdout is one JSON object and
-        # callers parse it. A shrunk universe still has to be visible — an
-        # instrument silently missing looks exactly like one that never existed.
-        _write_json(
-            {
-                "warning": "skipped_instruments",
-                "instruments": [s.model_dump() for s in skipped],
-            },
-            err=True,
-        )
-    if enrich:
-        vaults = enrich_vaults(client, vaults, days=HISTORY_DAYS)
-    if loops:
-        from open_allocator.exec import loops as loops_exec
-
-        levered, skipped_loops = loops_exec.discover_loop_vaults(client, vaults)
-        if skipped_loops:
-            _write_json(
-                {
-                    "warning": "skipped_loops",
-                    "loops": [s.model_dump() for s in skipped_loops],
-                },
-                err=True,
-            )
-        vaults = [*vaults, *levered]
-    return vaults
-
-
-def _filter_vaults(
-    vaults: list[Vault],
-    *,
-    chain: int | None,
-    asset: str | None,
-    protocol: str | None,
-) -> list[Vault]:
-    return [
-        vault
-        for vault in vaults
-        if (chain is None or vault.chain_id == chain)
-        and (asset is None or vault.asset.casefold() == asset.casefold())
-        and (protocol is None or vault.protocol.casefold() == protocol.casefold())
-    ]
-
-
-def _score_by_instrument(vaults: list[Vault]) -> dict[str, VaultScore]:
-    return {vault.instrument_id: score_vault_model(vault) for vault in vaults}
-
-
-def _live_cost_params(
-    allocation: Allocation,
-    chain_by_instrument: Mapping[str, int],
-    source_chain_id: int | None,
-) -> costs_core.CostParams:
-    """Cost params with gas priced from live chain state where possible.
-
-    Only the *source* chain's gas is charged (every deposit signs there), but the
-    source may be inferred from the legs, so price every chain the allocation
-    touches and let ``CostParams`` pick. A failed read is not fatal: the params
-    fall back to static constants and the estimate reports
-    ``gas_priced_live: false`` rather than passing a guess off as a measurement.
-    """
-    chain_ids = [
-        chain_id
-        for chain_id in (
-            chain_by_instrument.get(leg.instrument_id) for leg in allocation.legs
-        )
-        if chain_id is not None
-    ]
-    if source_chain_id is not None:
-        chain_ids.append(source_chain_id)
-    return costs_core.CostParams(gas=gas_module.live_pricing(chain_ids))
+    return universe_service.discover_vaults_from_client(
+        client, enrich=enrich, loops=loops, on_warning=_warn
+    )
 
 
 def _read_allocation(path: Path) -> Allocation:
-    with path.open(encoding="utf-8") as file:
-        payload = json.load(file)
-
-    validate(payload, "allocation")
-    return Allocation.model_validate(payload)
+    return allocation_service.parse_allocation(_read_json(path))
 
 
 def _read_json(path: Path) -> object:
     with path.open(encoding="utf-8") as file:
         return json.load(file)
-
-
-def _load_allocation_spec(path: Path) -> JsonObject:
-    with path.open(encoding="utf-8") as file:
-        payload = json.load(file)
-
-    validate(payload, "allocation-spec")
-    return payload
 
 
 def _read_positions(path: Path) -> positions_core.Positions:
@@ -286,18 +177,6 @@ def _read_position_source(
     if "holdings" in payload:
         return positions_core.Positions.model_validate(payload)
     return positions_core.PositionHolding.model_validate(payload)
-
-
-def signer_from_config(config: object) -> object:
-    from open_allocator.exec.signer import signer_from_config as factory
-
-    return factory(config)
-
-
-def execute_allocation(*args: object, **kwargs: object) -> object:
-    from open_allocator.exec.execute import execute_allocation as executor
-
-    return executor(*args, **kwargs)
 
 
 def execute_rebalance(*args: object, **kwargs: object) -> object:
@@ -324,63 +203,15 @@ def execute_loop_open(*args: object, **kwargs: object) -> object:
     return executor(*args, **kwargs)
 
 
-def _execution_report(
-    *,
-    status: str,
-    policy_result: object,
-    plan: TxPlan,
-    preparations: tuple[object, ...] = (),
-    funding: tuple[object, ...] = (),
-    messages: tuple[str, ...] = (),
-    loops: tuple[object, ...] = (),
-) -> object:
-    from open_allocator.exec.execute import ExecutionReport
-
-    return ExecutionReport(
-        status=status,
-        policy_result=policy_result,
-        plan=plan,
-        preparations=preparations,
-        funding=funding,
-        messages=messages,
-        loops=loops,
-    )
-
-
-def _model_payload(value: object) -> JsonObject:
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        payload = model_dump(mode="json")
-    elif isinstance(value, Mapping):
-        payload = dict(value)
-    elif hasattr(value, "__dict__"):
-        payload = vars(value)
-    else:
-        payload = value
-    if not isinstance(payload, dict):
-        raise TypeError("expected JSON object payload")
-    return payload
-
-
 def _idempotency_store(config: object, scope: str) -> ScopedIdempotencyStore | None:
-    """The store that decides whether a step is re-sent, bound to its scope.
-
-    Where it *lives* is `core.state`'s problem, not the CLI's: on a laptop that
-    is a JSON file, and in a container whose filesystem does not survive a retry
-    it is whatever backend the caller injected. This is the seam that stops a
-    retried run from broadcasting trades that already landed.
-    """
-    backend = backend_from_config(config, needs="idempotency_store_path")
-    if backend is None:
-        return None
-    return ScopedIdempotencyStore(backend, scope)
+    return execution_service.idempotency_store(config, scope)
 
 
 def _execution_idempotency_store(
     config: object,
     allocation: Allocation,
 ) -> ScopedIdempotencyStore | None:
-    return _idempotency_store(config, _allocation_scope(allocation))
+    return _idempotency_store(config, execution_service.allocation_scope(allocation))
 
 
 def _rebalance_idempotency_store(
@@ -405,25 +236,15 @@ def _withdraw_idempotency_store(
     return _idempotency_store(config, _withdraw_scope(position, amount=amount))
 
 
-def _allocation_scope(allocation: Allocation) -> str:
-    payload = allocation.model_dump(mode="json")
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _rebalance_scope(
     positions: positions_core.Positions,
     target: Allocation,
     *,
     min_trade_usd: float,
 ) -> str:
-    payload = {
-        "positions": positions.model_dump(mode="json"),
-        "target": target.model_dump(mode="json"),
-        "min_trade_usd": min_trade_usd,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.rebalance_scope(
+        positions, target, min_trade_usd=min_trade_usd
+    )
 
 
 def _loop_close_idempotency_store(
@@ -435,9 +256,7 @@ def _loop_close_idempotency_store(
 
 
 def _loop_close_scope(loop_id: str, account: str) -> str:
-    payload = {"loop_id": loop_id, "account": account}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.loop_close_scope(loop_id, account)
 
 
 def _loop_open_idempotency_store(
@@ -449,9 +268,7 @@ def _loop_open_idempotency_store(
 
 
 def _loop_open_scope(loop_id: str, account: str) -> str:
-    payload = {"loop_id": loop_id, "account": account, "action": "open"}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.loop_open_scope(loop_id, account)
 
 
 def _withdraw_scope(
@@ -459,43 +276,7 @@ def _withdraw_scope(
     *,
     amount: float | None,
 ) -> str:
-    payload = {
-        "position": position.model_dump(mode="json"),
-        "amount": amount,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _build_execution_plan(
-    allocation_path: Path,
-    policy_path: Path,
-) -> tuple[TxPlan, PlanPreparation, tuple[Any, ...], policy_core.PolicyResult]:
-    allocation = _read_allocation(allocation_path)
-    policy = load_policy(policy_path)
-    config = AllocatorConfig()
-    signer = signer_from_config(config)
-
-    with OneTxClient(config) as client:
-        known_instruments = _discover_vaults_from_client(
-            client, enrich=True, loops=True
-        )
-        # Planned and prepared in one pass: deposits are sized against the
-        # same preparation the dry run reports.
-        fitted = plan_calldata_allocation(
-            client,
-            signer,
-            allocation,
-            policy,
-            known_instruments=known_instruments,
-            config=config,
-            # Read only: legs already sent or bridging are not planned again.
-            idempotency_store=_execution_idempotency_store(config, allocation),
-        )
-    preparation = fitted.preparation.model_copy(
-        update={"messages": (*fitted.messages, *fitted.preparation.messages)}
-    )
-    return fitted.plan, preparation, fitted.loops, fitted.policy_result
+    return execution_service.withdraw_scope(position, amount=amount)
 
 
 def _execute_allocation_from_cli(
@@ -504,46 +285,15 @@ def _execute_allocation_from_cli(
     *,
     confirm: bool,
 ) -> JsonObject:
+    proposal = execution_service.plan_execute(
+        _read_allocation(allocation_path), policy=policy_path, on_warning=_warn
+    )
     if not confirm:
-        plan, preparation, loops, policy_result = _build_execution_plan(
-            allocation_path, policy_path
-        )
-        report = _execution_report(
-            status="planned",
-            policy_result=policy_result,
-            plan=plan,
-            preparations=preparation.preparations,
-            funding=preparation.funding,
-            loops=loops,
-            messages=(
-                "dry-run only; no transactions broadcast",
-                *preparation.messages,
-                *preparation.blockers,
-            ),
-        )
-        return _model_payload(report)
-
-    allocation = _read_allocation(allocation_path)
-    policy = load_policy(policy_path)
-    config = AllocatorConfig()
-    signer = signer_from_config(config)
-
-    with OneTxClient(config) as client:
-        known_instruments = _discover_vaults_from_client(
-            client, enrich=True, loops=True
-        )
-        report = execute_allocation(
-            client,
-            signer,
-            allocation,
-            policy,
-            confirm=True,
-            known_instruments=known_instruments,
-            config=config,
-            idempotency_store=_execution_idempotency_store(config, allocation),
-        )
-
-    return _model_payload(report)
+        return proposal["report"]
+    # Confirmed in the same run: the plan just built is the plan that runs.
+    return execution_service.apply_execute(
+        proposal["plan"], expected_hash=proposal["plan_hash"]
+    )
 
 
 def _rebalance_from_cli(
@@ -725,443 +475,20 @@ def _withdraw_position_from_cli(
     return _select_position(current, position)
 
 
+def _positions(address: str | None) -> JsonObject:
+    return positions_service.positions(
+        address,
+        on_warning=lambda message: _write_json(
+            {"warning": "levered_positions", "message": message}, err=True
+        ),
+    )
+
+
 def _select_position(
     source: positions_core.Positions | positions_core.PositionHolding,
     position_id: str,
 ) -> positions_core.PositionHolding:
-    if isinstance(source, positions_core.PositionHolding):
-        if source.instrument_id != position_id:
-            raise ValueError(f"position not found: {position_id}")
-        return source
-
-    matches = [
-        holding for holding in source.holdings if holding.instrument_id == position_id
-    ]
-    if not matches:
-        raise ValueError(f"position not found: {position_id}")
-    if len(matches) > 1:
-        raise ValueError(f"position id is ambiguous: {position_id}")
-    return matches[0]
-
-
-def _wallet_status_payload() -> JsonObject:
-    config = AllocatorConfig()
-    signer = signer_from_config(config)
-    address_method = getattr(signer, "address", None)
-    if not callable(address_method):
-        raise TypeError("signer does not implement address()")
-    address = str(address_method())
-
-    with OneTxClient(config) as client:
-        balances_response = client.balances(address)
-
-    from open_allocator.exec.erc4337_paymaster import submits_via_paymaster
-
-    balances_payload = _normalize_balances_response(balances_response)
-    # Which readiness question to ask depends on how the transaction reaches the
-    # chain. A smart account paying gas in USDC holds no native token anywhere by
-    # design, so asking for a native balance answers a question this wallet never
-    # has to satisfy.
-    gas_status = (
-        _paymaster_gas_status if submits_via_paymaster(config) else _native_gas_status
-    )
-    balances = []
-    for balance in balances_payload["balances"]:
-        chain_id = int(balance["chain_id"])
-        balances.append(
-            {
-                **balance,
-                **gas_status(address, chain_id, config),
-            }
-        )
-
-    return {
-        "address": address,
-        "balances": balances,
-        "total_usdc_usd": balances_payload.get("total_usdc_usd"),
-    }
-
-
-def _safe_seed_from_config(config: AllocatorConfig) -> safe_deployment.SafeSeed:
-    if config.safe_owners is None or config.safe_threshold is None:
-        raise ValueError(
-            "safe-address needs SAFE_OWNERS + SAFE_THRESHOLD to derive the "
-            "counterfactual address"
-        )
-    return safe_deployment.SafeSeed(
-        owners=config.safe_owners,
-        threshold=config.safe_threshold,
-        salt_nonce=config.safe_salt_nonce,
-    )
-
-
-def _safe_address_payload(chain_ids: tuple[int, ...] | None) -> JsonObject:
-    from web3 import HTTPProvider, Web3
-
-    config = AllocatorConfig()
-    if config.account != "safe":
-        raise ValueError("safe-address requires SIGNER_ACCOUNT=safe")
-
-    # No chain is configured in the common case, so fall back to the one the
-    # address would be derived from. The address is the same everywhere; the
-    # chain only decides who answers the eth_call.
-    targets = chain_ids or (safe_deployment.derivation_chain_id(config),)
-
-    seed = _safe_seed_from_config(config)
-    predicted: str | None = config.safe_address
-    per_chain: list[JsonObject] = []
-
-    for chain_id in targets:
-        entry: JsonObject = {"chain_id": chain_id, "chain": chains.chain_name(chain_id)}
-        try:
-            rpc_url = chains.require_rpc_url(chain_id, config)
-            w3 = Web3(HTTPProvider(rpc_url))
-            status = safe_deployment.deployment_status(w3, seed, chain_id=chain_id)
-            entry["address"] = status.address
-            entry["deployed"] = status.deployed
-            predicted = predicted or status.address
-        except Exception as error:
-            entry["error"] = str(error)
-            entry["deployed"] = None
-        per_chain.append(entry)
-
-    return {
-        "address": predicted,
-        "owners": list(seed.owners),
-        "threshold": seed.threshold,
-        "salt_nonce": seed.salt_nonce,
-        "safe_version": safe_deployment.SAFE_VERSION,
-        "chains": per_chain,
-    }
-
-
-def _positions_payload(address: str | None) -> JsonObject:
-    if address is None:
-        config = AllocatorConfig()
-        signer = signer_from_config(config)
-        address_method = getattr(signer, "address", None)
-        if not callable(address_method):
-            raise TypeError("signer does not implement address()")
-        address = str(address_method())
-    else:
-        config = ReadOnlyOneTxConfig()
-
-    from open_allocator.exec import loops as loops_exec
-
-    with OneTxClient(config) as client:
-        book, warnings = loops_exec.read_book(client, address, config)
-    for warning in warnings:
-        _write_json({"warning": "levered_positions", "message": warning}, err=True)
-    return book.model_dump(mode="json")
-
-
-def _rewards_payload(wallet: str, chain_id: int | None) -> JsonObject:
-    with OneTxClient(ReadOnlyOneTxConfig()) as client:
-        response = client.rewards(wallet, chain_id)
-
-    payload: JsonObject = {
-        "wallet": response.wallet,
-        "rewards": [],
-        "errors": list(response.errors),
-        "expires_at": response.expires_at,
-        "expired": response.expires_at <= int(time.time()),
-    }
-    rewards = payload["rewards"]
-    assert isinstance(rewards, list)
-    for reward in response.rewards:
-        item = reward.model_dump(mode="json")
-        item["claimable_amount_normalized"] = reward.claimable_amount_normalized
-        item["pending_amount_normalized"] = reward.pending_amount_normalized
-        rewards.append(item)
-
-    validate(payload, "rewards")
-    return payload
-
-
-def _normalize_balances_response(response: object) -> JsonObject:
-    payload = _model_payload(response)
-    raw_balances = payload.get("balances", [])
-    if not isinstance(raw_balances, Sequence) or isinstance(
-        raw_balances,
-        str | bytes | bytearray,
-    ):
-        raise TypeError("balances response did not contain a balances array")
-
-    balances: list[JsonObject] = []
-    for raw_balance in raw_balances:
-        balance_payload = _model_payload(raw_balance)
-        chain_id = int(_mapping_value(balance_payload, "chain_id", "chainId"))
-        balances.append(
-            {
-                "chain_id": chain_id,
-                "chain_name": str(
-                    _mapping_value(
-                        balance_payload,
-                        "chain_name",
-                        "chainName",
-                        default=chains.chain_name(chain_id),
-                    )
-                ),
-                "usdc_balance": str(
-                    _mapping_value(balance_payload, "usdc_balance", "usdcBalance")
-                ),
-                "usdc_balance_raw": str(
-                    _mapping_value(
-                        balance_payload,
-                        "usdc_balance_raw",
-                        "usdcBalanceRaw",
-                    )
-                ),
-            }
-        )
-
-    return {
-        "balances": balances,
-        "total_usdc_usd": _mapping_value(
-            payload,
-            "total_usdc_usd",
-            "totalUsdcUsd",
-            default=None,
-        ),
-    }
-
-
-def _mapping_value(
-    mapping: JsonObject,
-    *keys: str,
-    default: object = Ellipsis,
-) -> object:
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    if default is not Ellipsis:
-        return default
-    raise KeyError(keys[0])
-
-
-def _native_gas_status(address: str, chain_id: int, config: object) -> JsonObject:
-    required_wei = int(getattr(config, "min_native_gas_wei", 1))
-    rpc_url = chains.rpc_url(chain_id, config)
-    if rpc_url is None:
-        return {
-            "gas_mode": "native",
-            "rpc_available": False,
-            "rpc_executable": False,
-            "native_gas_balance_wei": None,
-            "native_gas_required_wei": required_wei,
-            "native_gas_available": False,
-            "executable": False,
-            "not_executable": True,
-            "not_executable_reasons": ["missing_rpc"],
-        }
-
-    try:
-        from web3 import HTTPProvider, Web3
-
-        balance_wei = int(Web3(HTTPProvider(rpc_url)).eth.get_balance(address))
-    except Exception as error:
-        return {
-            "gas_mode": "native",
-            "rpc_available": True,
-            "rpc_executable": False,
-            "native_gas_balance_wei": None,
-            "native_gas_required_wei": required_wei,
-            "native_gas_available": False,
-            "executable": False,
-            "not_executable": True,
-            "not_executable_reasons": ["rpc_error"],
-            "message": str(error),
-        }
-
-    gas_available = balance_wei >= required_wei
-    return {
-        "gas_mode": "native",
-        "rpc_available": True,
-        "rpc_executable": True,
-        "native_gas_balance_wei": balance_wei,
-        "native_gas_required_wei": required_wei,
-        "native_gas_available": gas_available,
-        "executable": gas_available,
-        "not_executable": not gas_available,
-        "not_executable_reasons": [] if gas_available else ["insufficient_native_gas"],
-    }
-
-
-def _paymaster_gas_status(_address: str, chain_id: int, config: object) -> JsonObject:
-    """Readiness on a chain whose gas is paid in USDC by the smart account.
-
-    There is no native balance to have: the paymaster fronts the native gas and
-    pulls USDC, and an exit funds itself from what it redeems, so a chain where
-    the account holds nothing at all is still executable. What decides it is
-    whether the paymaster can price this chain, whether its gas token is known,
-    and whether an RPC exists to read the account's nonce and deployment status.
-
-    USDC balance is deliberately not part of the verdict — it is already on the
-    row, and requiring it would mark exactly the self-funding exits unusable.
-    """
-    from open_allocator.exec.erc4337_paymaster import (
-        PaymasterError,
-        PaymasterUnsupportedChain,
-        usdc_address_for_chain,
-        validate_paymaster_preflight,
-    )
-
-    reasons: list[str] = []
-    message: str | None = None
-
-    rpc_url = chains.rpc_url(chain_id, config)
-    if rpc_url is None:
-        reasons.append("missing_rpc")
-
-    gas_token: str | None = None
-    try:
-        validate_paymaster_preflight(config, (chain_id,))
-        gas_token = usdc_address_for_chain(config, chain_id)
-    except PaymasterUnsupportedChain as error:
-        reasons.append("chain_not_gas_payable")
-        message = str(error)
-    except PaymasterError as error:
-        reasons.append("paymaster_not_configured")
-        message = str(error)
-
-    status: JsonObject = {
-        "gas_mode": "usdc_paymaster",
-        "gas_token": "USDC",
-        "gas_token_address": gas_token,
-        "rpc_available": rpc_url is not None,
-        "rpc_executable": rpc_url is not None,
-        # Not zero — inapplicable. This account never holds a native token.
-        "native_gas_balance_wei": None,
-        "native_gas_required_wei": 0,
-        "native_gas_available": None,
-        "executable": not reasons,
-        "not_executable": bool(reasons),
-        "not_executable_reasons": reasons,
-    }
-    if message is not None:
-        status["message"] = message
-    return status
-
-
-def _policy_candidate_vaults(
-    vaults: Sequence[Vault],
-    policy: Policy,
-) -> tuple[list[Vault], list[str]]:
-    candidates: list[Vault] = []
-    exclusions: list[str] = []
-
-    for vault in vaults:
-        rule = _policy_exclusion_rule(vault, policy)
-        if rule is None:
-            candidates.append(vault)
-        else:
-            exclusions.append(f"policy_excluded:{vault.instrument_id}:{rule}")
-
-    return candidates, exclusions
-
-
-def _policy_exclusion_rule(vault: Vault, policy: Policy) -> str | None:
-    # Single source of truth for per-vault policy eligibility.
-    return eligibility.candidate_exclusion(vault, policy)
-
-
-def _policy_violation_summary(result: policy_core.PolicyResult) -> list[str]:
-    return [
-        f"{violation.rule}:{violation.entity}:limit={violation.limit}:actual={violation.actual}"
-        for violation in result.violations
-    ]
-
-
-def _allocation_payload_with_policy_result(
-    allocation: Allocation,
-    result: policy_core.PolicyResult,
-    *,
-    discovered: Sequence[Vault],
-    candidates: Sequence[Vault],
-    exclusions: Sequence[str],
-    cost_estimate: costs_core.CostEstimate | None = None,
-) -> JsonObject:
-    metadata = dict(allocation.metadata)
-    warnings = [str(item) for item in metadata.get("warnings", [])]
-    warnings.extend(exclusions)
-    accounting = apy_accounting.for_allocation(allocation, discovered)
-    warnings.extend(accounting.warnings())
-    # Selection remains headline-based in this compatibility release.  The
-    # accounting block separately states whether accruing yield is measurable.
-    metadata["apy_basis"] = "advertised"
-    metadata["apy_accounting"] = accounting.model_dump(mode="json")
-    if cost_estimate is not None:
-        metadata["cost_estimate"] = cost_estimate.as_metadata()
-        cost_warning = cost_estimate.warning()
-        if cost_warning is not None:
-            warnings.append(cost_warning)
-    metadata.update(
-        {
-            "warnings": sorted(set(warnings)),
-            "policy_ok": result.ok,
-            "policy_violations": _policy_violation_summary(result),
-            "discovered_instruments": [vault.instrument_id for vault in discovered],
-            "candidate_instruments": [vault.instrument_id for vault in candidates],
-        }
-    )
-    payload = allocation.model_copy(update={"metadata": metadata}).model_dump(
-        mode="json"
-    )
-    validate(payload, "allocation")
-    return payload
-
-
-def _vault_summary(vault: Vault, score: VaultScore) -> JsonObject:
-    # `reward_apy` stays the advertised number — APY is descriptive here, and
-    # hiding what upstream said would make the row harder to check, not safer.
-    # `priced_reward_apy` is the one this allocator is willing to count, and it
-    # reads Unknown for a reward APY priced at the emission schedule rather
-    # than at a quote something would fill.
-    priced_reward = apy_accounting.priced_reward_apy(vault)
-    return {
-        "instrument_id": vault.instrument_id,
-        "protocol": vault.protocol,
-        "chain_id": vault.chain_id,
-        "asset": vault.asset,
-        "apy": vault.apy,
-        "advertised_apy": vault.apy,
-        "base_apy": vault.apy_base,
-        "reward_apy": vault.apy_reward,
-        "priced_reward_apy": (
-            priced_reward if priced_reward is not None else json_safe(Unknown)
-        ),
-        "reward_apy_basis": vault.reward_price_basis or "unknown",
-        "reward_tokens": list(vault.reward_tokens),
-        "reward_dependence": json_safe(vault.reward_dependence),
-        "tvl_usd": vault.tvl_usd,
-        # A levered row's usd value is its equity; its gross exposure is up to
-        # max_leverage times that, which no weight cap can see.
-        "levered": vault.is_levered,
-        "max_leverage": vault.max_leverage,
-        # A fixed-term row's apy is the rate locked to maturity, and its risk
-        # metrics are the holder's mark-to-market path (core.fixed_rate).
-        "maturity": vault.maturity.isoformat() if vault.maturity else None,
-        "days_to_maturity": fixed_rate.days_to_maturity(vault),
-        "term_return_pct": vault.term_return_pct,
-        "score": score.score,
-        "risk_metrics": _risk_metrics(vault),
-    }
-
-
-def _vault_score_payload(score: VaultScore, vault: Vault) -> JsonObject:
-    payload = score.model_dump(mode="json")
-    payload["risk_metrics"] = _risk_metrics(vault)
-    validate(payload, "vault-score")
-    return payload
-
-
-def _risk_metrics(vault: Vault) -> JsonObject:
-    # Yield-path risk only; never principal/depeg/contract loss. Unknown stays
-    # Unknown when history is insufficient.
-    return {
-        name: json_safe(value)
-        for name, value in riskmetrics_core.summary(vault).items()
-    }
+    return execution_service.select_position(source, position_id)
 
 
 def _parse_pins(pins: list[str] | None) -> dict[str, float] | None:
@@ -1237,29 +564,10 @@ MinScreenTvlOption = Annotated[
 ]
 
 
-def _screen_criteria(
-    *,
-    min_sharpe: float | None,
-    max_drawdown: float | None,
-    max_reward_dependence: float | None,
-    min_history_days: int | None,
-    curators: list[str] | None,
-    min_tvl_usd: float | None,
-) -> screen_core.ScreenCriteria:
-    return screen_core.ScreenCriteria(
-        min_sharpe=min_sharpe,
-        max_drawdown=max_drawdown,
-        max_reward_dependence=max_reward_dependence,
-        min_history_days=min_history_days,
-        curators=tuple(curators) if curators else None,
-        min_tvl_usd=min_tvl_usd,
-    )
-
-
 @app.command("wallet-status")
 @json_command
 def wallet_status() -> JsonObject:
-    return _wallet_status_payload()
+    return wallet_service.wallet_status()
 
 
 @app.command("safe-address")
@@ -1273,7 +581,7 @@ def safe_address(
         ),
     ] = None,
 ) -> JsonObject:
-    return _safe_address_payload(tuple(chain) if chain else None)
+    return wallet_service.safe_address(tuple(chain) if chain else None)
 
 
 @app.command("list-vaults")
@@ -1284,22 +592,13 @@ def list_vaults(
     protocol: Annotated[str | None, typer.Option("--protocol")] = None,
     sort: Annotated[VaultSort | None, typer.Option("--sort")] = None,
 ) -> list[JsonObject]:
-    vaults = _filter_vaults(
-        _discover_vaults(enrich=True),
+    return universe_service.list_vaults(
         chain=chain,
         asset=asset,
         protocol=protocol,
+        sort=sort.value if sort else None,
+        on_warning=_warn,
     )
-    scores = _score_by_instrument(vaults)
-
-    if sort == VaultSort.APY:
-        vaults.sort(key=lambda vault: vault.apy, reverse=True)
-    elif sort == VaultSort.TVL:
-        vaults.sort(key=lambda vault: vault.tvl_usd, reverse=True)
-    elif sort == VaultSort.SCORE:
-        vaults.sort(key=lambda vault: scores[vault.instrument_id].score, reverse=True)
-
-    return [_vault_summary(vault, scores[vault.instrument_id]) for vault in vaults]
 
 
 @app.command("score-vault")
@@ -1307,11 +606,7 @@ def list_vaults(
 def score_vault(
     instrument_id: Annotated[str, typer.Option("--instrument-id")],
 ) -> JsonObject:
-    for vault in _discover_vaults(enrich=True):
-        if vault.instrument_id == instrument_id:
-            return _vault_score_payload(score_vault_model(vault), vault)
-
-    raise ValueError(f"instrument not found: {instrument_id}")
+    return universe_service.score_vault(instrument_id, on_warning=_warn)
 
 
 @app.command("build-allocation")
@@ -1403,91 +698,30 @@ def build_allocation(
         ),
     ] = None,
 ) -> JsonObject:
-    if strategy in {"list", "help"}:
-        # Discovery convenience: enumerate strategies without needing --amount.
-        return {"strategies": list(strategies_core.available())}
-    risk_value = risk.value
-    strategy_params = _parse_strategy_params(strategy_param)
-    overrides = _parse_pins(pin)
-    if spec is not None:
-        spec_data = _load_allocation_spec(spec)
-        selection = spec_data.get("selection", {})
-        amount = amount if amount is not None else spec_data.get("amount_usd")
-        risk_value = spec_data.get("risk", risk_value)
-        strategy = spec_data.get("strategy", strategy)
-        strategy_params = spec_data.get("params", strategy_params)
-        weights = spec_data.get("weights")
-        if weights:
-            overrides = {str(key): float(value) for key, value in weights.items()}
-        exclude = selection.get("exclude", exclude)
-        max_positions = selection.get("max_positions", max_positions)
-        min_position_usd = selection.get("min_position_usd", min_position_usd)
-        criteria = _screen_criteria(
-            min_sharpe=selection.get("min_sharpe"),
-            max_drawdown=selection.get("max_drawdown"),
-            max_reward_dependence=selection.get("max_reward_dependence"),
-            min_history_days=selection.get("min_history_days"),
-            curators=selection.get("curators"),
-            min_tvl_usd=selection.get("min_tvl_usd"),
-        )
-    else:
-        criteria = _screen_criteria(
+    return allocation_service.build_allocation(
+        amount,
+        risk=risk.value,
+        policy=policy_path,
+        spec=_read_json(spec) if spec is not None else None,
+        strategy=strategy,
+        strategy_params=_parse_strategy_params(strategy_param),
+        criteria=universe_service.screen_criteria(
             min_sharpe=min_sharpe,
             max_drawdown=max_drawdown,
             max_reward_dependence=max_reward_dependence,
             min_history_days=min_history_days,
             curators=screen_curator,
             min_tvl_usd=min_tvl_usd,
-        )
-
-    if amount is None:
-        raise ValueError("amount required: pass --amount or set amount_usd in the spec")
-
-    policy = load_policy(policy_path)
-    discovered = _discover_vaults(enrich=True)
-    candidates, exclusions = _policy_candidate_vaults(discovered, policy)
-    if criteria.active:
-        screened = screen_core.screen(candidates, criteria)
-        candidates = list(screened.kept)
-        exclusions = [*exclusions, *screened.warnings()]
-    scores = _score_by_instrument(discovered)
-    allocation = allocation_core.build_allocation(
-        [(vault, scores[vault.instrument_id]) for vault in candidates],
-        amount,
-        risk=risk_value,
-        caps=policy.caps,
-        caps_headroom_bps=caps_headroom_bps,
-        strategy=strategy,
-        strategy_params=strategy_params,
+        ),
         max_positions=max_positions,
         min_position_usd=min_position_usd,
-        overrides=overrides,
-        exclude=exclude,
         score_power=score_power,
         apy_weight=apy_weight,
-    )
-    result = policy_core.check(allocation, policy, discovered)
-    chain_by_instrument = {v.instrument_id: v.chain_id for v in discovered}
-    cost_estimate = costs_core.estimate_from_allocation_legs(
-        [leg.model_dump() for leg in allocation.legs],
-        chain_by_instrument=chain_by_instrument,
-        apy_by_instrument={v.instrument_id: v.apy for v in discovered},
-        base_apy_by_instrument={v.instrument_id: v.apy_base for v in discovered},
-        term_days_by_instrument={
-            v.instrument_id: float(days)
-            for v in discovered
-            if (days := fixed_rate.days_to_maturity(v)) is not None
-        },
+        caps_headroom_bps=caps_headroom_bps,
+        exclude=exclude,
+        pins=_parse_pins(pin),
         source_chain_id=source_chain_id,
-        params=_live_cost_params(allocation, chain_by_instrument, source_chain_id),
-    )
-    return _allocation_payload_with_policy_result(
-        allocation,
-        result,
-        discovered=discovered,
-        candidates=candidates,
-        exclusions=exclusions,
-        cost_estimate=cost_estimate,
+        on_warning=_warn,
     )
 
 
@@ -1506,7 +740,7 @@ def screen(
     Narrows only; policy (``check-policy``) still applies downstream and cannot
     be loosened by any screen.
     """
-    criteria = _screen_criteria(
+    criteria = universe_service.screen_criteria(
         min_sharpe=min_sharpe,
         max_drawdown=max_drawdown,
         max_reward_dependence=max_reward_dependence,
@@ -1514,31 +748,7 @@ def screen(
         curators=screen_curator,
         min_tvl_usd=min_tvl_usd,
     )
-    discovered = _discover_vaults(enrich=True)
-    scores = _score_by_instrument(discovered)
-    result = screen_core.screen(discovered, criteria)
-    return {
-        "label": "advisory-not-policy",
-        "criteria": {
-            "min_sharpe": criteria.min_sharpe,
-            "max_drawdown": criteria.max_drawdown,
-            "max_reward_dependence": criteria.max_reward_dependence,
-            "min_history_days": criteria.min_history_days,
-            "curators": list(criteria.curators) if criteria.curators else None,
-            "min_tvl_usd": criteria.min_tvl_usd,
-        },
-        "kept": [
-            _vault_summary(vault, scores[vault.instrument_id]) for vault in result.kept
-        ],
-        "dropped": [
-            {
-                "instrument_id": drop.instrument_id,
-                "rule": drop.rule,
-                "detail": drop.detail,
-            }
-            for drop in result.dropped
-        ],
-    }
+    return universe_service.screen(criteria, on_warning=_warn)
 
 
 @app.command("simulate")
@@ -1550,23 +760,11 @@ def simulate(
     ],
     benchmark: Annotated[str | None, typer.Option("--benchmark")] = None,
 ) -> JsonObject:
-    allocation = _read_allocation(allocation_path)
-    # Discovery supplies the sector labels; without it the output would show
-    # yield and stability but say nothing about how many sleeves the capital
-    # actually sits in. The dated history on top is what turns that label into
-    # a measurement — one extra bulk call, not one per instrument.
-    with OneTxClient(ReadOnlyOneTxConfig()) as client:
-        vaults = metrics.attach_series(
-            client,
-            _discover_vaults_from_client(client, enrich=False),
-            days=HISTORY_DAYS,
-        )
-        return simulate_core.simulate(
-            client,
-            allocation,
-            benchmark=benchmark,
-            vaults=vaults,
-        ).model_dump(mode="json")
+    return allocation_service.simulate(
+        _read_allocation(allocation_path),
+        benchmark=benchmark,
+        on_warning=_warn,
+    )
 
 
 @app.command("backtest")
@@ -1580,13 +778,9 @@ def backtest(
     """Read-only daily-compounded NAV backtest of an allocation vs. a
     TVL-weighted universe benchmark. Yield-path only; descriptive not
     predictive."""
-    allocation = _read_allocation(allocation_path)
-    discovered = _discover_vaults(enrich=True)
-    apy_series_by_id = {vault.instrument_id: vault.apy_series for vault in discovered}
-    tvl_by_id = {vault.instrument_id: vault.tvl_usd for vault in discovered}
-    weights = {leg.instrument_id: leg.weight for leg in allocation.legs}
-    report = backtest_core.run(weights, apy_series_by_id, tvl_by_id)
-    return report.model_dump(mode="json")
+    return allocation_service.backtest(
+        _read_allocation(allocation_path), on_warning=_warn
+    )
 
 
 @app.command("check-policy")
@@ -1614,22 +808,12 @@ def check_policy(
         ),
     ] = None,
 ) -> JsonObject:
-    allocation = _read_allocation(allocation_path)
-    policy = load_policy(policy_path)
-    known_instruments = _discover_vaults(enrich=True)
-    if against_path is None:
-        return policy_core.check(
-            allocation,
-            policy,
-            known_instruments,
-        ).model_dump(mode="json")
-    held_usd = positions_core.held_usd_by_instrument(_read_positions(against_path))
-    return policy_core.check_incremental(
-        allocation,
-        policy,
-        known_instruments,
-        held_usd,
-    ).model_dump(mode="json")
+    return allocation_service.check_policy(
+        _read_allocation(allocation_path),
+        policy=policy_path,
+        against=_read_positions(against_path) if against_path is not None else None,
+        on_warning=_warn,
+    )
 
 
 @app.command("validate-mandate")
@@ -1691,7 +875,7 @@ def drift(
     positions_snapshot = (
         _read_positions(positions_path)
         if positions_path is not None
-        else positions_core.Positions.model_validate(_positions_payload(None))
+        else positions_core.Positions.model_validate(_positions(None))
     )
     shelf = _discover_vaults(enrich=True)
     off_shelf = _held_off_shelf(positions_snapshot, shelf)
@@ -1722,13 +906,13 @@ def build_tx(
         typer.Option("--policy", dir_okay=False, readable=True),
     ] = DEFAULT_POLICY_PATH,
 ) -> JsonObject:
-    plan, preparation, _loops, _policy_result = _build_execution_plan(
-        allocation_path, policy_path
+    planned = execution_service.plan_allocation_execution(
+        _read_allocation(allocation_path), policy=policy_path, on_warning=_warn
     )
     # The plan is the output, so blockers are an error rather than a note.
-    if preparation.blockers:
-        raise TransactionPlanError("; ".join(preparation.blockers))
-    payload = plan.model_dump(mode="json")
+    if planned.preparation.blockers:
+        raise TransactionPlanError("; ".join(planned.preparation.blockers))
+    payload = planned.plan.model_dump(mode="json")
     validate(payload, "tx-plan")
     return payload
 
@@ -1761,7 +945,7 @@ def execute(
 def positions(
     address: Annotated[str | None, typer.Option("--address")] = None,
 ) -> JsonObject:
-    return _positions_payload(address)
+    return _positions(address)
 
 
 @app.command("rewards")
@@ -1770,7 +954,7 @@ def rewards(
     wallet: Annotated[str, typer.Option("--wallet")],
     chain: Annotated[int | None, typer.Option("--chain")] = None,
 ) -> JsonObject:
-    return _rewards_payload(wallet, chain)
+    return positions_service.rewards(wallet, chain)
 
 
 @app.command("rebalance")
@@ -1936,18 +1120,9 @@ def _bridge_scope(
     amount: float,
     ref: str | None,
 ) -> str:
-    """The same arguments resume the same transfer; --ref starts another."""
-    payload = {
-        "bridge": {
-            "account": address.casefold(),
-            "from": from_chain_id,
-            "to": to_chain_id,
-            "amount": amount,
-            "ref": ref,
-        }
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.bridge_scope(
+        address, from_chain_id, to_chain_id, amount, ref
+    )
 
 
 def main() -> None:

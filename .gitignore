@@ -37,3 +37,8 @@ notes/
 # Live-run scratch artifacts (real funds; not part of the shipped repo)
 policy-live-*.yaml
 allocation-live-*.json
+
+# Web app: dependencies, the build oa_server serves, and the generated OpenAPI input
+node_modules/
+apps/server/src/oa_server/web_dist/
+apps/web/openapi.json
