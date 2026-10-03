@@ -197,16 +197,3 @@ def test_an_mcp_proposal_runs_only_when_a_human_approves_it(
     # The signer's key never leaves the process.
     for response in (stored, approved, replayed):
         assert "11" * 32 not in response.text
-
-
-def test_chat_reports_a_missing_claude(tmp_path: Path) -> None:
-    app = create_app(
-        settings(claude_bin=str(tmp_path / "no-claude")), InMemoryPlanStore()
-    )
-    with TestClient(app, base_url=BASE_URL) as client:
-        response = client.post(
-            "/api/chat", json={"message": "hi"}, headers=authorized()
-        )
-
-    assert response.status_code == 503
-    assert "not installed" in response.json()["detail"]["error"]

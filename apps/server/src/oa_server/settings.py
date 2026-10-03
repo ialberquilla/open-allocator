@@ -25,8 +25,6 @@ class Settings:
     # The operator's policy. Approval re-checks every plan against it, whatever
     # policy the model planned under.
     policy_path: Path = DEFAULT_POLICY_PATH
-    # The `claude` executable the chat spawns.
-    claude_bin: str = "claude"
     extra_allowed_hosts: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
@@ -38,7 +36,6 @@ class Settings:
             "policy_path": Path(
                 os.environ.get("OA_POLICY_PATH", str(DEFAULT_POLICY_PATH))
             ),
-            "claude_bin": os.environ.get("OA_CLAUDE_BIN", "claude"),
         }
         values.update({key: value for key, value in overrides.items() if value})
         return cls(token=token, **values)  # type: ignore[arg-type]

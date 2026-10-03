@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "oa-server"
 version = "0.1.0"
-description = "Local server for Open Allocator: HTTP API, MCP over HTTP, approval and chat."
+description = "Local server for Open Allocator: HTTP API, MCP over HTTP and approval."
 license = "MIT"
 requires-python = ">=3.12,<3.13"
 authors = [{ name = "Ivan Alberquilla" }]

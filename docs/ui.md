@@ -1,6 +1,6 @@
-# Local UI, MCP server and chat
+# Local UI and MCP server
 
-A local dashboard and chat on top of the library.
+A local dashboard and approval surface on top of the library. Conversation happens in the user's own MCP client (Claude Code, Claude Desktop, …); this repository ships no chat.
 
 ## Layers
 
@@ -53,9 +53,8 @@ Not yet split: `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`.
 `oa_server` is a separate package in the uv workspace. It depends on the library; the library never imports it. One process serves:
 
 - `/mcp`: the same MCP server over streamable HTTP, storing plans in Postgres (`PostgresPlanStore`).
-- `GET /api/plans/{hash}`: the stored plan an approval would apply. A UI shows this, not the chat's copy.
+- `GET /api/plans/{hash}`: the stored plan an approval would apply. A UI shows this, not the model's copy.
 - `POST /api/approve {"plan_hash"}`: applies that stored plan once, after re-checking it against the operator's policy (`OA_POLICY_PATH`, default `policy.yaml`), whatever policy the model planned under. Records the result or error on the plan row. `404` unknown, `410` expired, `409` used or mismatched, `422` policy violation.
-- `POST /api/chat {"message", "session_id"?}`: one chat turn as server-sent events (`session`, `text`, `tool_use`, `tool_result`, `plan_required`, `result`, `error`).
 - `GET /api/health`: the only route that needs no token.
 
 Run it from the directory with the CLI's `.env`:
@@ -65,23 +64,23 @@ docker compose up -d          # Postgres on 127.0.0.1:5442
 uv run open-allocator-ui      # migrates, then serves http://127.0.0.1:8787
 ```
 
-It prints a token generated at start. Send it as `Authorization: Bearer <token>` (or the `oa_token` cookie). Settings: `OA_DATABASE_URL`, `OA_HOST`, `OA_PORT`, `OA_POLICY_PATH`, `OA_CLAUDE_BIN`.
+It prints a token generated at start. Send it as `Authorization: Bearer <token>` (or the `oa_token` cookie). Settings: `OA_DATABASE_URL`, `OA_HOST`, `OA_PORT`, `OA_POLICY_PATH`.
 
 ### Access
 
 - Binds `127.0.0.1`. A request whose `Host` is not the server's own is refused (`421`, against DNS rebinding), as is one with a foreign `Origin` (`403`) or without the token (`401`).
 - Signer keys stay in the server process. No response carries them.
 
-### Chat
+### MCP clients
 
-Each turn spawns the user's own `claude` CLI (`claude -p … --output-format stream-json`), so it runs on their Claude login. The child process:
+Point any MCP client that speaks streamable HTTP at `http://127.0.0.1:8787/mcp` with the header `Authorization: Bearer <token>`. For Claude Code:
 
-- runs in a scratch directory, not the repository, with an environment reduced to `PATH`, `HOME`, locale and Claude auth variables: no signer, 1Tx or database secrets;
-- has no built-in tools (`--tools ""`), only this server's MCP tools (`--strict-mcp-config`, `--allowedTools mcp__open-allocator__*`), no settings sources (`--setting-sources ""`) and no skills;
-- gets its MCP config from a `0600` file holding the server's URL and token;
-- is killed if the client disconnects mid-turn. A session runs one turn at a time (`409` otherwise). A missing `claude` is a `503`.
+```bash
+claude mcp add --transport http open-allocator http://127.0.0.1:8787/mcp \
+  --header "Authorization: Bearer <token>"
+```
 
-The bridge never approves. A `plan_required` event names the stored plan; approving it is a separate request to `/api/approve`.
+Plans proposed over this endpoint land in Postgres, where `/api/approve` can take them. The client never approves: a `plan_required` result names the stored plan, and approving it is a separate human action against this server.
 
 ### Storage
 
