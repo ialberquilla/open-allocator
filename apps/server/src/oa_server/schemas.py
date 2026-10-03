@@ -8,7 +8,7 @@ library adds or renames into a failure here rather than a silent gap on the page
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -101,6 +101,34 @@ class ExecuteReview(Strict):
     transactions: int
 
 
+class WithdrawReview(Strict):
+    kind: Literal["withdraw"]
+    account: str
+    instrument_id: str
+    protocol: str
+    chain_id: int
+    symbol: str
+    full_exit: bool
+    # None for a full exit asked without an amount.
+    requested_usd: float | None
+    # The position's value when the plan was built.
+    current_usd: float
+    # Yield-token shares sold, and the position's share balance, in token units.
+    shares: str
+    share_balance: str
+    share_symbol: str | None
+    # USDC the exit is quoted to pay out; None when it does not pay out in USDC.
+    expected_usdc: str | None
+    bundles: list[ReviewBundle]
+    funding: list[ReviewFunding]
+    notes: list[str]
+    blockers: list[str]
+    transactions: int
+
+
+Review = Annotated[ExecuteReview | WithdrawReview, Field(discriminator="kind")]
+
+
 class PlanSummary(BaseModel):
     plan_hash: str
     kind: str
@@ -112,7 +140,7 @@ class PlanSummary(BaseModel):
 class PlanResponse(PlanSummary):
     # What the approval would submit, read from the stored plan. None when the
     # stored plan cannot be described; `review_error` says why.
-    review: ExecuteReview | None
+    review: Review | None
     review_error: str | None
     plan: JsonObject
     used_at: datetime | None

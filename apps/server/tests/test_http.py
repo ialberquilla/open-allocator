@@ -15,12 +15,16 @@ from test_cli import (
     DEPOSIT_KINDS,
     ExecutionSignerSpy,
     install_execution_surface_mocks,
+    install_withdraw_surface_mocks,
     write_execution_files,
+    write_rebalance_files,
 )
 
 from oa_server.app import create_app
 from oa_server.auth import TOKEN_COOKIE
 from oa_server.settings import Settings
+from open_allocator.core.positions import Positions
+from open_allocator.exec import loops as loops_exec
 from open_allocator.service.plan_store import InMemoryPlanStore
 
 TOKEN = "test-token"
@@ -306,6 +310,39 @@ def test_an_mcp_proposal_runs_only_when_a_human_approves_it(
     # The signer's key never leaves the process.
     for response in (stored, approved, replayed):
         assert "11" * 32 not in response.text
+
+
+def test_an_mcp_withdrawal_is_reviewed_and_runs_on_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer: ExecutionSignerSpy = install_withdraw_surface_mocks(monkeypatch)
+    positions_path, _target, policy_path = write_rebalance_files(tmp_path)
+    book = Positions.model_validate_json(positions_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        loops_exec, "read_book", lambda _client, _address, _config=None: (book, [])
+    )
+    app = create_app(settings(policy_path), InMemoryPlanStore())
+
+    with TestClient(app, base_url=BASE_URL) as client:
+        proposal = McpSession(client).call_tool("withdraw", {"position": "vault-a"})
+        assert proposal["kind"] == "withdraw"
+        assert signer.sent == []
+        stored = client.get(f"/api/plans/{proposal['plan_hash']}", headers=authorized())
+        approved = client.post(
+            "/api/approve",
+            json={"plan_hash": proposal["plan_hash"]},
+            headers=authorized(Origin=BASE_URL),
+        )
+
+    assert stored.status_code == 200
+    assert stored.json()["review_error"] is None
+    review = stored.json()["review"]
+    assert (review["kind"], review["instrument_id"]) == ("withdraw", "vault-a")
+    assert review["full_exit"] is True
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["status"] == "success"
+    assert [getattr(sent[0], "kind") for sent in signer.sent] == ["withdraw"]
 
 
 def test_a_rejected_plan_never_runs(

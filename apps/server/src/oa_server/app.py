@@ -15,17 +15,18 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import TypeAdapter
 
 from oa_server import __version__
 from oa_server.approval import approve, plan_status, reject
 from oa_server.auth import LocalAccessMiddleware
 from oa_server.schemas import (
     ApproveResponse,
-    ExecuteReview,
     PlanHashRequest,
     PlanResponse,
     PlanSummary,
     RejectResponse,
+    Review,
 )
 from oa_server.settings import Settings
 from open_allocator.mcp import build_mcp
@@ -46,6 +47,8 @@ padding: 0 1rem; line-height: 1.5">
 <p>Run <code>make web</code> from the repository root, then reload.</p>
 </body></html>
 """
+
+_REVIEW: TypeAdapter[Review] = TypeAdapter(Review)
 
 # How a refused approval or rejection maps to HTTP.
 _APPROVAL_STATUS = {
@@ -106,10 +109,10 @@ def create_app(
         stored = plan_store.get(plan_hash)
         if stored is None:
             raise HTTPException(404, {"error": f"no plan {plan_hash}"})
-        review: ExecuteReview | None = None
+        review: Review | None = None
         review_error: str | None = None
         try:
-            review = ExecuteReview.model_validate(review_plan(stored.kind, stored.plan))
+            review = _REVIEW.validate_python(review_plan(stored.kind, stored.plan))
         except Exception as error:
             review_error = str(error)
         return PlanResponse(

@@ -14,6 +14,7 @@ from open_allocator.core.types import Vault
 from open_allocator.exec import execute as execute_exec
 from open_allocator.exec import gas as gas_module
 from open_allocator.exec import loops as loops_exec
+from open_allocator.exec import withdraw as withdraw_exec
 from open_allocator.exec.client import RewardsResponse
 from open_allocator.mcp import build_mcp
 from open_allocator.service import ServiceError
@@ -81,6 +82,7 @@ def test_tools_are_cli_commands_that_change_nothing() -> None:
         "build-allocation",
         "simulate",
         "execute",
+        "withdraw",
     }
     assert {tool.name for tool in tools} <= cli_inventory()
     for tool in tools:
@@ -374,13 +376,56 @@ def test_execute_links_to_the_approval_page_when_the_host_has_one(
     assert payload["approval_url"] == f"http://host/approve/{payload['plan_hash']}"
 
 
+def test_withdraw_stores_the_plan_for_approval_and_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = {"account": WALLET, "withdraw_plan": {"instrument_id": "vault-a"}}
+    report = {"status": "planned", "messages": ["dry-run only"]}
+
+    def fake_plan(position: str, **kwargs: Any) -> dict[str, Any]:
+        assert (position, kwargs["amount"]) == ("vault-a", 25.0)
+        kwargs["on_warning"]("loop unreadable")
+        return {
+            "kind": "withdraw",
+            "plan": document,
+            "plan_hash": plan_hash("withdraw", document),
+            "report": report,
+        }
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an execution tool applied a plan")
+
+    monkeypatch.setattr(execution_service, "plan_withdraw", fake_plan)
+    monkeypatch.setattr(execution_service, "apply_withdraw", refuse)
+    monkeypatch.setattr(withdraw_exec, "apply_withdrawal_plan", refuse)
+    store = InMemoryPlanStore()
+
+    result = anyio.run(
+        build_mcp(store).call_tool,
+        "withdraw",
+        {"position": "vault-a", "amount": 25},
+    )
+
+    payload = result.structured_content
+    assert payload["plan_required"] is True
+    assert payload["kind"] == "withdraw"
+    assert payload["plan_hash"] == plan_hash("withdraw", document)
+    assert payload["plan"] == report
+    assert payload["warnings"] == ["loop unreadable"]
+    stored = store.get(payload["plan_hash"])
+    assert stored is not None and stored.used_at is None
+    assert stored.plan == document
+
+
 def test_nothing_in_the_mcp_adapter_can_apply_a_plan() -> None:
     source = Path(mcp_module.__file__).read_text(encoding="utf-8")
 
     for name in (
         "apply_execute",
+        "apply_withdraw",
         "apply_approved",
         "apply_allocation_plan",
+        "apply_withdrawal_plan",
         "take(",
         "reject(",
     ):

@@ -8,7 +8,15 @@ import { Cell, Table } from "@/components/Table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { ApiError, api, type ExecuteReview, type PlanResponse, type ReviewBundle } from "@/lib/api";
+import {
+  ApiError,
+  api,
+  type ExecuteReview,
+  type PlanResponse,
+  type Review as PlanReview,
+  type ReviewBundle,
+  type WithdrawReview,
+} from "@/lib/api";
 import { addressUrl, chainName, txUrl } from "@/lib/chains";
 import { countdown, dateTime, label, shortHash, tokenAmount, usd } from "@/lib/format";
 
@@ -93,7 +101,8 @@ export function Approve({ hash }: { hash: string }) {
         {pending && (
           <p className="max-w-2xl text-sm text-muted-foreground">
             This is the stored plan, read by the server, not the model's description of it. Approving sends exactly
-            these transactions after the server re-checks it against your policy.
+            these transactions
+            {plan.kind === "withdraw" ? "." : " after the server re-checks it against your policy."}
           </p>
         )}
       </header>
@@ -173,23 +182,16 @@ export function Approve({ hash }: { hash: string }) {
   );
 }
 
-function Review({ review }: { review: ExecuteReview }) {
+function Review({ review }: { review: PlanReview }) {
+  return review.kind === "withdraw" ? <WithdrawDetails review={review} /> : <ExecuteDetails review={review} />;
+}
+
+function ExecuteDetails({ review }: { review: ExecuteReview }) {
   const chains = [...new Set(review.bundles.map((bundle) => bundle.chain_id))];
   const unfunded = review.funding.filter((item) => !item.ok);
   return (
     <>
-      {review.blockers.length > 0 && (
-        <Notice tone="destructive">
-          <p className="mb-2 flex items-center gap-2 font-semibold">
-            <AlertTriangle className="size-4" /> Blockers
-          </p>
-          <ul className="list-disc space-y-1 pl-5">
-            {review.blockers.map((blocker) => (
-              <li key={blocker}>{blocker}</li>
-            ))}
-          </ul>
-        </Notice>
-      )}
+      <Blockers blockers={review.blockers} />
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatTile label="Deposits" value={usd(review.deposit_usd)} sub={`target ${usd(review.target_usd)}`} />
@@ -203,12 +205,7 @@ function Review({ review }: { review: ExecuteReview }) {
         />
       </div>
 
-      <Card>
-        <CardHeader title="Account" />
-        <CardContent>
-          <Address chainId={review.bundles[0]?.chain_id} address={review.account} />
-        </CardContent>
-      </Card>
+      <AccountCard chainId={review.bundles[0]?.chain_id} address={review.account} />
 
       <Card>
         <CardHeader
@@ -256,57 +253,156 @@ function Review({ review }: { review: ExecuteReview }) {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader
-          title="Transactions"
-          description="Each bundle is submitted atomically, in this order. Amounts are the plan's own quotes."
-        />
-        <CardContent>
-          <Table head={["Action", "Chain", "Instrument", "Spends", "Expected", "Steps"]} minWidth={760}>
-            {review.bundles.map((bundle) => (
-              <BundleRow key={bundle.bundle_id} bundle={bundle} />
-            ))}
-          </Table>
-        </CardContent>
-      </Card>
+      <Transactions bundles={review.bundles} />
 
       {review.loops.length > 0 && <Loops loops={review.loops} />}
 
+      <Funding funding={review.funding} />
+
+      <Notes notes={review.notes} />
+    </>
+  );
+}
+
+function WithdrawDetails({ review }: { review: WithdrawReview }) {
+  const unfunded = review.funding.filter((item) => !item.ok);
+  const shares = `${review.shares} ${review.share_symbol ?? "shares"}`;
+  return (
+    <>
+      <Blockers blockers={review.blockers} />
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatTile
+          label={review.full_exit ? "Full exit" : "Withdraw"}
+          value={usd(review.full_exit ? review.current_usd : review.requested_usd)}
+          sub={`of ${usd(review.current_usd)} held`}
+        />
+        <StatTile
+          label="Expected USDC"
+          value={review.expected_usdc ?? "unknown"}
+          sub="quoted when planned"
+        />
+        <StatTile label="Chain" value={chainName(review.chain_id)} sub={`${review.transactions} transaction${review.transactions === 1 ? "" : "s"}`} />
+        <StatTile
+          label="Shares"
+          value={unfunded.length === 0 ? "Held" : "Short"}
+          tone={unfunded.length === 0 ? "success" : "destructive"}
+          sub={unfunded.length === 0 ? "balances read at planning" : `${unfunded.length} shortfall(s)`}
+        />
+      </div>
+
+      <AccountCard chainId={review.chain_id} address={review.account} />
+
       <Card>
-        <CardHeader title="Funding" description="Balances read when the plan was built." />
+        <CardHeader title="Position" description="What the plan sells, against the balance held when it was built." />
         <CardContent>
-          <Table head={["Chain", "Required", "Available", "Shortfall", ""]} minWidth={560}>
-            {review.funding.map((item, index) => (
-              <tr key={index}>
-                <Cell>{chainName(item.chain_id)}</Cell>
-                <Cell numeric>
-                  {tokenAmount(item.required)}
-                  {item.includes_gas_charge && <span className="ml-1 text-xs text-muted-foreground">incl. gas</span>}
-                </Cell>
-                <Cell numeric>{item.available ? tokenAmount(item.available) : "unknown"}</Cell>
-                <Cell numeric className={item.ok ? "text-muted-foreground" : "text-destructive"}>
-                  {tokenAmount(item.shortfall)}
-                </Cell>
-                <Cell>{item.ok ? <Badge variant="success">ok</Badge> : <Badge variant="destructive">short</Badge>}</Cell>
-              </tr>
-            ))}
+          <Table head={["Instrument", "Protocol", "Asset", "Sells", "Of balance"]} minWidth={560}>
+            <tr>
+              <Cell className="font-mono text-xs">{review.instrument_id}</Cell>
+              <Cell>{review.protocol}</Cell>
+              <Cell>{review.symbol}</Cell>
+              <Cell numeric>{shares}</Cell>
+              <Cell numeric className="text-muted-foreground">
+                {review.share_balance}
+              </Cell>
+            </tr>
           </Table>
         </CardContent>
       </Card>
 
-      {review.notes.length > 0 && (
-        <Card>
-          <CardHeader title="Notes" description="Sizing and routing decisions made while planning." />
-          <CardContent>
-            <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
-              {review.notes.map((note, index) => (
-                <li key={index}>{note}</li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-      )}
+      <Transactions bundles={review.bundles} />
+
+      <Funding funding={review.funding} />
+
+      <Notes notes={review.notes} />
     </>
+  );
+}
+
+function Blockers({ blockers }: { blockers: string[] }) {
+  if (blockers.length === 0) return null;
+  return (
+    <Notice tone="destructive">
+      <p className="mb-2 flex items-center gap-2 font-semibold">
+        <AlertTriangle className="size-4" /> Blockers
+      </p>
+      <ul className="list-disc space-y-1 pl-5">
+        {blockers.map((blocker) => (
+          <li key={blocker}>{blocker}</li>
+        ))}
+      </ul>
+    </Notice>
+  );
+}
+
+function AccountCard({ chainId, address }: { chainId: number | undefined; address: string }) {
+  return (
+    <Card>
+      <CardHeader title="Account" />
+      <CardContent>
+        <Address chainId={chainId} address={address} />
+      </CardContent>
+    </Card>
+  );
+}
+
+function Transactions({ bundles }: { bundles: ReviewBundle[] }) {
+  return (
+    <Card>
+      <CardHeader
+        title="Transactions"
+        description="Each bundle is submitted atomically, in this order. Amounts are the plan's own quotes."
+      />
+      <CardContent>
+        <Table head={["Action", "Chain", "Instrument", "Spends", "Expected", "Steps"]} minWidth={760}>
+          {bundles.map((bundle) => (
+            <BundleRow key={bundle.bundle_id} bundle={bundle} />
+          ))}
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+function Funding({ funding }: { funding: ExecuteReview["funding"] }) {
+  return (
+    <Card>
+      <CardHeader title="Funding" description="Balances read when the plan was built." />
+      <CardContent>
+        <Table head={["Chain", "Required", "Available", "Shortfall", ""]} minWidth={560}>
+          {funding.map((item, index) => (
+            <tr key={index}>
+              <Cell>{chainName(item.chain_id)}</Cell>
+              <Cell numeric>
+                {tokenAmount(item.required)}
+                {item.includes_gas_charge && <span className="ml-1 text-xs text-muted-foreground">incl. gas</span>}
+              </Cell>
+              <Cell numeric>{item.available ? tokenAmount(item.available) : "unknown"}</Cell>
+              <Cell numeric className={item.ok ? "text-muted-foreground" : "text-destructive"}>
+                {tokenAmount(item.shortfall)}
+              </Cell>
+              <Cell>{item.ok ? <Badge variant="success">ok</Badge> : <Badge variant="destructive">short</Badge>}</Cell>
+            </tr>
+          ))}
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+function Notes({ notes }: { notes: string[] }) {
+  if (notes.length === 0) return null;
+  return (
+    <Card>
+      <CardHeader title="Notes" description="Sizing and routing decisions made while planning." />
+      <CardContent>
+        <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+          {notes.map((note, index) => (
+            <li key={index}>{note}</li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
   );
 }
 

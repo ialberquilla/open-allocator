@@ -366,6 +366,37 @@ def build_mcp(
         )
         return {**_proposed(proposal), "warnings": warnings}
 
+    @server.tool(name="withdraw", annotations=READ_ONLY)
+    def withdraw(
+        position: Annotated[
+            str,
+            Field(description="Instrument id of a position in the signer's book."),
+        ],
+        amount: Annotated[
+            float | None,
+            Field(
+                gt=0,
+                description="USD to withdraw. Omit, or pass at least the position's "
+                "value, for a full exit.",
+            ),
+        ] = None,
+    ) -> JsonObject:
+        """Plan a withdrawal from one position into USDC and submit the plan for
+        human approval. Broadcasts nothing. Levered loops are refused: they are
+        unwound by a loop close. Returns `plan_required: true`, the `plan_hash` a
+        human approves, `expires_at`, and `plan`: the dry-run report (shares sold,
+        expected USDC, steps, funding, blockers), and `approval_url` when the server
+        has an approval page. Show the plan and its blockers and give the user the
+        link; only the user can approve it, outside this conversation."""
+        warnings: list[str] = []
+        proposal = _call(
+            execution_service.plan_withdraw,
+            position,
+            amount=amount,
+            on_warning=warnings.append,
+        )
+        return {**_proposed(proposal), "warnings": warnings}
+
     return server
 
 

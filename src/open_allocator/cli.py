@@ -287,12 +287,7 @@ def _withdraw_scope(
     *,
     amount: float | None,
 ) -> str:
-    payload = {
-        "position": position.model_dump(mode="json"),
-        "amount": amount,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return execution_service.withdraw_scope(position, amount=amount)
 
 
 def _execute_allocation_from_cli(
@@ -504,19 +499,7 @@ def _select_position(
     source: positions_core.Positions | positions_core.PositionHolding,
     position_id: str,
 ) -> positions_core.PositionHolding:
-    if isinstance(source, positions_core.PositionHolding):
-        if source.instrument_id != position_id:
-            raise ValueError(f"position not found: {position_id}")
-        return source
-
-    matches = [
-        holding for holding in source.holdings if holding.instrument_id == position_id
-    ]
-    if not matches:
-        raise ValueError(f"position not found: {position_id}")
-    if len(matches) > 1:
-        raise ValueError(f"position id is ambiguous: {position_id}")
-    return matches[0]
+    return execution_service.select_position(source, position_id)
 
 
 def _parse_pins(pins: list[str] | None) -> dict[str, float] | None:

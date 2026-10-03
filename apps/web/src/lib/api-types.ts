@@ -117,8 +117,8 @@ export interface components {
         /** ExecuteReview */
         ExecuteReview: {
             /**
-             * Kind
-             * @constant
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
              */
             kind: "execute";
             /** Account */
@@ -176,7 +176,8 @@ export interface components {
              * Format: date-time
              */
             expires_at: string;
-            review: components["schemas"]["ExecuteReview"] | null;
+            /** Review */
+            review: (components["schemas"]["ExecuteReview"] | components["schemas"]["WithdrawReview"]) | null;
             /** Review Error */
             review_error: string | null;
             /** Plan */
@@ -319,6 +320,48 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /** WithdrawReview */
+        WithdrawReview: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "withdraw";
+            /** Account */
+            account: string;
+            /** Instrument Id */
+            instrument_id: string;
+            /** Protocol */
+            protocol: string;
+            /** Chain Id */
+            chain_id: number;
+            /** Symbol */
+            symbol: string;
+            /** Full Exit */
+            full_exit: boolean;
+            /** Requested Usd */
+            requested_usd: number | null;
+            /** Current Usd */
+            current_usd: number;
+            /** Shares */
+            shares: string;
+            /** Share Balance */
+            share_balance: string;
+            /** Share Symbol */
+            share_symbol: string | null;
+            /** Expected Usdc */
+            expected_usdc: string | null;
+            /** Bundles */
+            bundles: components["schemas"]["ReviewBundle"][];
+            /** Funding */
+            funding: components["schemas"]["ReviewFunding"][];
+            /** Notes */
+            notes: string[];
+            /** Blockers */
+            blockers: string[];
+            /** Transactions */
+            transactions: number;
         };
     };
     responses: never;

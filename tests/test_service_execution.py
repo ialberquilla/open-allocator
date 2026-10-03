@@ -9,11 +9,16 @@ import pytest
 from test_cli import (
     DEPOSIT_KINDS,
     ExecutionOneTxClient,
+    WithdrawOneTxClient,
     execution_policy,
     install_execution_surface_mocks,
+    install_withdraw_surface_mocks,
     write_execution_files,
+    write_rebalance_files,
 )
 
+from open_allocator.core.positions import Positions
+from open_allocator.exec import loops as loops_exec
 from open_allocator.exec.execute import TransactionPlanError
 from open_allocator.service import ServiceError
 from open_allocator.service import execution as execution_service
@@ -244,3 +249,146 @@ def test_a_rejected_plan_cannot_be_approved() -> None:
         execution_service.apply_approved(store, stored.plan_hash)
 
     assert approved.value.code == "plan_used"
+
+
+def planned_withdrawal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    amount: float | None = None,
+) -> dict[str, Any]:
+    positions_path, _target, policy_path = write_rebalance_files(tmp_path)
+    book = Positions.model_validate_json(positions_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        loops_exec, "read_book", lambda _client, _address, _config=None: (book, [])
+    )
+    proposal = execution_service.plan_withdraw(
+        "vault-a", amount=amount, policy=policy_path
+    )
+    return json.loads(json.dumps(proposal))
+
+
+def test_a_withdrawal_plan_is_the_dry_run_and_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_withdraw_surface_mocks(monkeypatch)
+
+    proposal = planned_withdrawal(monkeypatch, tmp_path)
+
+    assert proposal["kind"] == "withdraw"
+    assert proposal["plan_hash"] == plan_hash("withdraw", proposal["plan"])
+    assert proposal["report"]["status"] == "planned"
+    assert proposal["report"]["plan"] == proposal["plan"]["plan"]
+    assert proposal["plan"]["withdraw_plan"]["instrument_id"] == "vault-a"
+    assert signer.sent == []
+
+
+def test_an_unknown_position_is_not_planned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_withdraw_surface_mocks(monkeypatch)
+    positions_path, _target, policy_path = write_rebalance_files(tmp_path)
+    book = Positions.model_validate_json(positions_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        loops_exec, "read_book", lambda _client, _address, _config=None: (book, [])
+    )
+
+    with pytest.raises(ServiceError) as raised:
+        execution_service.plan_withdraw("vault-z", policy=policy_path)
+
+    assert raised.value.code == "not_found"
+    assert WithdrawOneTxClient.calls == []
+
+
+def test_an_approved_withdrawal_runs_the_stored_plan_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_withdraw_surface_mocks(
+        monkeypatch, idempotency_store_path=tmp_path / "idempotency.json"
+    )
+    store = InMemoryPlanStore()
+    response = execution_service.propose(
+        store, planned_withdrawal(monkeypatch, tmp_path)
+    )
+    WithdrawOneTxClient.calls = []
+
+    # A withdrawal has no policy re-check: an exit is never refused for it.
+    report = execution_service.apply_approved(
+        store, response["plan_hash"], policy=tmp_path / "missing.yaml"
+    )
+    with pytest.raises(ServiceError) as again:
+        execution_service.apply_approved(store, response["plan_hash"])
+
+    assert report["status"] == "success"
+    assert [getattr(sent[0], "kind") for sent in signer.sent] == ["withdraw"]
+    assert WithdrawOneTxClient.calls == []
+    assert again.value.code == "plan_used"
+
+
+def test_a_withdrawal_sent_since_it_was_planned_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_withdraw_surface_mocks(
+        monkeypatch, idempotency_store_path=tmp_path / "idempotency.json"
+    )
+    proposal = planned_withdrawal(monkeypatch, tmp_path)
+    execution_service.apply_withdraw(proposal["plan"])
+    sent = len(signer.sent)
+
+    with pytest.raises(TransactionPlanError, match="stale"):
+        execution_service.apply_withdraw(
+            proposal["plan"], expected_hash=proposal["plan_hash"]
+        )
+
+    assert len(signer.sent) == sent
+
+
+def test_a_tampered_withdrawal_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    signer = install_withdraw_surface_mocks(monkeypatch)
+    proposal = planned_withdrawal(monkeypatch, tmp_path)
+    tampered = json.loads(json.dumps(proposal["plan"]))
+    tampered["account"] = "0x" + "22" * 20
+
+    with pytest.raises(ServiceError) as raised:
+        execution_service.apply_withdraw(tampered, expected_hash=proposal["plan_hash"])
+    with pytest.raises(TransactionPlanError, match="built for"):
+        execution_service.apply_withdraw(tampered)
+
+    assert raised.value.code == "plan_mismatch"
+    assert signer.sent == []
+
+
+def test_a_withdrawal_review_describes_the_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_withdraw_surface_mocks(monkeypatch)
+    proposal = planned_withdrawal(monkeypatch, tmp_path, amount=30)
+
+    review = execution_service.review_plan("withdraw", proposal["plan"])
+
+    assert review["kind"] == "withdraw"
+    assert review["account"] == proposal["plan"]["account"]
+    assert (review["instrument_id"], review["chain_id"]) == ("vault-a", 8453)
+    assert review["full_exit"] is False
+    assert (review["requested_usd"], review["current_usd"]) == (30.0, 80.0)
+    assert review["shares"] == "30"
+    assert review["share_symbol"] == "aUSDC"
+    (bundle,) = review["bundles"]
+    assert bundle["action"] == "withdraw"
+    assert bundle["steps"] == ["withdraw"]
+    # A partial exit's calldata amount is in the underlying, not the yield token.
+    assert bundle["amount_in"] == {
+        "raw": "30000000",
+        "amount": "30",
+        "symbol": "USDC",
+        "token": None,
+    }
+    assert review["transactions"] == 1

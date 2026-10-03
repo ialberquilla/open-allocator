@@ -26,7 +26,7 @@ Tools are named after the CLI commands and return the same objects, with these d
 - Arguments are typed values, not CLI strings: `pins` and `strategy_params` are objects, `spec` is an allocation-spec object rather than a path. `policy_path` is still a path, resolved against the server's working directory.
 - Errors come back as `{"error": ..., "code": ...}` in the tool result; `code` is present for `ServiceError`.
 
-Exposed tools: `wallet-status`, `safe-address`, `positions`, `rewards`, `list-vaults`, `score-vault`, `screen`, `build-allocation`, `simulate`, `execute`. None of them changes anything on chain.
+Exposed tools: `wallet-status`, `safe-address`, `positions`, `rewards`, `list-vaults`, `score-vault`, `screen`, `build-allocation`, `simulate`, `execute`, `withdraw`. None of them changes anything on chain.
 
 ## Plans and approval
 
@@ -35,8 +35,9 @@ Execution is split in the service layer (`open_allocator.service.execution`):
 - `plan_execute(allocation, policy=...)` discovers, policy-checks, sizes and prepares the deposits and sends nothing. It returns `{kind, plan, plan_hash, report}`. `plan` is a complete `AllocationPlan` (`exec/allocation_plan.py`), `plan_hash` is sha256 over the canonical JSON of the kind and plan, and `report` is the dry run `execute` prints without `--confirm`.
 - `apply_execute(plan, expected_hash=...)` executes that plan as it stands. It never discovers, sizes or plans again. It refuses a plan that does not match the hash, a plan built for another signer, and a plan the wallet has moved past (a leg sent or bridging since it was built). Calldata close to expiry is re-quoted for the same leg, account and amount just before signing, as on the CLI.
 - `execute --confirm` runs plan then apply in one process. Its output is unchanged.
+- `plan_withdraw(position, amount=...)` reads the signer's book live, picks the position by instrument id and plans its exit (a full exit when `amount` is omitted or at least the position's value). `plan` is a `WithdrawalPlan` (`exec/withdraw.py`): the position and amount it was planned from, the withdraw and sell details, the bundle and its preparation. `apply_withdraw(plan, expected_hash=...)` executes it as it stands and refuses a plan for another signer or one whose withdrawal was sent since it was built. `withdraw --confirm` is plan then apply, output unchanged.
 
-The MCP `execute` tool takes the `allocation` object from `build-allocation`. It calls `plan_execute`, stores the plan in a `PlanStore` (`service/plan_store.py`) and returns:
+The MCP `execute` tool takes the `allocation` object from `build-allocation`; `withdraw` takes a `position` instrument id and an optional USD `amount`. Each calls its `plan_*`, stores the plan in a `PlanStore` (`service/plan_store.py`) and returns:
 
 ```json
 {"plan_required": true, "kind": "execute", "plan_hash": "…", "expires_at": "…", "plan": {"status": "planned", …}, "approval_url": "http://127.0.0.1:8787/approve/…", "warnings": []}
@@ -44,13 +45,13 @@ The MCP `execute` tool takes the `allocation` object from `build-allocation`. It
 
 `approval_url` is present when the host serves an approval page (`build_mcp(store, approval_url=...)`); the stdio server has none.
 
-Nothing in the MCP adapter can apply or reject a plan. `apply_approved(store, plan_hash, policy=...)` is the approval entry point for a human-facing surface (the local server's Approve route). It marks the stored plan used before anything else, so a plan runs at most once, and refuses unknown (`plan_not_found`), expired (`plan_expired`, 15 minutes by default) or used (`plan_used`) plans, and a stored plan that no longer hashes to the approved hash (`plan_mismatch`). With `policy`, it then re-checks the plan's allocation against that policy on today's shelf (`recheck_execute_policy`) and refuses on a violation (`policy_violation`). A refused or failed approval leaves the plan used: plan again. `reject(store, plan_hash)` retires a plan without applying it, with the same refusals.
+Nothing in the MCP adapter can apply or reject a plan. `apply_approved(store, plan_hash, policy=...)` is the approval entry point for a human-facing surface (the local server's Approve route). It marks the stored plan used before anything else, so a plan runs at most once, and refuses unknown (`plan_not_found`), expired (`plan_expired`, 15 minutes by default) or used (`plan_used`) plans, and a stored plan that no longer hashes to the approved hash (`plan_mismatch`). With `policy`, it then re-checks an `execute` plan's allocation against that policy on today's shelf (`recheck_execute_policy`) and refuses on a violation (`policy_violation`). A `withdraw` plan has no re-check: the policy bounds what is entered, and an exit is never refused for it. A refused or failed approval leaves the plan used: plan again. `reject(store, plan_hash)` retires a plan without applying it, with the same refusals.
 
-`review_plan(kind, plan)` describes a stored plan for the person approving it, from the plan alone: account, legs (target and planned USD), bundles in submission order (action, chain, amounts in token units, step kinds, quote expiry, bridge), loops, funding against balances read at planning, the policy result, notes and blockers.
+`review_plan(kind, plan)` describes a stored plan for the person approving it, from the plan alone. For `execute`: account, legs (target and planned USD), bundles in submission order (action, chain, amounts in token units, step kinds, quote expiry, bridge), loops, funding against balances read at planning, the policy result, notes and blockers. For `withdraw`: account, position, full or partial exit, requested and current USD, shares sold against the share balance, expected USDC, the bundle (a partial exit's amount in the underlying asset, which is how 1Tx takes it), funding (shares held), notes and blockers. The server's `review` is a union discriminated on `kind` (`ExecuteReview`, `WithdrawReview`).
 
-The stdio server keeps plans in memory and has no approval surface. Over stdio, approve by running `execute --confirm` yourself.
+The stdio server keeps plans in memory and has no approval surface. Over stdio, approve by running `execute --confirm` or `withdraw --confirm` yourself.
 
-Not yet split: `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`.
+Not yet split: `rebalance`, `loop-open`, `loop-close`, `bridge`.
 
 ## Local server (`apps/server`)
 

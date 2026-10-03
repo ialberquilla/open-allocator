@@ -15,9 +15,11 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from open_allocator.core import positions as positions_core
 from open_allocator.core.policy_loader import load_policy
 from open_allocator.core.state import ScopedIdempotencyStore, backend_from_config
-from open_allocator.core.types import Allocation, BundleToken, Policy
+from open_allocator.core.types import Allocation, BundleToken, Policy, TxBundle, TxStep
+from open_allocator.core.withdraw import WithdrawPlan
 from open_allocator.exec.allocation_plan import AllocationPlan
 from open_allocator.exec.client import OneTxClient
 from open_allocator.exec.config import AllocatorConfig
@@ -29,13 +31,25 @@ from open_allocator.exec.execute import (
     plan_allocation,
 )
 from open_allocator.exec.funding import FundingRequirement
-from open_allocator.service._common import JsonObject, model_payload, signer_from_config
+from open_allocator.exec.withdraw import (
+    WithdrawalPlan,
+    apply_withdrawal_plan,
+    plan_withdrawal,
+)
+from open_allocator.exec.withdraw import dry_run_report as withdraw_dry_run_report
+from open_allocator.service._common import (
+    JsonObject,
+    model_payload,
+    signer_address,
+    signer_from_config,
+)
 from open_allocator.service.allocation import DEFAULT_POLICY_PATH, parse_allocation
 from open_allocator.service.errors import ServiceError
 from open_allocator.service.plan_store import PlanStore, plan_hash
 from open_allocator.service.universe import OnWarning, discover_vaults_from_client
 
 EXECUTE = "execute"
+WITHDRAW = "withdraw"
 
 
 def idempotency_store(config: object, scope: str) -> ScopedIdempotencyStore | None:
@@ -54,6 +68,16 @@ def idempotency_store(config: object, scope: str) -> ScopedIdempotencyStore | No
 
 def allocation_scope(allocation: Allocation) -> str:
     payload = allocation.model_dump(mode="json")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def withdraw_scope(
+    position: positions_core.PositionHolding,
+    *,
+    amount: float | str | None,
+) -> str:
+    payload = {"position": position.model_dump(mode="json"), "amount": amount}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -235,6 +259,39 @@ def _funding(item: FundingRequirement, token: BundleToken | None) -> JsonObject:
     }
 
 
+def _tokens(bundles: tuple[TxBundle, ...]) -> dict[tuple[int, str], BundleToken]:
+    """Every token the bundles move, by chain and lowercased address."""
+    tokens: dict[tuple[int, str], BundleToken] = {}
+    for bundle in bundles:
+        for token in (bundle.token_in, bundle.token_out):
+            tokens.setdefault((bundle.chain_id, token.address.lower()), token)
+    return tokens
+
+
+def _bundle(bundle: TxBundle, steps: tuple[TxStep, ...]) -> JsonObject:
+    return {
+        "bundle_id": bundle.bundle_id,
+        "leg_index": bundle.leg_index,
+        "instrument_id": bundle.instrument_id,
+        "action": bundle.action,
+        "chain_id": bundle.chain_id,
+        "amount_in": _token_amount(bundle.amount, bundle.token_in),
+        "expected_out": _token_amount(bundle.expected_out, bundle.token_out),
+        "min_out": _token_amount(bundle.min_out, bundle.token_out),
+        "steps": [steps[index].kind for index in bundle.step_indexes],
+        "expires_at": bundle.expires_at,
+        "bridge": (
+            None
+            if bundle.bridge is None
+            else {
+                "to_chain_id": bundle.bridge.to_chain_id,
+                "fast": bundle.bridge.fast,
+                "max_fee": _token_amount(bundle.bridge.max_fee, bundle.token_in),
+            }
+        ),
+    }
+
+
 def review_execute(plan: AllocationPlan | Mapping[str, Any]) -> JsonObject:
     """What a person approving a stored `execute` plan reads, from the plan alone.
 
@@ -247,10 +304,7 @@ def review_execute(plan: AllocationPlan | Mapping[str, Any]) -> JsonObject:
         else AllocationPlan.model_validate(plan)
     )
     bundles = planned.plan.bundles
-    tokens: dict[tuple[int, str], BundleToken] = {}
-    for bundle in bundles:
-        for token in (bundle.token_in, bundle.token_out):
-            tokens.setdefault((bundle.chain_id, token.address.lower()), token)
+    tokens = _tokens(bundles)
     for chain_id, deposit_token in planned.deposit_tokens.items():
         tokens.setdefault(
             (chain_id, deposit_token.address.lower()),
@@ -278,32 +332,7 @@ def review_execute(plan: AllocationPlan | Mapping[str, Any]) -> JsonObject:
             }
             for index, leg in enumerate(planned.allocation.legs)
         ],
-        "bundles": [
-            {
-                "bundle_id": bundle.bundle_id,
-                "leg_index": bundle.leg_index,
-                "instrument_id": bundle.instrument_id,
-                "action": bundle.action,
-                "chain_id": bundle.chain_id,
-                "amount_in": _token_amount(bundle.amount, bundle.token_in),
-                "expected_out": _token_amount(bundle.expected_out, bundle.token_out),
-                "min_out": _token_amount(bundle.min_out, bundle.token_out),
-                "steps": [steps[index].kind for index in bundle.step_indexes],
-                "expires_at": bundle.expires_at,
-                "bridge": (
-                    None
-                    if bundle.bridge is None
-                    else {
-                        "to_chain_id": bundle.bridge.to_chain_id,
-                        "fast": bundle.bridge.fast,
-                        "max_fee": _token_amount(
-                            bundle.bridge.max_fee, bundle.token_in
-                        ),
-                    }
-                ),
-            }
-            for bundle in bundles
-        ],
+        "bundles": [_bundle(bundle, steps) for bundle in bundles],
         "loops": [loop.model_dump(mode="json") for loop in planned.loops],
         "funding": [
             _funding(item, tokens.get((item.chain_id, item.token.lower())))
@@ -311,6 +340,164 @@ def review_execute(plan: AllocationPlan | Mapping[str, Any]) -> JsonObject:
         ],
         "policy": planned.policy_result.model_dump(mode="json"),
         "notes": [*planned.messages, *preparation.messages],
+        "blockers": list(preparation.blockers),
+        "transactions": len(steps),
+    }
+
+
+def select_position(
+    source: positions_core.Positions | positions_core.PositionHolding,
+    position_id: str,
+) -> positions_core.PositionHolding:
+    """The one holding of `source` with instrument id `position_id`."""
+    if isinstance(source, positions_core.PositionHolding):
+        if source.instrument_id != position_id:
+            raise ServiceError("not_found", f"position not found: {position_id}")
+        return source
+    matches = [
+        holding for holding in source.holdings if holding.instrument_id == position_id
+    ]
+    if not matches:
+        raise ServiceError("not_found", f"position not found: {position_id}")
+    if len(matches) > 1:
+        raise ServiceError("invalid_input", f"position id is ambiguous: {position_id}")
+    return matches[0]
+
+
+def plan_withdraw(
+    position: str,
+    *,
+    amount: float | None = None,
+    policy: Policy | Path = DEFAULT_POLICY_PATH,
+    on_warning: Callable[[str], None] | None = None,
+) -> JsonObject:
+    """`{"kind", "plan", "plan_hash", "report"}` for withdrawing `position`.
+
+    `position` is an instrument id in the signer's current book, read live.
+    `amount` is in USD; omitted, or at least the position's value, it is a full
+    exit. Sends nothing; `report` is the dry run `withdraw` prints.
+    """
+    policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    from open_allocator.exec import loops as loops_exec
+
+    with OneTxClient(config) as client:
+        book, warnings = loops_exec.read_book(client, signer_address(config), config)
+        if on_warning is not None:
+            for warning in warnings:
+                on_warning(warning)
+        holding = select_position(book, position)
+        planned = plan_withdrawal(
+            client,
+            signer,  # type: ignore[arg-type]
+            holding,
+            policy_model,
+            amount,
+            config=config,
+            # Read only: a withdrawal already sent is not planned again.
+            idempotency_store=idempotency_store(
+                config, withdraw_scope(holding, amount=amount)
+            ),
+        )
+    document = planned.model_dump(mode="json")
+    return {
+        "kind": WITHDRAW,
+        "plan": document,
+        "plan_hash": plan_hash(WITHDRAW, document),
+        "report": model_payload(withdraw_dry_run_report(planned)),
+    }
+
+
+def apply_withdraw(
+    plan: WithdrawalPlan | Mapping[str, Any],
+    *,
+    expected_hash: str | None = None,
+) -> JsonObject:
+    """Execute a plan from `plan_withdraw` exactly; the withdraw report payload.
+
+    With `expected_hash`, a plan that does not hash to it is refused before
+    anything is read or sent.
+    """
+    document = (
+        plan.model_dump(mode="json") if isinstance(plan, WithdrawalPlan) else dict(plan)
+    )
+    if expected_hash is not None and plan_hash(WITHDRAW, document) != expected_hash:
+        raise ServiceError(
+            "plan_mismatch", "the plan does not match the approved plan hash"
+        )
+    planned = (
+        plan
+        if isinstance(plan, WithdrawalPlan)
+        else WithdrawalPlan.model_validate(document)
+    )
+    config = AllocatorConfig()
+    signer = signer_from_config(config)
+    with OneTxClient(config) as client:
+        report = apply_withdrawal_plan(
+            client,
+            signer,  # type: ignore[arg-type]
+            planned,
+            config=config,
+            idempotency_store=idempotency_store(
+                config, withdraw_scope(planned.position, amount=planned.amount)
+            ),
+        )
+    return model_payload(report)
+
+
+def _withdraw_bundle(
+    bundle: TxBundle, steps: tuple[TxStep, ...], exit_plan: WithdrawPlan
+) -> JsonObject:
+    """A withdraw bundle, its amount in the underlying asset it is denominated in.
+
+    1Tx takes a partial withdrawal's amount in raw underlying units, not in the
+    yield token the bundle spends; `max` is the whole position either way.
+    """
+    reviewed = _bundle(bundle, steps)
+    decimals = exit_plan.underlying_decimals
+    if bundle.amount != "max" and decimals is not None:
+        reviewed["amount_in"] = {
+            "raw": bundle.amount,
+            "amount": format(Decimal(bundle.amount).scaleb(-decimals).normalize(), "f"),
+            "symbol": exit_plan.symbol,
+            "token": None,
+        }
+    return reviewed
+
+
+def review_withdraw(plan: WithdrawalPlan | Mapping[str, Any]) -> JsonObject:
+    """What a person approving a stored `withdraw` plan reads, from the plan alone."""
+    planned = (
+        plan
+        if isinstance(plan, WithdrawalPlan)
+        else WithdrawalPlan.model_validate(plan)
+    )
+    exit_plan = planned.withdraw_plan
+    bundles = planned.plan.bundles
+    tokens = _tokens(bundles)
+    steps = planned.plan.steps
+    preparation = planned.preparation
+    return {
+        "kind": WITHDRAW,
+        "account": planned.account,
+        "instrument_id": exit_plan.instrument_id,
+        "protocol": exit_plan.protocol,
+        "chain_id": exit_plan.chain_id,
+        "symbol": exit_plan.symbol,
+        "full_exit": exit_plan.full_exit,
+        "requested_usd": exit_plan.requested_usd,
+        "current_usd": exit_plan.current_usd,
+        "shares": exit_plan.yield_token_amount,
+        "share_balance": exit_plan.share_balance,
+        "share_symbol": exit_plan.yield_token_symbol,
+        "expected_usdc": planned.sell.expected_usdc,
+        "bundles": [_withdraw_bundle(bundle, steps, exit_plan) for bundle in bundles],
+        "funding": [
+            _funding(item, tokens.get((item.chain_id, item.token.lower())))
+            for item in preparation.funding
+        ],
+        "notes": list(preparation.messages),
         "blockers": list(preparation.blockers),
         "transactions": len(steps),
     }
@@ -325,10 +512,17 @@ def review_plan(kind: str, plan: Mapping[str, Any]) -> JsonObject:
 
 
 # What applies each kind of stored plan, re-checks its policy first, and
-# describes it to the person approving it.
-_APPLY: dict[str, Callable[..., JsonObject]] = {EXECUTE: apply_execute}
+# describes it to the person approving it. A withdrawal has no re-check: the
+# policy bounds what is entered, and an exit is never refused for it.
+_APPLY: dict[str, Callable[..., JsonObject]] = {
+    EXECUTE: apply_execute,
+    WITHDRAW: apply_withdraw,
+}
 _RECHECK: dict[str, Callable[..., JsonObject]] = {EXECUTE: recheck_execute_policy}
-_REVIEW: dict[str, Callable[..., JsonObject]] = {EXECUTE: review_execute}
+_REVIEW: dict[str, Callable[..., JsonObject]] = {
+    EXECUTE: review_execute,
+    WITHDRAW: review_withdraw,
+}
 
 
 def propose(store: PlanStore, proposal: Mapping[str, Any]) -> JsonObject:
@@ -357,8 +551,8 @@ def apply_approved(
     """Apply the stored plan a human approved by hash, at most once.
 
     The plan is marked used before anything else, so a repeated approval cannot
-    send it twice; a refused or failed run needs a new plan. With `policy`, the
-    plan's allocation is checked against it on today's shelf before it is
+    send it twice; a refused or failed run needs a new plan. With `policy`, a
+    kind that has a re-check is checked against it on today's shelf before it is
     applied, and refused on a violation.
     """
     stored = store.take(approved_hash)
@@ -369,8 +563,9 @@ def apply_approved(
         raise ServiceError(
             "plan_mismatch", "the stored plan does not match the approved hash"
         )
-    if policy is not None:
-        _RECHECK[stored.kind](stored.plan, policy=policy)
+    recheck = _RECHECK.get(stored.kind)
+    if policy is not None and recheck is not None:
+        recheck(stored.plan, policy=policy)
     return apply(stored.plan, expected_hash=approved_hash)
 
 
