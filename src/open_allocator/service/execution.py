@@ -32,7 +32,6 @@ from open_allocator.core.types import (
 from open_allocator.core.withdraw import WithdrawPlan
 from open_allocator.exec.allocation_plan import AllocationPlan
 from open_allocator.exec.client import OneTxClient
-from open_allocator.exec.config import AllocatorConfig
 from open_allocator.exec.execute import (
     ExecutionReport,
     PolicyCheckFailed,
@@ -74,6 +73,7 @@ from open_allocator.exec.withdraw import (
 from open_allocator.exec.withdraw import dry_run_report as withdraw_dry_run_report
 from open_allocator.service._common import (
     JsonObject,
+    allocator_config,
     model_payload,
     signer_address,
     signer_from_config,
@@ -179,7 +179,7 @@ def plan_allocation_execution(
     """The deposit plan `execute` would submit for `allocation`, not sent."""
     allocation_model = parse_allocation(allocation)
     policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         known_instruments = discover_vaults_from_client(
@@ -265,7 +265,7 @@ def apply_execute(
         if isinstance(plan, AllocationPlan)
         else AllocationPlan.model_validate(document)
     )
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         report = apply_allocation_plan(
@@ -298,7 +298,7 @@ def recheck_execute_policy(
         else AllocationPlan.model_validate(plan)
     )
     policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         known_instruments = discover_vaults_from_client(
@@ -466,7 +466,7 @@ def plan_withdraw(
     exit. Sends nothing; `report` is the dry run `withdraw` prints.
     """
     policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     from open_allocator.exec import loops as loops_exec
 
@@ -519,7 +519,7 @@ def apply_withdraw(
         if isinstance(plan, WithdrawalPlan)
         else WithdrawalPlan.model_validate(document)
     )
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         report = apply_withdrawal_plan(
@@ -607,7 +607,7 @@ def plan_rebalance(
     """
     target_model = parse_allocation(target)
     policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     from open_allocator.exec import loops as loops_exec
 
@@ -677,7 +677,7 @@ def apply_rebalance(
         if isinstance(plan, RebalancingPlan)
         else RebalancingPlan.model_validate(document)
     )
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         report = apply_rebalancing_plan(
@@ -715,7 +715,7 @@ def recheck_rebalance_policy(
         else RebalancingPlan.model_validate(plan)
     )
     policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
-    with OneTxClient(AllocatorConfig()) as client:
+    with OneTxClient(allocator_config()) as client:
         known_instruments = discover_vaults_from_client(
             client, enrich=True, loops=True, on_warning=on_warning
         )
@@ -846,7 +846,7 @@ def plan_loop_open(
     is the dry run `loop-open` prints.
     """
     policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         known_instruments = discover_vaults_from_client(
@@ -882,7 +882,7 @@ def apply_loop_open(
     """Execute a plan from `plan_loop_open` exactly; the loop-open report payload."""
     document = _approved_document(LOOP_OPEN, plan, expected_hash)
     planned = LoopOpeningPlan.model_validate(document)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         report = apply_loop_opening_plan(
@@ -913,7 +913,7 @@ def recheck_loop_open_policy(
         plan.model_dump(mode="json") if isinstance(plan, LoopOpeningPlan) else plan
     )
     policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
-    config = AllocatorConfig()
+    config = allocator_config()
     with OneTxClient(config) as client:
         known_instruments = discover_vaults_from_client(
             client, enrich=True, on_warning=on_warning
@@ -961,7 +961,7 @@ def plan_loop_close(
     nothing; `report` is the dry run `loop-close` prints.
     """
     policy_model = policy if isinstance(policy, Policy) else load_policy(policy)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         known_instruments = discover_vaults_from_client(
@@ -992,7 +992,7 @@ def apply_loop_close(
     """Execute a plan from `plan_loop_close` exactly; the loop-close report payload."""
     document = _approved_document(LOOP_CLOSE, plan, expected_hash)
     planned = LoopClosingPlan.model_validate(document)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         report = apply_loop_closing_plan(
@@ -1038,7 +1038,7 @@ def plan_bridge(
     new `ref` starts another. Sends nothing; `report` is the dry run `bridge`
     prints.
     """
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     address = signer_address(config)
     with OneTxClient(config) as client:
@@ -1083,7 +1083,7 @@ def apply_bridge(
     """
     document = _approved_document(BRIDGE, plan, expected_hash)
     planned = TransferPlan.model_validate(document)
-    config = AllocatorConfig()
+    config = allocator_config()
     signer = signer_from_config(config)
     with OneTxClient(config) as client:
         report = apply_transfer_plan(

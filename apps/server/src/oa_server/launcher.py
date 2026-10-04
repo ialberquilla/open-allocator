@@ -25,7 +25,8 @@ from oa_server.approval import PostgresPlanStore, approve, reject
 from oa_server.auth import load_mcp_token, new_token
 from oa_server.db.session import make_engine
 from oa_server.settings import DEFAULT_MCP_TOKEN_PATH, Settings
-from open_allocator.service import ServiceError
+from oa_server.state import PostgresStateBackend
+from open_allocator.service import ServiceError, use_state_backend
 
 MIGRATIONS = Path(__file__).resolve().parent / "migrations"
 
@@ -67,6 +68,7 @@ def serve(args: argparse.Namespace) -> None:
     )
     engine = _connect(settings.database_url)
     migrate(settings.database_url)
+    use_state_backend(PostgresStateBackend(engine))
 
     app = create_app(settings, PostgresPlanStore(engine))
     login_url = settings.login_url()
@@ -88,7 +90,9 @@ def serve(args: argparse.Namespace) -> None:
 def decide(args: argparse.Namespace) -> None:
     """Approve or reject one stored plan, printing the outcome as JSON."""
     settings = Settings.from_env("", "", database_url=args.database_url)
-    store = PostgresPlanStore(_connect(settings.database_url))
+    engine = _connect(settings.database_url)
+    use_state_backend(PostgresStateBackend(engine))
+    store = PostgresPlanStore(engine)
     try:
         if args.command == "approve":
             outcome = {

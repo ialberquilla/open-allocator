@@ -6,6 +6,7 @@ long-running server must not exit. Adapters translate `ServiceError` into their 
 error shape.
 """
 
+from open_allocator.service._common import use_state_backend
 from open_allocator.service.errors import ServiceError
 
-__all__ = ["ServiceError"]
+__all__ = ["ServiceError", "use_state_backend"]

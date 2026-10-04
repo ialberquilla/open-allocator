@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, String, Text
+from sqlalchemy import BigInteger, DateTime, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -29,3 +29,44 @@ class PlanRow(Base):
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class CheckpointRow(Base):
+    """A checkpoint an execution run wrote, by its content-derived id."""
+
+    __tablename__ = "checkpoint"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    checkpoint: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AllocationLogRow(Base):
+    """One executed action. Append-only, read back in `id` order."""
+
+    __tablename__ = "allocation_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    entry: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    logged_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class IdempotencyKeyRow(Base):
+    """A step that already executed within a scope, and what is known about it.
+
+    A bridge leg's value is its transfer state, rewritten as the transfer
+    advances.
+    """
+
+    __tablename__ = "idempotency_key"
+
+    scope: Mapped[str] = mapped_column(Text, primary_key=True)
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[Any] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
