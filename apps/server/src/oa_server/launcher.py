@@ -25,7 +25,11 @@ from sqlalchemy.exc import OperationalError
 from oa_server.app import create_app
 from oa_server.approval import PostgresPlanStore, approve, reject
 from oa_server.auth import load_mcp_token, new_token
-from oa_server.dashboard import BACKFILL_INTERVAL_SECONDS, Dashboard
+from oa_server.dashboard import (
+    BACKFILL_INTERVAL_SECONDS,
+    SHELF_INTERVAL_SECONDS,
+    Dashboard,
+)
 from oa_server.db.session import make_engine
 from oa_server.nav_job import backfill
 from oa_server.settings import DEFAULT_MCP_TOKEN_PATH, Settings
@@ -79,6 +83,7 @@ def serve(args: argparse.Namespace) -> None:
         PostgresPlanStore(engine),
         dashboard=Dashboard(engine),
         backfill_every=None if args.no_backfill else BACKFILL_INTERVAL_SECONDS,
+        shelf_every=SHELF_INTERVAL_SECONDS,
     )
     login_url = settings.login_url()
     print(

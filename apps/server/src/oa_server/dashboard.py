@@ -1,12 +1,16 @@
-"""What the dashboard pages read: the live book, the NAV history, job runs.
+"""What the dashboard pages read: the live book, the shelf, the NAV history, job
+runs.
 
 Every number a page shows is computed here or in the library; the web app only
 formats. The book is read live through the service layer (cached briefly, it
-takes seconds); the NAV history comes from the tables the backfill writes.
+takes seconds). The shelf is discovery with its metric history, which takes
+about a minute, so it is read on start and hourly and served from memory. The
+NAV history comes from the tables the backfill writes.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -29,17 +33,32 @@ from oa_server.schemas import (
     NavPoint,
     NavResponse,
     NavSummary,
+    ShelfResponse,
+    ShelfVault,
 )
 from open_allocator.core.nav import ONE, ONE_USD
+from open_allocator.core.types import Unknown, Vault
 from open_allocator.exec import chains
 from open_allocator.service import nav as nav_service
+from open_allocator.service import universe
 from open_allocator.service.positions import positions as read_positions
 
 JsonObject = dict[str, Any]
 
 BOOK_TTL_SECONDS = 60
-# How often the server backfills on its own, once started.
+SHELF_TTL_SECONDS = 3600
+# How often the server backfills, and reads the shelf, on its own once started.
 BACKFILL_INTERVAL_SECONDS = 3600
+SHELF_INTERVAL_SECONDS = 3600
+
+ShelfRead = tuple[list[Vault], list[JsonObject]]
+
+
+def read_shelf() -> ShelfRead:
+    """The scored universe with its metric history, and discovery's warnings."""
+    warnings: list[JsonObject] = []
+    vaults = universe.discover_vaults(enrich=True, on_warning=warnings.append)
+    return vaults, warnings
 
 
 def book_view(payload: JsonObject, *, read_at: datetime) -> BookResponse:
@@ -100,6 +119,62 @@ def book_view(payload: JsonObject, *, read_at: datetime) -> BookResponse:
     )
 
 
+def shelf_view(read: ShelfRead, *, read_at: datetime) -> ShelfResponse:
+    """The shelf as `list-vaults` describes it, best score first."""
+    vaults, warnings = read
+    scores = universe.score_by_instrument(vaults)
+    rows = []
+    for vault in vaults:
+        summary = universe.vault_summary(vault, scores[vault.instrument_id])
+        metrics = summary["risk_metrics"]
+        rows.append(
+            ShelfVault(
+                instrument_id=vault.instrument_id,
+                protocol=vault.protocol,
+                chain_id=vault.chain_id,
+                chain=chains.chain_name(vault.chain_id),
+                asset=vault.asset,
+                name=vault.description or vault.asset,
+                yield_token_symbol=vault.yield_token_symbol,
+                curator=_known(vault.curator),
+                sector=vault.sector,
+                apy=summary["apy"],
+                base_apy=summary["base_apy"],
+                reward_apy=summary["reward_apy"],
+                priced_reward_apy=_known(summary["priced_reward_apy"]),
+                reward_dependence=_known(summary["reward_dependence"]),
+                tvl_usd=summary["tvl_usd"],
+                levered=summary["levered"],
+                max_leverage=summary["max_leverage"],
+                maturity=vault.maturity,
+                days_to_maturity=summary["days_to_maturity"],
+                score=summary["score"],
+                history_days=_known(metrics.get("history_days")),
+                sharpe=_known(metrics.get("sharpe")),
+                max_drawdown=_known(metrics.get("max_drawdown")),
+                volatility=_known(metrics.get("volatility")),
+                realized_apy=_known(metrics.get("realized_apy")),
+                delivery_gap=_known(metrics.get("delivery_gap")),
+            )
+        )
+    rows.sort(key=lambda row: row.score, reverse=True)
+    return ShelfResponse(
+        read_at=read_at, vaults=rows, warnings=[_warning(w) for w in warnings]
+    )
+
+
+def _known(value: Any) -> Any:
+    return None if value == Unknown else value
+
+
+def _warning(warning: JsonObject) -> str:
+    skipped = warning.get("instruments")
+    if warning.get("warning") == "skipped_instruments" and isinstance(skipped, list):
+        names = "; ".join(f"{s['instrument_id']}: {s['reason']}" for s in skipped)
+        return f"{len(skipped)} instruments 1Tx lists could not be read ({names})"
+    return json.dumps(warning, sort_keys=True, default=str)
+
+
 def _slices(
     positions: list[BookPosition], key: Callable[[BookPosition], str], total: float
 ) -> list[BookSlice]:
@@ -118,17 +193,21 @@ class Dashboard:
         engine: Engine,
         *,
         read_book: Callable[[], JsonObject] = read_positions,
+        read_shelf: Callable[[], ShelfRead] = read_shelf,
         account: Callable[[], str] = nav_service.book_account,
         run_backfill: Callable[[], object] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._engine = engine
         self._read_book = read_book
+        self._read_shelf = read_shelf
         self._account = account
         self._run_backfill = run_backfill or (lambda: nav_job.backfill(engine))
         self._clock = clock
         self._book: tuple[float, BookResponse] | None = None
         self._book_lock = threading.Lock()
+        self._shelf: tuple[float, ShelfResponse] | None = None
+        self._shelf_lock = threading.Lock()
         self._backfill_lock = threading.Lock()
 
     def book(self, *, refresh: bool = False) -> BookResponse:
@@ -142,6 +221,23 @@ class Dashboard:
                 return cached[1]
             view = book_view(self._read_book(), read_at=self._clock())
             self._book = (time.monotonic(), view)
+            return view
+
+    def shelf(self, *, refresh: bool = False) -> ShelfResponse:
+        """The cached shelf, read first if it is missing, stale or asked for.
+
+        A read already under way is waited for rather than repeated.
+        """
+        asked = time.monotonic()
+        with self._shelf_lock:
+            cached = self._shelf
+            if cached and (
+                cached[0] >= asked
+                or (not refresh and asked - cached[0] < SHELF_TTL_SECONDS)
+            ):
+                return cached[1]
+            view = shelf_view(self._read_shelf(), read_at=self._clock())
+            self._shelf = (time.monotonic(), view)
             return view
 
     def backfill(self) -> bool:

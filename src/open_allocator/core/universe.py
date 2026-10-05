@@ -169,6 +169,10 @@ def _to_vault(instrument: object) -> Vault:
             "yield_token_decimals",
             "yieldTokenDecimals",
         ),
+        yield_token_symbol=_optional_text(
+            instrument, "yield_token_symbol", "yieldTokenSymbol"
+        ),
+        description=_optional_text(instrument, "description"),
         asset_category=_optional_text(instrument, "asset_category", "assetCategory"),
         sector=_optional_text(instrument, "sector"),
         maturity=_optional_datetime(instrument, "maturity"),

@@ -27,6 +27,8 @@ export type ApproveResponse = Schemas["ApproveResponse"];
 export type Book = Schemas["BookResponse"];
 export type BookPosition = Schemas["BookPosition"];
 export type BookSlice = Schemas["BookSlice"];
+export type Shelf = Schemas["ShelfResponse"];
+export type ShelfVault = Schemas["ShelfVault"];
 export type Nav = Schemas["NavResponse"];
 export type NavPoint = Schemas["NavPoint"];
 export type JobRun = Schemas["JobRun"];
@@ -71,6 +73,7 @@ export const api = {
       body: JSON.stringify({ plan_hash: hash }),
     }),
   book: (refresh = false) => request<Book>(`/api/book${refresh ? "?refresh=true" : ""}`),
+  shelf: (refresh = false) => request<Shelf>(`/api/shelf${refresh ? "?refresh=true" : ""}`),
   nav: () => request<Nav>("/api/nav"),
   backfill: () => request<Schemas["BackfillResponse"]>("/api/nav/backfill", { method: "POST" }),
   reject: (hash: string) =>

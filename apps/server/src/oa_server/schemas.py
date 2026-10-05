@@ -369,3 +369,50 @@ class NavResponse(BaseModel):
 class BackfillResponse(BaseModel):
     # False when a backfill was already running.
     started: bool
+
+
+class ShelfVault(BaseModel):
+    instrument_id: str
+    protocol: str
+    chain_id: int
+    chain: str
+    asset: str
+    # 1Tx's name for the instrument, else its asset.
+    name: str
+    yield_token_symbol: str | None
+    curator: str | None
+    sector: str | None
+    # Percent, as 1Tx advertises it; descriptive, not predictive. A fixed-term
+    # row's is the rate locked to maturity.
+    apy: float
+    base_apy: float | None
+    reward_apy: float | None
+    # The reward APY this allocator counts; None where it is priced at an
+    # emission schedule rather than a fillable quote.
+    priced_reward_apy: float | None
+    # Share of the APY paid in rewards, 0-1.
+    reward_dependence: float | None
+    tvl_usd: float
+    levered: bool
+    max_leverage: float | None
+    maturity: datetime | None
+    days_to_maturity: int | None
+    # The allocator's score, 0-1.
+    score: float
+    # Yield-path metrics over the APY history; never principal or contract loss.
+    history_days: int | None
+    sharpe: float | None
+    # Non-positive fraction of the compounded APY path.
+    max_drawdown: float | None
+    # Population standard deviation of the APY, in percentage points.
+    volatility: float | None
+    realized_apy: float | None
+    # Realized less advertised APY, percentage points; never positive.
+    delivery_gap: float | None
+
+
+class ShelfResponse(BaseModel):
+    read_at: datetime
+    # Best score first.
+    vaults: list[ShelfVault]
+    warnings: list[str]

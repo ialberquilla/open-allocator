@@ -60,8 +60,9 @@ The stdio server keeps plans in memory and has no approval surface. Over stdio, 
 `oa_server` is a separate package in the uv workspace. It depends on the library; the library never imports it. One process serves:
 
 - `/mcp`: the same MCP server over streamable HTTP, storing plans in Postgres (`PostgresPlanStore`).
-- `/`, `/book`, `/performance`, `/activity` and `/approve/<hash>`: the web app (`apps/web`), styled after agent-showcase: the book, its NAV history, recent plans, and one plan's review with Approve and Reject.
+- `/`, `/book`, `/shelf`, `/performance`, `/activity` and `/approve/<hash>`: the web app (`apps/web`), styled after agent-showcase: the book, the shelf, the book's NAV history, recent plans, and one plan's review with Approve and Reject.
 - `GET /api/book` (`?refresh=true` to skip the one-minute cache): the live `positions` book with its aggregates (weights by protocol and chain, blended current APY, 1/Σw²), computed in Python.
+- `GET /api/shelf` (`?refresh=true` to read it again): every instrument discovery can score, as `list-vaults` describes it (score, advertised and realized APY, priced rewards, yield-path risk metrics), best score first. Discovery with 180 days of history takes about a minute, so the server reads it on start and hourly and serves it from memory; a request during a read waits for it.
 - `GET /api/nav`: the NAV series, its summary, per-chain coverage and the last backfill run. `POST /api/nav/backfill` starts one in the background (`202`). `GET /api/jobs`: recent job runs.
 - `GET /api/plans`: recent plans, newest first, with their status (`pending`, `expired`, `applying`, `applied`, `failed`, `rejected`).
 - `GET /api/plans/{hash}`: the stored plan an approval would apply, its `review` and status, and the recorded result or error. The page shows this, not the model's copy.

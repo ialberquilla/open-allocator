@@ -4,6 +4,7 @@ import { Approve } from "@/pages/Approve";
 import { Book } from "@/pages/Book";
 import { Overview } from "@/pages/Overview";
 import { Performance } from "@/pages/Performance";
+import { Shelf } from "@/pages/Shelf";
 
 // Routes matched by hand; the server serves this page for each of them.
 const APPROVE = /^\/approve\/([0-9a-f]{64})\/?$/;
@@ -14,6 +15,8 @@ function Page({ pathname }: { pathname: string }) {
   switch (pathname.replace(/\/$/, "") || "/") {
     case "/book":
       return <Book />;
+    case "/shelf":
+      return <Shelf />;
     case "/performance":
       return <Performance />;
     case "/activity":

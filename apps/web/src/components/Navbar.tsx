@@ -1,4 +1,4 @@
-import { Activity, BookOpen, LayoutGrid, TrendingUp } from "lucide-react";
+import { Activity, BookOpen, LayoutGrid, Library, TrendingUp } from "lucide-react";
 
 import logo from "@/assets/1tx-logo.svg";
 import { cn } from "@/lib/utils";
@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 const LINKS = [
   { href: "/", label: "Overview", icon: LayoutGrid },
   { href: "/book", label: "Book", icon: BookOpen },
+  { href: "/shelf", label: "Shelf", icon: Library },
   { href: "/performance", label: "Performance", icon: TrendingUp },
   { href: "/activity", label: "Activity", icon: Activity },
 ];
@@ -54,7 +55,7 @@ export function Navbar({ pathname }: { pathname: string }) {
         className="fixed inset-x-0 bottom-0 z-40 border-t border-border/60 bg-background/90 backdrop-blur md:hidden"
         style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
       >
-        <ul className="mx-auto grid max-w-lg grid-cols-4">
+        <ul className="mx-auto grid max-w-lg grid-cols-5">
           {LINKS.map(({ href, label, icon: Icon }) => {
             const active = isActive(pathname, href);
             return (

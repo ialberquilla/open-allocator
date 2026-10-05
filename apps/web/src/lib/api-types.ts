@@ -121,6 +121,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/shelf": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Shelf
+         * @description What can be allocated to, scored, with its yield-path metrics (read
+         *     hourly; a refresh takes about a minute).
+         */
+        get: operations["get_shelf_api_shelf_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/nav": {
         parameters: {
             query?: never;
@@ -704,6 +725,73 @@ export interface components {
             /** Actual */
             actual: unknown;
         };
+        /** ShelfResponse */
+        ShelfResponse: {
+            /**
+             * Read At
+             * Format: date-time
+             */
+            read_at: string;
+            /** Vaults */
+            vaults: components["schemas"]["ShelfVault"][];
+            /** Warnings */
+            warnings: string[];
+        };
+        /** ShelfVault */
+        ShelfVault: {
+            /** Instrument Id */
+            instrument_id: string;
+            /** Protocol */
+            protocol: string;
+            /** Chain Id */
+            chain_id: number;
+            /** Chain */
+            chain: string;
+            /** Asset */
+            asset: string;
+            /** Name */
+            name: string;
+            /** Yield Token Symbol */
+            yield_token_symbol: string | null;
+            /** Curator */
+            curator: string | null;
+            /** Sector */
+            sector: string | null;
+            /** Apy */
+            apy: number;
+            /** Base Apy */
+            base_apy: number | null;
+            /** Reward Apy */
+            reward_apy: number | null;
+            /** Priced Reward Apy */
+            priced_reward_apy: number | null;
+            /** Reward Dependence */
+            reward_dependence: number | null;
+            /** Tvl Usd */
+            tvl_usd: number;
+            /** Levered */
+            levered: boolean;
+            /** Max Leverage */
+            max_leverage: number | null;
+            /** Maturity */
+            maturity: string | null;
+            /** Days To Maturity */
+            days_to_maturity: number | null;
+            /** Score */
+            score: number;
+            /** History Days */
+            history_days: number | null;
+            /** Sharpe */
+            sharpe: number | null;
+            /** Max Drawdown */
+            max_drawdown: number | null;
+            /** Volatility */
+            volatility: number | null;
+            /** Realized Apy */
+            realized_apy: number | null;
+            /** Delivery Gap */
+            delivery_gap: number | null;
+        };
         /** TokenAmount */
         TokenAmount: {
             /** Raw */
@@ -947,6 +1035,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BookResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_shelf_api_shelf_get: {
+        parameters: {
+            query?: {
+                refresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShelfResponse"];
                 };
             };
             /** @description Validation Error */

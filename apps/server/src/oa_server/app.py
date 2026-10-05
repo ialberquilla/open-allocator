@@ -35,6 +35,7 @@ from oa_server.schemas import (
     PlanSummary,
     RejectResponse,
     Review,
+    ShelfResponse,
 )
 from oa_server.settings import Settings
 from open_allocator.mcp import build_mcp
@@ -47,7 +48,7 @@ JsonObject = dict[str, Any]
 log = logging.getLogger(__name__)
 
 # The web app's pages, each served the same `index.html`.
-WEB_PAGES = ("/book", "/performance", "/activity")
+WEB_PAGES = ("/book", "/shelf", "/performance", "/activity")
 
 # The built web app (`make web`); not in the repository.
 WEB_DIST = Path(__file__).resolve().parent / "web_dist"
@@ -93,28 +94,41 @@ def create_app(
     web_dist: Path = WEB_DIST,
     dashboard: Dashboard | None = None,
     backfill_every: float | None = None,
+    shelf_every: float | None = None,
 ) -> FastAPI:
-    """`backfill_every` (seconds) runs the NAV backfill on start and then on
-    that interval; None runs it only when asked."""
+    """`backfill_every` and `shelf_every` (seconds) run the NAV backfill and the
+    shelf read on start and then on that interval; None runs them only when
+    asked."""
     mcp = build_mcp(plan_store, approval_url=settings.approval_url)
     mcp_app = mcp.streamable_http_app(streamable_http_path="/mcp", host=settings.host)
 
-    async def backfill_loop(board: Dashboard, every: float) -> None:
+    async def repeat(name: str, run: Callable[[], object], every: float) -> None:
         while True:
             try:
-                await asyncio.to_thread(board.backfill)
+                await asyncio.to_thread(run)
             except Exception:
-                log.exception("NAV backfill failed")
+                log.exception("%s failed", name)
             await asyncio.sleep(every)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        task = None
+        tasks = []
         if dashboard is not None and backfill_every:
-            task = asyncio.create_task(backfill_loop(dashboard, backfill_every))
+            tasks.append(
+                asyncio.create_task(
+                    repeat("NAV backfill", dashboard.backfill, backfill_every)
+                )
+            )
+        if dashboard is not None and shelf_every:
+            board = dashboard
+            tasks.append(
+                asyncio.create_task(
+                    repeat("shelf read", lambda: board.shelf(refresh=True), shelf_every)
+                )
+            )
         async with mcp.session_manager.run():
             yield
-        if task is not None:
+        for task in tasks:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -202,6 +216,19 @@ def create_app(
             raise
         except Exception as error:
             raise HTTPException(502, {"error": f"book read failed: {error}"}) from error
+
+    @app.get("/api/shelf", response_model=ShelfResponse)
+    def get_shelf(refresh: bool = False) -> ShelfResponse:
+        """What can be allocated to, scored, with its yield-path metrics (read
+        hourly; a refresh takes about a minute)."""
+        try:
+            return board().shelf(refresh=refresh)
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise HTTPException(
+                502, {"error": f"shelf read failed: {error}"}
+            ) from error
 
     @app.get("/api/nav", response_model=NavResponse)
     def get_nav() -> NavResponse:

@@ -169,7 +169,7 @@ def test_the_approval_page_serves_the_web_app(tmp_path: Path) -> None:
     assert asset.text == "console.log(1)"
 
 
-@pytest.mark.parametrize("path", ["/", "/book", "/performance", "/activity"])
+@pytest.mark.parametrize("path", ["/", "/book", "/shelf", "/performance", "/activity"])
 def test_every_dashboard_page_serves_the_web_app(tmp_path: Path, path: str) -> None:
     (tmp_path / "index.html").write_text("<div id=root></div>", encoding="utf-8")
     app = create_app(settings(), InMemoryPlanStore(), web_dist=tmp_path)
@@ -207,6 +207,13 @@ class FakeDashboard:
             backfilling=False,
         )
 
+    def shelf(self, *, refresh: bool = False) -> Any:
+        from datetime import UTC, datetime
+
+        from oa_server.dashboard import shelf_view
+
+        return shelf_view(([], []), read_at=datetime(2026, 10, 4, tzinfo=UTC))
+
     def backfill(self) -> bool:
         self.backfills += 1
         return True
@@ -219,7 +226,7 @@ def test_dashboard_routes_need_the_browser_token() -> None:
     board = FakeDashboard()
     app = create_app(settings(), InMemoryPlanStore(), dashboard=board)  # type: ignore[arg-type]
     with TestClient(app, base_url=BASE_URL) as client:
-        for path in ("/api/book", "/api/nav", "/api/jobs"):
+        for path in ("/api/book", "/api/shelf", "/api/nav", "/api/jobs"):
             assert client.get(path).status_code == 401
             assert client.get(path, headers=mcp_authorized()).status_code == 401
             assert client.get(path, headers=authorized()).status_code == 200
@@ -237,6 +244,7 @@ def test_dashboard_routes_without_a_database_are_unavailable(
 ) -> None:
     assert client.get("/api/nav", headers=authorized()).status_code == 503
     assert client.get("/api/book", headers=authorized()).status_code == 503
+    assert client.get("/api/shelf", headers=authorized()).status_code == 503
 
 
 def test_an_unbuilt_web_app_says_how_to_build_it(tmp_path: Path) -> None:
