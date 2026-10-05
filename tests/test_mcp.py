@@ -644,3 +644,66 @@ def test_nothing_in_the_mcp_adapter_can_apply_a_plan() -> None:
         "reject(",
     ):
         assert name not in source, name
+
+
+def test_every_cli_command_is_a_tool_or_named_cli_only() -> None:
+    tools = {tool.name for tool in list_tools()}
+
+    assert not tools & mcp_module.CLI_ONLY
+    assert tools | mcp_module.CLI_ONLY == cli_inventory()
+    assert mcp_module.PROPOSING <= tools
+
+
+def test_resources_serve_the_guides_skills_schemas_and_workflows() -> None:
+    server = build_mcp()
+    uris = {str(resource.uri) for resource in anyio.run(server.list_resources)}
+
+    package = ROOT / "src" / "open_allocator"
+    expected = {"open-allocator://guides/AGENT_GUIDE.md"}
+    expected |= {
+        "open-allocator://" + path.relative_to(package).as_posix()
+        for pattern in ("skills/**/*.md", "schemas/*.json", "workflows/*.yaml")
+        for path in package.glob(pattern)
+    }
+    assert expected <= uris
+
+    contents = list(
+        anyio.run(server.read_resource, "open-allocator://guides/AGENT_GUIDE.md")
+    )
+    assert contents[0].content == (ROOT / "AGENT_GUIDE.md").read_text("utf-8")
+    assert contents[0].mime_type == "text/markdown"
+    schema = list(
+        anyio.run(
+            server.read_resource, "open-allocator://schemas/allocation.schema.json"
+        )
+    )
+    assert json.loads(schema[0].content)["type"] == "object"
+
+
+def test_workflow_prompts_name_tools_skills_and_human_approval() -> None:
+    server = build_mcp()
+    tools = {tool.name for tool in list_tools()}
+    uris = {str(resource.uri) for resource in anyio.run(server.list_resources)}
+
+    assert {prompt.name for prompt in anyio.run(server.list_prompts)} == {
+        "allocate",
+        "rebalance",
+        "withdraw",
+    }
+    for name, arguments in (
+        ("allocate", {"amount": "250"}),
+        ("rebalance", {}),
+        ("withdraw", {"position": "inst-1"}),
+    ):
+        result = anyio.run(server.get_prompt, name, arguments)
+        text = result.messages[0].content.text
+        called = re.findall(r"Call `([a-z-]+)`", text)
+        assert called and set(called) <= tools, name
+        # An execution tool is called once: a second call would propose twice.
+        assert len([c for c in called if c in mcp_module.PROPOSING]) == 1, name
+        assert set(re.findall(r"open-allocator://\S+?(?=[.,]?\s|$)", text)) <= uris
+        assert mcp_module.APPROVAL_STEP in text, name
+
+    allocate = anyio.run(server.get_prompt, "allocate", {"amount": "250"})
+    assert "allocate 250 USD" in allocate.messages[0].content.text
+    assert "`build-tx` is CLI only" in allocate.messages[0].content.text

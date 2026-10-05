@@ -1,8 +1,8 @@
 """Where the library's own data files live, resolved the one way that survives install.
 
-`schemas/`, `skills/` and `workflows/` are package data, not repo files. They used
-to sit at the repository root and be reached by walking `__file__` upward, which is
-correct in a source checkout and wrong everywhere else: from
+`schemas/`, `skills/`, `workflows/` and `guides/` are package data, not repo files.
+They used to sit at the repository root and be reached by walking `__file__`
+upward, which is correct in a source checkout and wrong everywhere else: from
 `site-packages/open_allocator/core/` the same walk lands on the environment's
 `lib/python3.12/`, which holds nothing, so every schema-validating command failed on
 an installed library while the whole test suite passed from the source tree.
@@ -28,3 +28,6 @@ PACKAGE_ROOT = Path(str(files("open_allocator")))
 SCHEMAS_DIR = PACKAGE_ROOT / "schemas"
 SKILLS_DIR = PACKAGE_ROOT / "skills"
 WORKFLOWS_DIR = PACKAGE_ROOT / "workflows"
+# Verbatim copies of the root AGENT_GUIDE.md and PROJECT_CONTEXT.md, so an installed
+# library can serve them as MCP resources; tests/test_docs.py keeps them equal.
+GUIDES_DIR = PACKAGE_ROOT / "guides"

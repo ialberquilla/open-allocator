@@ -9,6 +9,11 @@ its plan, stores it in the `PlanStore` and returns a plan-required response with
 plan's hash. It never accepts a confirmation and nothing here can apply a plan:
 approval is a human action outside the model's reach (see docs/ui.md).
 
+The library's own documents are resources under `open-allocator://`, addressed by
+their path in the package (`open-allocator://skills/withdraw.md`), so a workflow's
+`skill:` entry names its resource directly. Each workflow is also a prompt that walks
+the model through its stages with these tools.
+
 Run over stdio with `open-allocator-mcp` (needs the `mcp` extra). stdout carries the
 protocol, which is why nothing in the service layer may print.
 """
@@ -20,14 +25,23 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import yaml
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.resources import FileResource
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from open_allocator import __version__
 from open_allocator.core import allocator as allocation_core
 from open_allocator.core import strategies as strategies_core
+from open_allocator.resources import (
+    GUIDES_DIR,
+    PACKAGE_ROOT,
+    SCHEMAS_DIR,
+    SKILLS_DIR,
+    WORKFLOWS_DIR,
+)
 from open_allocator.service import ServiceError
 from open_allocator.service import allocation as allocation_service
 from open_allocator.service import execution as execution_service
@@ -46,6 +60,25 @@ INSTRUCTIONS = (
     "as `allocation`; pass that `allocation` object to `simulate` unchanged. "
     "APY figures are descriptive, not predictive. "
     "Fields reported as unknown or null are unknown; do not fill them in."
+)
+
+RESOURCE_SCHEME = "open-allocator://"
+
+# CLI commands with no tool. `build-tx` is covered by the plan an execution tool
+# proposes; `drift` and `validate-mandate` are not exposed (docs/ui.md).
+CLI_ONLY = frozenset({"build-tx", "drift", "validate-mandate"})
+
+# Tools that store a plan for approval: a workflow calls each once.
+PROPOSING = frozenset(
+    {"execute", "rebalance", "withdraw", "loop-open", "loop-close", "bridge"}
+)
+
+APPROVAL_STEP = (
+    "Nothing has run yet: execution tools only propose. Show the user the plan "
+    "and its blockers, give them `approval_url` (or the `plan_hash` for "
+    "`open-allocator-ui approve`), and stop until they say they approved or "
+    "rejected it. Only the user approves, outside this conversation; no tool "
+    "call can."
 )
 
 # Advisory screen arguments, shared by `screen` and `build-allocation`.
@@ -582,7 +615,104 @@ def build_mcp(
         )
         return {**_proposed(proposal), "warnings": warnings}
 
+    _add_resources(server)
+    _add_workflow_prompts(server)
     return server
+
+
+def resource_uri(path: Path) -> str:
+    """A package file's resource URI: its path below the package root."""
+    return RESOURCE_SCHEME + path.relative_to(PACKAGE_ROOT).as_posix()
+
+
+def _add_resources(server: MCPServer) -> None:
+    documents = [
+        (GUIDES_DIR / "AGENT_GUIDE.md", "The operating contract: rules and loops."),
+        (GUIDES_DIR / "PROJECT_CONTEXT.md", "Architecture and safety invariants."),
+    ]
+    documents += [(path, None) for path in sorted(SKILLS_DIR.rglob("*.md"))]
+    documents += [(path, None) for path in sorted(SCHEMAS_DIR.glob("*.json"))]
+    documents += [(path, None) for path in sorted(WORKFLOWS_DIR.glob("*.yaml"))]
+    mime_types = {
+        ".md": "text/markdown",
+        ".json": "application/json",
+        ".yaml": "application/yaml",
+    }
+    for path, description in documents:
+        server.add_resource(
+            FileResource(
+                uri=resource_uri(path),
+                name=path.relative_to(PACKAGE_ROOT).as_posix(),
+                description=description,
+                mime_type=mime_types[path.suffix],
+                path=path,
+            )
+        )
+
+
+def _workflow(name: str) -> JsonObject:
+    return yaml.safe_load((WORKFLOWS_DIR / f"{name}.yaml").read_text("utf-8"))
+
+
+def workflow_prompt(name: str, request: str | None = None) -> str:
+    """The stages of `workflows/<name>.yaml` as instructions for the MCP tools."""
+    workflow = _workflow(name)
+    agent_guide = resource_uri(GUIDES_DIR / "AGENT_GUIDE.md")
+    lines = [
+        f"Run the Open Allocator `{name}` workflow: {workflow['description']}",
+        "",
+    ]
+    if request:
+        lines += [f"Request: {request}", ""]
+    lines += [
+        f"Read {agent_guide} first; it is the operating contract. Each stage names "
+        "the skill resource to follow and what to review before moving on.",
+        "",
+    ]
+    called: set[str] = set()
+    for number, stage in enumerate(workflow["stages"], start=1):
+        command = stage["command"]
+        if command in CLI_ONLY:
+            action = (
+                f"`{command}` is CLI only; over MCP the next proposal's plan covers it."
+            )
+        elif command in PROPOSING and command in called:
+            action = f"Use the `{command}` proposal above; do not call it again."
+        else:
+            action = f"Call `{command}`."
+        called.add(command)
+        if stage.get("human_approval_default"):
+            action += " " + APPROVAL_STEP
+        skill = RESOURCE_SCHEME + stage["skill"]
+        review = ", ".join(stage["review_focus"])
+        lines.append(
+            f"{number}. {stage['stage']}: {action} Skill: {skill}. Review: {review}."
+        )
+    return "\n".join(lines)
+
+
+def _add_workflow_prompts(server: MCPServer) -> None:
+    @server.prompt(name="allocate", description=_workflow("allocate")["description"])
+    def allocate(
+        amount: Annotated[
+            str | None, Field(description="USD to allocate, if already known.")
+        ] = None,
+    ) -> str:
+        request = f"allocate {amount} USD of new capital." if amount else None
+        return workflow_prompt("allocate", request)
+
+    @server.prompt(name="rebalance", description=_workflow("rebalance")["description"])
+    def rebalance() -> str:
+        return workflow_prompt("rebalance")
+
+    @server.prompt(name="withdraw", description=_workflow("withdraw")["description"])
+    def withdraw(
+        position: Annotated[
+            str | None, Field(description="Instrument id of the position to exit.")
+        ] = None,
+    ) -> str:
+        request = f"withdraw from position `{position}`." if position else None
+        return workflow_prompt("withdraw", request)
 
 
 def main() -> None:

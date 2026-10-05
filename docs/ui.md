@@ -29,6 +29,10 @@ Tools are named after the CLI commands and return the same objects, with these d
 
 Exposed tools: `wallet-status`, `safe-address`, `positions`, `rewards`, `list-vaults`, `score-vault`, `screen`, `build-allocation`, `simulate`, `backtest`, `check-policy`, `execute`, `rebalance`, `withdraw`, `loop-open`, `loop-close`, `bridge`. None of them changes anything on chain. `drift` and `validate-mandate` are not exposed.
 
+Resources, under `open-allocator://` and addressed by their path in the package: the guides (`guides/AGENT_GUIDE.md`, `guides/PROJECT_CONTEXT.md`, verbatim copies of the root files, kept equal by `tests/test_docs.py`; copy them over after editing either), every skill (`skills/withdraw.md`, `skills/meta/risk-review.md`, …), the JSON schemas and the workflows. A workflow's `skill:` entry is its resource path.
+
+Prompts `allocate` (optional `amount`), `rebalance` and `withdraw` (optional `position`) render the matching `workflows/*.yaml` as numbered stages: the tool to call, the skill resource, what to review. Each execution tool is called once; the approval stage tells the model to hand the user `approval_url` and stop. `build-tx` stages say it is CLI only: the execution tool's plan covers it.
+
 ## Plans and approval
 
 Execution is split in the service layer (`open_allocator.service.execution`):
