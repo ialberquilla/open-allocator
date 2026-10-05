@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, String, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -70,3 +71,94 @@ class IdempotencyKeyRow(Base):
     completed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+# The NAV history. Every row is keyed by the account it describes, so a
+# different Safe is a different history rather than a corrupted one.
+
+# Raw token amounts are uint256.
+_RAW = Numeric(78, 0)
+
+
+class ChainCloseRow(Base):
+    """One chain read at one day's last block.
+
+    Written once a day has closed, so it never changes: a backfill skips what is
+    already here. `unknown` closes (a position that could not be valued) are
+    read again on every run, in case a price has since appeared.
+    """
+
+    __tablename__ = "chain_close"
+
+    account: Mapped[str] = mapped_column(String(42), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    block: Mapped[int] = mapped_column(BigInteger)
+    block_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(Text)
+    read_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class PositionCloseRow(Base):
+    """One position at one chain close."""
+
+    __tablename__ = "position_close"
+
+    account: Mapped[str] = mapped_column(String(42), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    instrument_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    protocol: Mapped[str] = mapped_column(Text)
+    symbol: Mapped[str] = mapped_column(Text)
+    shares_raw: Mapped[Decimal] = mapped_column(_RAW)
+    base_shares_raw: Mapped[Decimal | None] = mapped_column(_RAW)
+    underlying_raw: Mapped[Decimal | None] = mapped_column(_RAW)
+    decimals: Mapped[int | None] = mapped_column(Integer)
+    price_usd: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    price_source: Mapped[str | None] = mapped_column(String(16))
+    usd_micro: Mapped[int | None] = mapped_column(BigInteger)
+    reason: Mapped[str | None] = mapped_column(Text)
+
+
+class NavDayRow(Base):
+    """One day of the unit ledger, derived from the closes; rebuilt, not edited."""
+
+    __tablename__ = "nav_day"
+
+    account: Mapped[str] = mapped_column(String(42), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    nav_micro: Mapped[int | None] = mapped_column(BigInteger)
+    flow_micro: Mapped[int | None] = mapped_column(BigInteger)
+    # 1e-12 fixed point.
+    units: Mapped[Decimal | None] = mapped_column(Numeric(40, 0))
+    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(40, 0))
+    yield_micro: Mapped[int | None] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(Text)
+
+
+class JobRunRow(Base):
+    """One run of a background job, and how it went."""
+
+    __tablename__ = "job_run"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    job: Mapped[str] = mapped_column(String(32))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16))
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+
+class NavAccountRow(Base):
+    """Where an account's history starts: the day its Safe was first deployed,
+    unless the operator set one."""
+
+    __tablename__ = "nav_account"
+
+    account: Mapped[str] = mapped_column(String(42), primary_key=True)
+    start_day: Mapped[date] = mapped_column(Date)
+    notes: Mapped[list[str] | None] = mapped_column(JSONB)

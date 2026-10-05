@@ -1,11 +1,33 @@
 import { Shell } from "@/components/Shell";
+import { Activity } from "@/pages/Activity";
 import { Approve } from "@/pages/Approve";
-import { Home } from "@/pages/Home";
+import { Book } from "@/pages/Book";
+import { Overview } from "@/pages/Overview";
+import { Performance } from "@/pages/Performance";
 
-// Two routes, matched by hand: `/` and `/approve/<hash>`.
+// Routes matched by hand; the server serves this page for each of them.
 const APPROVE = /^\/approve\/([0-9a-f]{64})\/?$/;
 
+function Page({ pathname }: { pathname: string }) {
+  const approve = APPROVE.exec(pathname);
+  if (approve?.[1]) return <Approve hash={approve[1]} />;
+  switch (pathname.replace(/\/$/, "") || "/") {
+    case "/book":
+      return <Book />;
+    case "/performance":
+      return <Performance />;
+    case "/activity":
+      return <Activity />;
+    default:
+      return <Overview />;
+  }
+}
+
 export function App() {
-  const match = APPROVE.exec(window.location.pathname);
-  return <Shell>{match?.[1] ? <Approve hash={match[1]} /> : <Home />}</Shell>;
+  const pathname = window.location.pathname;
+  return (
+    <Shell pathname={pathname}>
+      <Page pathname={pathname} />
+    </Shell>
+  );
 }

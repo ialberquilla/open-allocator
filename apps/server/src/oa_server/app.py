@@ -6,6 +6,9 @@ One process: the MCP tools a client calls store their plans in the same
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -20,8 +23,13 @@ from pydantic import TypeAdapter
 from oa_server import __version__
 from oa_server.approval import approve, plan_status, reject
 from oa_server.auth import LocalAccessMiddleware
+from oa_server.dashboard import Dashboard
 from oa_server.schemas import (
     ApproveResponse,
+    BackfillResponse,
+    BookResponse,
+    JobRun,
+    NavResponse,
     PlanHashRequest,
     PlanResponse,
     PlanSummary,
@@ -35,6 +43,11 @@ from open_allocator.service.execution import review_plan
 from open_allocator.service.plan_store import PlanStore
 
 JsonObject = dict[str, Any]
+
+log = logging.getLogger(__name__)
+
+# The web app's pages, each served the same `index.html`.
+WEB_PAGES = ("/book", "/performance", "/activity")
 
 # The built web app (`make web`); not in the repository.
 WEB_DIST = Path(__file__).resolve().parent / "web_dist"
@@ -67,20 +80,44 @@ def _refused(error: ServiceError) -> HTTPException:
     )
 
 
+def _log_failure(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        log.error("NAV backfill failed", exc_info=task.exception())
+
+
 def create_app(
     settings: Settings,
     plan_store: PlanStore,
     *,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     web_dist: Path = WEB_DIST,
+    dashboard: Dashboard | None = None,
+    backfill_every: float | None = None,
 ) -> FastAPI:
+    """`backfill_every` (seconds) runs the NAV backfill on start and then on
+    that interval; None runs it only when asked."""
     mcp = build_mcp(plan_store, approval_url=settings.approval_url)
     mcp_app = mcp.streamable_http_app(streamable_http_path="/mcp", host=settings.host)
 
+    async def backfill_loop(board: Dashboard, every: float) -> None:
+        while True:
+            try:
+                await asyncio.to_thread(board.backfill)
+            except Exception:
+                log.exception("NAV backfill failed")
+            await asyncio.sleep(every)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        task = None
+        if dashboard is not None and backfill_every:
+            task = asyncio.create_task(backfill_loop(dashboard, backfill_every))
         async with mcp.session_manager.run():
             yield
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     app = FastAPI(title="Open Allocator", version=__version__, lifespan=lifespan)
 
@@ -151,6 +188,40 @@ def create_app(
             raise _refused(error) from error
         return RejectResponse(plan_hash=request.plan_hash, status="rejected")
 
+    def board() -> Dashboard:
+        if dashboard is None:
+            raise HTTPException(503, {"error": "the dashboard has no database"})
+        return dashboard
+
+    @app.get("/api/book", response_model=BookResponse)
+    def get_book(refresh: bool = False) -> BookResponse:
+        """The account's positions and idle cash, read live (cached a minute)."""
+        try:
+            return board().book(refresh=refresh)
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise HTTPException(502, {"error": f"book read failed: {error}"}) from error
+
+    @app.get("/api/nav", response_model=NavResponse)
+    def get_nav() -> NavResponse:
+        """The NAV history the backfill has derived, and what it could not read."""
+        return board().nav()
+
+    @app.post("/api/nav/backfill", response_model=BackfillResponse, status_code=202)
+    async def start_backfill() -> BackfillResponse:
+        """Read any closed day still missing, then rebuild NAV, in the background."""
+        current = board()
+        if current.backfilling:
+            return BackfillResponse(started=False)
+        task = asyncio.create_task(asyncio.to_thread(current.backfill))
+        task.add_done_callback(_log_failure)
+        return BackfillResponse(started=True)
+
+    @app.get("/api/jobs", response_model=list[JobRun])
+    def get_jobs(limit: int = 20) -> list[JobRun]:
+        return board().jobs(min(max(limit, 1), 100))
+
     # The MCP endpoint, served by the same process and store.
     app.router.routes.extend(mcp_app.routes)
 
@@ -171,6 +242,9 @@ def create_app(
     @app.get("/approve/{plan_hash}", include_in_schema=False)
     def approval_page(plan_hash: str) -> Response:
         return web_page()
+
+    for page in WEB_PAGES:
+        app.add_api_route(page, web_page, include_in_schema=False, methods=["GET"])
 
     app.add_middleware(
         LocalAccessMiddleware,

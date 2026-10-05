@@ -24,6 +24,12 @@ export type Review =
 export type ReviewBundle = Schemas["ReviewBundle"];
 export type TokenAmount = Schemas["TokenAmount"];
 export type ApproveResponse = Schemas["ApproveResponse"];
+export type Book = Schemas["BookResponse"];
+export type BookPosition = Schemas["BookPosition"];
+export type BookSlice = Schemas["BookSlice"];
+export type Nav = Schemas["NavResponse"];
+export type NavPoint = Schemas["NavPoint"];
+export type JobRun = Schemas["JobRun"];
 
 export class ApiError extends Error {
   constructor(
@@ -64,9 +70,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ plan_hash: hash }),
     }),
+  book: (refresh = false) => request<Book>(`/api/book${refresh ? "?refresh=true" : ""}`),
+  nav: () => request<Nav>("/api/nav"),
+  backfill: () => request<Schemas["BackfillResponse"]>("/api/nav/backfill", { method: "POST" }),
   reject: (hash: string) =>
     request<Schemas["RejectResponse"]>("/api/reject", {
       method: "POST",
       body: JSON.stringify({ plan_hash: hash }),
     }),
 };
+
+/** The days of the current ledger: from its last opening on. An earlier ledger
+ *  that was emptied (a test deposit, a full exit) is not this record. */
+export function currentLedger(days: NavPoint[]): NavPoint[] {
+  let start = -1;
+  days.forEach((day, index) => {
+    if (day.status === "opened") start = index;
+  });
+  return start < 0 ? [] : days.slice(start);
+}

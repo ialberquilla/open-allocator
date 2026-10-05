@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-/* The 1Tx product palette, shared with agent-showcase. Dark only: this is an
+/* The 1Tx product palette. Dark only: this is an
    operator's console, not a document. */
 :root {
   color-scheme: dark;
@@ -57,4 +57,12 @@ body {
 .table-scroll {
   scrollbar-width: thin;
   scrollbar-color: hsl(var(--border)) transparent;
+}
+
+@utility bg-glow {
+  background-image: radial-gradient(
+    circle at 50% -20%,
+    hsl(260 80% 60% / 0.15),
+    transparent 70%
+  );
 }

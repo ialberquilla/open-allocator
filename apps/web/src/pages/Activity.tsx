@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { api, type PlanSummary } from "@/lib/api";
 import { dateTime, label, shortHash } from "@/lib/format";
 
-export function Home() {
+export function Activity() {
   const [plans, setPlans] = useState<PlanSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,7 +18,7 @@ export function Home() {
   return (
     <div className="flex flex-col gap-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">Approvals</h1>
+        <h1 className="text-2xl font-bold tracking-tight">Activity</h1>
         <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
           Plans your MCP client proposed. Nothing runs until you approve it here or with{" "}
           <code className="text-foreground">open-allocator-ui approve &lt;hash&gt;</code>.

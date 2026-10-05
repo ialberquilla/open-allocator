@@ -7,7 +7,7 @@ library adds or renames into a failure here rather than a silent gap on the page
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -252,3 +252,120 @@ class ApproveResponse(BaseModel):
 class RejectResponse(BaseModel):
     plan_hash: str
     status: PlanStatus
+
+
+# The dashboard.
+
+
+class BookPosition(BaseModel):
+    instrument_id: str
+    protocol: str
+    chain_id: int
+    chain: str
+    symbol: str
+    name: str
+    yield_token_symbol: str | None
+    usd: float
+    # Of the deployed value, 0-1.
+    weight: float
+    # Current APY in percent, as 1Tx reports it; descriptive, not predictive.
+    apy: float | None
+    leverage: float | None
+
+
+class IdleBalance(BaseModel):
+    chain_id: int
+    chain: str
+    usd: float
+
+
+class BookSlice(BaseModel):
+    label: str
+    usd: float
+    weight: float
+
+
+class BookResponse(BaseModel):
+    account: str
+    read_at: datetime
+    total_usd: float
+    deployed_usd: float
+    idle_usd: float
+    # USD-weighted current APY of the positions that report one, in percent.
+    blended_apy: float | None
+    income_per_year_usd: float | None
+    # 1/sum(w^2) over position weights: concentration, not independence.
+    effective_positions: float | None
+    positions: list[BookPosition]
+    idle: list[IdleBalance]
+    by_protocol: list[BookSlice]
+    by_chain: list[BookSlice]
+    warnings: list[str]
+
+
+NavStatus = Literal["ok", "opened", "unknown", "empty"]
+
+
+class NavPoint(BaseModel):
+    day: date
+    # None on a day that could not be read: a gap, never a zero.
+    nav_usd: float | None
+    # Into positions, negative out of them. On the opening day, the whole NAV.
+    flow_usd: float | None
+    # Value of one unit, opened at 100; flows mint units, so they do not move it.
+    unit_price: float | None
+    # NAV change less flows; gross of gas.
+    yield_usd: float | None
+    status: NavStatus
+    reason: str | None
+
+
+class NavChain(BaseModel):
+    chain_id: int
+    chain: str
+    days_read: int
+    days_unknown: int
+    first_day: date | None
+    last_day: date | None
+    # Why the last backfill could not read this chain, if it could not.
+    error: str | None
+
+
+class NavSummary(BaseModel):
+    since: date | None
+    last_day: date | None
+    unit_price: float | None
+    nav_usd: float | None
+    # Since the current ledger opened; an earlier, emptied one is not counted.
+    total_return: float | None
+    # Compounded to a year; None under a week of history.
+    annualized_return: float | None
+    yield_usd: float
+    net_flow_usd: float
+    days: int
+    unknown_days: int
+
+
+class JobRun(BaseModel):
+    id: int
+    job: str
+    started_at: datetime
+    finished_at: datetime | None
+    status: str
+    detail: JsonObject | None
+
+
+class NavResponse(BaseModel):
+    account: str
+    start_day: date | None
+    start_notes: list[str]
+    days: list[NavPoint]
+    chains: list[NavChain]
+    summary: NavSummary
+    last_run: JobRun | None
+    backfilling: bool
+
+
+class BackfillResponse(BaseModel):
+    # False when a backfill was already running.
+    started: bool

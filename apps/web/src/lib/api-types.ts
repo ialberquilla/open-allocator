@@ -101,6 +101,83 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/book": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Book
+         * @description The account's positions and idle cash, read live (cached a minute).
+         */
+        get: operations["get_book_api_book_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/nav": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Nav
+         * @description The NAV history the backfill has derived, and what it could not read.
+         */
+        get: operations["get_nav_api_nav_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/nav/backfill": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start Backfill
+         * @description Read any closed day still missing, then rebuild NAV, in the background.
+         */
+        post: operations["start_backfill_api_nav_backfill_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Jobs */
+        get: operations["get_jobs_api_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -113,6 +190,77 @@ export interface components {
             result: {
                 [key: string]: unknown;
             };
+        };
+        /** BackfillResponse */
+        BackfillResponse: {
+            /** Started */
+            started: boolean;
+        };
+        /** BookPosition */
+        BookPosition: {
+            /** Instrument Id */
+            instrument_id: string;
+            /** Protocol */
+            protocol: string;
+            /** Chain Id */
+            chain_id: number;
+            /** Chain */
+            chain: string;
+            /** Symbol */
+            symbol: string;
+            /** Name */
+            name: string;
+            /** Yield Token Symbol */
+            yield_token_symbol: string | null;
+            /** Usd */
+            usd: number;
+            /** Weight */
+            weight: number;
+            /** Apy */
+            apy: number | null;
+            /** Leverage */
+            leverage: number | null;
+        };
+        /** BookResponse */
+        BookResponse: {
+            /** Account */
+            account: string;
+            /**
+             * Read At
+             * Format: date-time
+             */
+            read_at: string;
+            /** Total Usd */
+            total_usd: number;
+            /** Deployed Usd */
+            deployed_usd: number;
+            /** Idle Usd */
+            idle_usd: number;
+            /** Blended Apy */
+            blended_apy: number | null;
+            /** Income Per Year Usd */
+            income_per_year_usd: number | null;
+            /** Effective Positions */
+            effective_positions: number | null;
+            /** Positions */
+            positions: components["schemas"]["BookPosition"][];
+            /** Idle */
+            idle: components["schemas"]["IdleBalance"][];
+            /** By Protocol */
+            by_protocol: components["schemas"]["BookSlice"][];
+            /** By Chain */
+            by_chain: components["schemas"]["BookSlice"][];
+            /** Warnings */
+            warnings: string[];
+        };
+        /** BookSlice */
+        BookSlice: {
+            /** Label */
+            label: string;
+            /** Usd */
+            usd: number;
+            /** Weight */
+            weight: number;
         };
         /** BridgeReview */
         BridgeReview: {
@@ -182,6 +330,35 @@ export interface components {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
         };
+        /** IdleBalance */
+        IdleBalance: {
+            /** Chain Id */
+            chain_id: number;
+            /** Chain */
+            chain: string;
+            /** Usd */
+            usd: number;
+        };
+        /** JobRun */
+        JobRun: {
+            /** Id */
+            id: number;
+            /** Job */
+            job: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Finished At */
+            finished_at: string | null;
+            /** Status */
+            status: string;
+            /** Detail */
+            detail: {
+                [key: string]: unknown;
+            } | null;
+        };
         /** LoopCloseReview */
         LoopCloseReview: {
             /**
@@ -228,6 +405,86 @@ export interface components {
             notes: string[];
             /** Transactions */
             transactions: number;
+        };
+        /** NavChain */
+        NavChain: {
+            /** Chain Id */
+            chain_id: number;
+            /** Chain */
+            chain: string;
+            /** Days Read */
+            days_read: number;
+            /** Days Unknown */
+            days_unknown: number;
+            /** First Day */
+            first_day: string | null;
+            /** Last Day */
+            last_day: string | null;
+            /** Error */
+            error: string | null;
+        };
+        /** NavPoint */
+        NavPoint: {
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Nav Usd */
+            nav_usd: number | null;
+            /** Flow Usd */
+            flow_usd: number | null;
+            /** Unit Price */
+            unit_price: number | null;
+            /** Yield Usd */
+            yield_usd: number | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ok" | "opened" | "unknown" | "empty";
+            /** Reason */
+            reason: string | null;
+        };
+        /** NavResponse */
+        NavResponse: {
+            /** Account */
+            account: string;
+            /** Start Day */
+            start_day: string | null;
+            /** Start Notes */
+            start_notes: string[];
+            /** Days */
+            days: components["schemas"]["NavPoint"][];
+            /** Chains */
+            chains: components["schemas"]["NavChain"][];
+            summary: components["schemas"]["NavSummary"];
+            last_run: components["schemas"]["JobRun"] | null;
+            /** Backfilling */
+            backfilling: boolean;
+        };
+        /** NavSummary */
+        NavSummary: {
+            /** Since */
+            since: string | null;
+            /** Last Day */
+            last_day: string | null;
+            /** Unit Price */
+            unit_price: number | null;
+            /** Nav Usd */
+            nav_usd: number | null;
+            /** Total Return */
+            total_return: number | null;
+            /** Annualized Return */
+            annualized_return: number | null;
+            /** Yield Usd */
+            yield_usd: number;
+            /** Net Flow Usd */
+            net_flow_usd: number;
+            /** Days */
+            days: number;
+            /** Unknown Days */
+            unknown_days: number;
         };
         /** PlanHashRequest */
         PlanHashRequest: {
@@ -659,6 +916,108 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RejectResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_book_api_book_get: {
+        parameters: {
+            query?: {
+                refresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BookResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_nav_api_nav_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NavResponse"];
+                };
+            };
+        };
+    };
+    start_backfill_api_nav_backfill_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackfillResponse"];
+                };
+            };
+        };
+    };
+    get_jobs_api_jobs_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobRun"][];
                 };
             };
             /** @description Validation Error */

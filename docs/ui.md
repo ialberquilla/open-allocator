@@ -60,7 +60,9 @@ The stdio server keeps plans in memory and has no approval surface. Over stdio, 
 `oa_server` is a separate package in the uv workspace. It depends on the library; the library never imports it. One process serves:
 
 - `/mcp`: the same MCP server over streamable HTTP, storing plans in Postgres (`PostgresPlanStore`).
-- `/` and `/approve/<hash>`: the web app (`apps/web`): recent plans, and one plan's review with Approve and Reject.
+- `/`, `/book`, `/performance`, `/activity` and `/approve/<hash>`: the web app (`apps/web`), styled after agent-showcase: the book, its NAV history, recent plans, and one plan's review with Approve and Reject.
+- `GET /api/book` (`?refresh=true` to skip the one-minute cache): the live `positions` book with its aggregates (weights by protocol and chain, blended current APY, 1/Σw²), computed in Python.
+- `GET /api/nav`: the NAV series, its summary, per-chain coverage and the last backfill run. `POST /api/nav/backfill` starts one in the background (`202`). `GET /api/jobs`: recent job runs.
 - `GET /api/plans`: recent plans, newest first, with their status (`pending`, `expired`, `applying`, `applied`, `failed`, `rejected`).
 - `GET /api/plans/{hash}`: the stored plan an approval would apply, its `review` and status, and the recorded result or error. The page shows this, not the model's copy.
 - `POST /api/approve {"plan_hash"}`: applies that stored plan once, after re-checking it against the operator's policy (`OA_POLICY_PATH`, default `policy.yaml`), whatever policy the model planned under. Records the result or error on the plan row. `404` unknown, `410` expired, `409` used or mismatched, `422` policy violation.
@@ -76,9 +78,20 @@ make serve                    # builds the web app, starts Postgres, migrates, s
 
 The server prints a sign-in link and opens it in the browser (`--no-browser` to skip), and prints the `claude mcp add` command for its MCP endpoint. Settings: `OA_DATABASE_URL`, `OA_HOST`, `OA_PORT`, `OA_POLICY_PATH`, `OA_MCP_TOKEN`.
 
-From a terminal instead of the page: `uv run open-allocator-ui approve <hash>` or `reject <hash>`, against the same database and `.env`.
+From a terminal instead of the page: `uv run open-allocator-ui approve <hash>` or `reject <hash>`, against the same database and `.env`. `uv run open-allocator-ui backfill [--since YYYY-MM-DD]` fills the NAV history without serving.
 
 For web development, run the server, then `make dev` (Vite on `:5173`, proxying `/api` and `/login` to `:8787`). `make types` regenerates `apps/web/src/lib/api-types.ts` from the server's OpenAPI; the review's shape is pinned in `oa_server/schemas.py`.
+
+### NAV history
+
+The history is rebuilt from chain reads alone, so it covers days the server was not running and days the wallet was driven from somewhere else. 1Tx has no wallet-history endpoint and free RPC tiers serve no useful `eth_getLogs` ranges, so only state reads at a block are used.
+
+- **What is tracked:** everything the configured Safe holds in instruments 1Tx lists (plus any it held and 1Tx has since delisted), from the day the Safe was first deployed on any chain (`nav_account.start_day`; `backfill --since` moves it).
+- **A close:** for each chain and each finished UTC day, the last block at or before 23:59:59Z (found by interpolation search), and at it, one Multicall3 of every listed yield token's `balanceOf`, then the held ones valued as 1Tx's `/positions` values them (`open_allocator.exec.chain_book`): ERC-4626 `convertToAssets`, Aave and forks `balanceOf` with `scaledBalanceOf` as the base count, Comet principal, Moonwell `balanceOfUnderlying`, Pendle PTs at `getPtToAssetRate` in their SY's accounting asset. USDC is 1; other assets are priced from DeFiLlama's historical prices.
+- **NAV:** darex's unit ledger (`open_allocator.core.nav`). NAV is the positions; idle USDC is outside it. A flow is the change in a position's base count valued at that day's price, so deposits, withdrawals and rebalances do not move the unit price. Unit price opens at 100. It is **gross of gas**, and value lost in a swap or bridge on the way between positions shows as a flow, not as a loss.
+- **Gaps, never zeros:** a chain the RPC cannot answer, a position with no price, or an Aave position with debt against it (a loop, which is not valued historically) leaves that day unknown, with its reason.
+- **Idempotent:** a close is read once and stored (`chain_close`, `position_close`); an unvalued one is read again each run. `nav_day` is rebuilt whole from the stored closes, so the same closes always give the same series. The server backfills on start and hourly (`--no-backfill` to skip); a Postgres advisory lock keeps one at a time.
+- **RPCs:** `RPC_URL_<chain>` from the environment or `.env`, else the public RPC. History needs an archive node: on a pruned RPC the backfill stops at the first refused day and the coverage table says which variable to set.
 
 ### Access
 
@@ -101,7 +114,7 @@ Plans proposed over this endpoint land in Postgres. The client never approves: a
 
 SQLAlchemy models in `oa_server/db/models.py`; Alembic migrations are autogenerated from them (`uv run --directory apps/server alembic revision --autogenerate -m "…"`), never hand-written. The launcher runs `upgrade head` at start. `test_migrations.py` runs `alembic check`, so a model change without its migration fails.
 
-Tables: `plan` (hash, kind, plan, created/expires/used, result, error), and the execution state: `idempotency_key` (scope, key, value), `checkpoint` (id, checkpoint), `allocation_log` (append-only entries).
+Tables: `plan` (hash, kind, plan, created/expires/used, result, error); the NAV history: `nav_account`, `chain_close`, `position_close`, `nav_day`, `job_run`; and the execution state: `idempotency_key` (scope, key, value), `checkpoint` (id, checkpoint), `allocation_log` (append-only entries).
 
 All of the server's state is here. At start it plugs `oa_server.state.PostgresStateBackend` into the library's state port (`open_allocator.service.use_state_backend`), so planning and approval read and write completed steps, bridge transfers, checkpoints and the allocation log in Postgres, not under `.open_allocator/`. The CLI never does this and keeps its files, so it works without Docker. The two are separate: drive a wallet from one or the other, since a transfer the CLI started is invisible to the server and the reverse.
 

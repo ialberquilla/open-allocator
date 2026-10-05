@@ -1,17 +1,20 @@
 import type { ReactNode } from "react";
 
-export function Shell({ children }: { children: ReactNode }) {
+import { Navbar } from "@/components/Navbar";
+
+export function Shell({ pathname, children }: { pathname: string; children: ReactNode }) {
   return (
-    <div className="min-h-screen">
-      <nav className="border-b">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3">
-          <a href="/" className="text-sm font-bold tracking-tight">
-            Open Allocator
-          </a>
-          <span className="text-xs text-muted-foreground">local · 127.0.0.1</span>
+    <div className="bg-glow flex min-h-screen flex-col">
+      <Navbar pathname={pathname} />
+      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-8 sm:px-6">{children}</main>
+      {/* Room for the fixed mobile tab bar; it is not in flow. */}
+      <footer className="border-t border-border/60 py-6 pb-[calc(5rem+env(safe-area-inset-bottom))] md:pb-6">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-4 gap-y-1 px-4 text-xs text-muted-foreground sm:px-6">
+          <span>Informational only. Not investment advice.</span>
+          <span className="text-border">·</span>
+          <span>Served locally on 127.0.0.1. Numbers are read from chain and from 1Tx.</span>
         </div>
-      </nav>
-      <main className="mx-auto max-w-5xl px-4 py-8">{children}</main>
+      </footer>
     </div>
   );
 }
