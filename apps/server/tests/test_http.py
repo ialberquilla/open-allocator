@@ -179,8 +179,7 @@ def test_every_dashboard_page_serves_the_web_app(tmp_path: Path, path: str) -> N
 
 class FakeDashboard:
     def __init__(self) -> None:
-        self.backfills = 0
-        self.backfilling = False
+        self.started: list[str] = []
 
     def book(self, *, refresh: bool = False) -> Any:
         from datetime import UTC, datetime
@@ -203,6 +202,8 @@ class FakeDashboard:
             days=[],
             chains=[],
             summary=_summary([]),
+            by_position=[],
+            by_protocol=[],
             last_run=None,
             backfilling=False,
         )
@@ -214,11 +215,29 @@ class FakeDashboard:
 
         return shelf_view(([], []), read_at=datetime(2026, 10, 4, tzinfo=UTC))
 
-    def backfill(self) -> bool:
-        self.backfills += 1
+    def rewards(self, *, refresh: bool = False) -> Any:
+        from datetime import UTC, datetime
+
+        from oa_server.dashboard import rewards_view
+
+        return rewards_view(
+            {"wallet": "0xabc", "rewards": [], "errors": []},
+            read_at=datetime(2026, 10, 4, tzinfo=UTC),
+        )
+
+    def run_job(self, name: str) -> bool:
+        self.started.append(name)
         return True
 
-    def jobs(self, limit: int = 20) -> list[Any]:
+    def running(self) -> list[str]:
+        return ["shelf"]
+
+    def jobs(self, limit: int = 20) -> Any:
+        from oa_server.schemas import JobsResponse
+
+        return JobsResponse(latest={}, runs=[], running=[])
+
+    def executions(self, limit: int = 50) -> list[Any]:
         return []
 
 
@@ -226,17 +245,26 @@ def test_dashboard_routes_need_the_browser_token() -> None:
     board = FakeDashboard()
     app = create_app(settings(), InMemoryPlanStore(), dashboard=board)  # type: ignore[arg-type]
     with TestClient(app, base_url=BASE_URL) as client:
-        for path in ("/api/book", "/api/shelf", "/api/nav", "/api/jobs"):
+        for path in (
+            "/api/book",
+            "/api/shelf",
+            "/api/nav",
+            "/api/jobs",
+            "/api/rewards",
+            "/api/executions",
+        ):
             assert client.get(path).status_code == 401
             assert client.get(path, headers=mcp_authorized()).status_code == 401
             assert client.get(path, headers=authorized()).status_code == 200
-        assert (
-            client.post("/api/nav/backfill", headers=mcp_authorized()).status_code
-            == 401
-        )
-        started = client.post("/api/nav/backfill", headers=authorized())
-    assert started.status_code == 202 and started.json() == {"started": True}
-    assert board.backfills == 1
+        assert client.post("/api/jobs/nav", headers=mcp_authorized()).status_code == 401
+        started = client.post("/api/jobs/nav", headers=authorized())
+        busy = client.post("/api/jobs/shelf", headers=authorized())
+        unknown = client.post("/api/jobs/drift", headers=authorized())
+    assert started.status_code == 202
+    assert started.json() == {"job": "nav", "started": True}
+    assert busy.json() == {"job": "shelf", "started": False}
+    assert unknown.status_code == 422
+    assert board.started == ["nav"]
 
 
 def test_dashboard_routes_without_a_database_are_unavailable(

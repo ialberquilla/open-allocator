@@ -32,6 +32,12 @@ export type ShelfVault = Schemas["ShelfVault"];
 export type Nav = Schemas["NavResponse"];
 export type NavPoint = Schemas["NavPoint"];
 export type JobRun = Schemas["JobRun"];
+export type JobName = Schemas["JobStartResponse"]["job"];
+export type Jobs = Schemas["JobsResponse"];
+export type Execution = Schemas["Execution"];
+export type Rewards = Schemas["RewardsResponse"];
+export type PositionYield = Schemas["PositionYield"];
+export type ProtocolYield = Schemas["ProtocolYield"];
 
 export class ApiError extends Error {
   constructor(
@@ -75,7 +81,11 @@ export const api = {
   book: (refresh = false) => request<Book>(`/api/book${refresh ? "?refresh=true" : ""}`),
   shelf: (refresh = false) => request<Shelf>(`/api/shelf${refresh ? "?refresh=true" : ""}`),
   nav: () => request<Nav>("/api/nav"),
-  backfill: () => request<Schemas["BackfillResponse"]>("/api/nav/backfill", { method: "POST" }),
+  rewards: (refresh = false) => request<Rewards>(`/api/rewards${refresh ? "?refresh=true" : ""}`),
+  executions: () => request<Execution[]>("/api/executions"),
+  jobs: () => request<Jobs>("/api/jobs"),
+  startJob: (name: JobName) =>
+    request<Schemas["JobStartResponse"]>(`/api/jobs/${name}`, { method: "POST" }),
   reject: (hash: string) =>
     request<Schemas["RejectResponse"]>("/api/reject", {
       method: "POST",

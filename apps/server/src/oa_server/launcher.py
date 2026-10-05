@@ -27,6 +27,7 @@ from oa_server.approval import PostgresPlanStore, approve, reject
 from oa_server.auth import load_mcp_token, new_token
 from oa_server.dashboard import (
     BACKFILL_INTERVAL_SECONDS,
+    REWARDS_INTERVAL_SECONDS,
     SHELF_INTERVAL_SECONDS,
     Dashboard,
 )
@@ -82,8 +83,11 @@ def serve(args: argparse.Namespace) -> None:
         settings,
         PostgresPlanStore(engine),
         dashboard=Dashboard(engine),
-        backfill_every=None if args.no_backfill else BACKFILL_INTERVAL_SECONDS,
-        shelf_every=SHELF_INTERVAL_SECONDS,
+        every={
+            "shelf": SHELF_INTERVAL_SECONDS,
+            "rewards": REWARDS_INTERVAL_SECONDS,
+        }
+        | ({} if args.no_backfill else {"nav": BACKFILL_INTERVAL_SECONDS}),
     )
     login_url = settings.login_url()
     print(

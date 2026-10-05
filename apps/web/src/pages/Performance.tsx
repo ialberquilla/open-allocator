@@ -8,7 +8,7 @@ import { Cell, Table } from "@/components/Table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { api, currentLedger, type NavPoint } from "@/lib/api";
+import { api, currentLedger, type Nav, type NavPoint, type PositionYield } from "@/lib/api";
 import { chainColor } from "@/lib/chains";
 import { ago, fineUsd, signed, usd } from "@/lib/format";
 import { useApi } from "@/lib/useApi";
@@ -35,7 +35,7 @@ export function Performance() {
   async function backfill() {
     setStarting(true);
     try {
-      await api.backfill();
+      await api.startJob("nav");
     } finally {
       setStarting(false);
       nav.reload();
@@ -117,6 +117,8 @@ export function Performance() {
         </Card>
       )}
 
+      {data && data.by_position.length > 0 && <Attribution nav={data} />}
+
       {days.length > 0 && (
         <Card>
           <CardHeader title="Daily closes" description="Newest first." />
@@ -130,6 +132,70 @@ export function Performance() {
         </Card>
       )}
     </div>
+  );
+}
+
+function Attribution({ nav }: { nav: Nav }) {
+  const unattributed = nav.summary.yield_usd - nav.by_position.reduce((sum, p) => sum + p.yield_usd, 0);
+  return (
+    <section className="grid gap-4 lg:grid-cols-[1fr_2fr]">
+      <Card>
+        <CardHeader title="Yield by protocol" description="Since the ledger opened, gross of gas." />
+        <CardContent className="space-y-2">
+          {nav.by_protocol.map((share) => (
+            <div key={share.protocol} className="flex items-center justify-between gap-3 text-sm">
+              <span>{share.protocol}</span>
+              <span className={`tabular-nums ${share.yield_usd < 0 ? "text-destructive" : "text-success"}`}>
+                {signed(share.yield_usd, fineUsd)}
+              </span>
+            </div>
+          ))}
+          {Math.abs(unattributed) >= 0.0001 && (
+            <p className="pt-2 text-xs text-muted-foreground">
+              {signed(unattributed, fineUsd)} of the ledger's yield is in no position: what a position earned on the
+              day it entered or left.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader
+          title="Yield by position"
+          description="Value change less flows, on each day a position was held at both closes."
+        />
+        <CardContent>
+          <Table head={["Position", "Protocol", "Chain", "Yield", "Unsplit days"]} minWidth={560}>
+            {nav.by_position.map((share) => (
+              <PositionRow key={`${share.chain_id}:${share.instrument_id}`} share={share} />
+            ))}
+          </Table>
+        </CardContent>
+      </Card>
+    </section>
+  );
+}
+
+function PositionRow({ share }: { share: PositionYield }) {
+  return (
+    <tr>
+      <Cell>{share.symbol}</Cell>
+      <Cell>{share.protocol}</Cell>
+      <Cell>
+        <span style={{ color: chainColor(share.chain_id) }}>{share.chain}</span>
+      </Cell>
+      <Cell className={`tabular-nums ${share.yield_usd < 0 ? "text-destructive" : "text-success"}`}>
+        {signed(share.yield_usd, fineUsd)}
+      </Cell>
+      <Cell className="tabular-nums text-muted-foreground">
+        {share.unknown_days > 0 ? (
+          <span className="text-warning" title="Days its flow could not be split from its return, such as a loop resized">
+            {share.unknown_days}
+          </span>
+        ) : (
+          "—"
+        )}
+      </Cell>
+    </tr>
   );
 }
 

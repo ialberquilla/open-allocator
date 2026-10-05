@@ -121,6 +121,8 @@ class PositionCloseRow(Base):
     price_source: Mapped[str | None] = mapped_column(String(16))
     usd_micro: Mapped[int | None] = mapped_column(BigInteger)
     reason: Mapped[str | None] = mapped_column(Text)
+    # A loop's debt token scaled balance; None for a position with no debt.
+    debt_shares_raw: Mapped[Decimal | None] = mapped_column(_RAW)
 
 
 class NavDayRow(Base):
@@ -138,6 +140,23 @@ class NavDayRow(Base):
     yield_micro: Mapped[int | None] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(String(16))
     reason: Mapped[str | None] = mapped_column(Text)
+
+
+class PositionYieldRow(Base):
+    """One position's share of the current ledger's return; rebuilt with
+    `nav_day`, not edited."""
+
+    __tablename__ = "position_yield"
+
+    account: Mapped[str] = mapped_column(String(42), primary_key=True)
+    chain_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    instrument_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    protocol: Mapped[str] = mapped_column(Text)
+    symbol: Mapped[str] = mapped_column(Text)
+    # Over the days its flow could be split from its return; gross of gas.
+    yield_micro: Mapped[int] = mapped_column(BigInteger)
+    # Days held at both ends whose return could not be split from a flow.
+    unknown_days: Mapped[int] = mapped_column(Integer)
 
 
 class JobRunRow(Base):

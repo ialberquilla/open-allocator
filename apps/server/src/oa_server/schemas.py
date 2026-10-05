@@ -355,6 +355,25 @@ class JobRun(BaseModel):
     detail: JsonObject | None
 
 
+class PositionYield(BaseModel):
+    chain_id: int
+    chain: str
+    instrument_id: str
+    protocol: str
+    symbol: str
+    # Earned while held, over the days its flow could be split from its
+    # return; gross of gas.
+    yield_usd: float
+    # Days held at both ends whose return could not be split from a flow.
+    unknown_days: int
+
+
+class ProtocolYield(BaseModel):
+    protocol: str
+    yield_usd: float
+    unknown_days: int
+
+
 class NavResponse(BaseModel):
     account: str
     start_day: date | None
@@ -362,13 +381,71 @@ class NavResponse(BaseModel):
     days: list[NavPoint]
     chains: list[NavChain]
     summary: NavSummary
+    # The current ledger's return by position and by protocol, largest first.
+    # It need not add up to the summary's yield: the part of a day earned by
+    # a position entering or leaving is in NAV but in no position.
+    by_position: list[PositionYield]
+    by_protocol: list[ProtocolYield]
     last_run: JobRun | None
     backfilling: bool
 
 
-class BackfillResponse(BaseModel):
-    # False when a backfill was already running.
+JobName = Literal["nav", "shelf", "rewards"]
+
+
+class JobStartResponse(BaseModel):
+    job: JobName
+    # False when that job was already running.
     started: bool
+
+
+class JobsResponse(BaseModel):
+    # The last run of each job, by name; a job that never ran is absent.
+    latest: dict[str, JobRun]
+    # Every job's runs, newest first.
+    runs: list[JobRun]
+    running: list[JobName]
+
+
+class Execution(BaseModel):
+    """One executed action from the allocation log."""
+
+    id: int
+    logged_at: datetime
+    instrument_id: str
+    chain_id: int
+    chain: str
+    action_type: str
+    tx_hash: str
+    usd: float | None
+    shares: str | None
+    share_price: str | None
+    basis: str
+
+
+class Reward(BaseModel):
+    provider: str
+    chain_id: int
+    chain: str
+    token: str
+    symbol: str
+    claimable: str
+    pending: str
+    # What claiming and swapping to USDC would bring, as 1Tx quotes it; None
+    # when there is no route or quote. A USDC reward is its own amount.
+    usd: float | None
+    swap_status: str
+    instrument_ids: list[str]
+
+
+class RewardsResponse(BaseModel):
+    wallet: str
+    read_at: datetime
+    rewards: list[Reward]
+    # The sum of the rewards that have a USD value; the others are unpriced.
+    claimable_usd: float
+    unpriced: int
+    errors: list[str]
 
 
 class ShelfVault(BaseModel):

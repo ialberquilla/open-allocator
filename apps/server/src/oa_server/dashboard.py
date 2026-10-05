@@ -1,11 +1,13 @@
-"""What the dashboard pages read: the live book, the shelf, the NAV history, job
-runs.
+"""What the dashboard pages read: the live book, the shelf, the rewards, the NAV
+history, executions and job runs.
 
 Every number a page shows is computed here or in the library; the web app only
 formats. The book is read live through the service layer (cached briefly, it
 takes seconds). The shelf is discovery with its metric history, which takes
-about a minute, so it is read on start and hourly and served from memory. The
-NAV history comes from the tables the backfill writes.
+about a minute, so it is read on start and hourly and served from memory; the
+rewards likewise, though they are one call. The NAV history comes from the
+tables the backfill writes. There is no intraday NAV: a day enters the history
+once it has closed, and the book is what is held now.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -22,17 +24,31 @@ from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from oa_server import nav_job
-from oa_server.db.models import ChainCloseRow, JobRunRow, NavAccountRow, NavDayRow
+from oa_server.db.models import (
+    AllocationLogRow,
+    ChainCloseRow,
+    JobRunRow,
+    NavAccountRow,
+    NavDayRow,
+    PositionYieldRow,
+)
+from oa_server.jobs import JOBS, recorded
 from oa_server.schemas import (
     BookPosition,
     BookResponse,
     BookSlice,
+    Execution,
     IdleBalance,
     JobRun,
+    JobsResponse,
     NavChain,
     NavPoint,
     NavResponse,
     NavSummary,
+    PositionYield,
+    ProtocolYield,
+    Reward,
+    RewardsResponse,
     ShelfResponse,
     ShelfVault,
 )
@@ -42,14 +58,18 @@ from open_allocator.exec import chains
 from open_allocator.service import nav as nav_service
 from open_allocator.service import universe
 from open_allocator.service.positions import positions as read_positions
+from open_allocator.service.positions import rewards as rewards_of
 
 JsonObject = dict[str, Any]
 
 BOOK_TTL_SECONDS = 60
 SHELF_TTL_SECONDS = 3600
-# How often the server backfills, and reads the shelf, on its own once started.
+REWARDS_TTL_SECONDS = 3600
+# How often the server backfills, and reads the shelf and the rewards, on its
+# own once started.
 BACKFILL_INTERVAL_SECONDS = 3600
 SHELF_INTERVAL_SECONDS = 3600
+REWARDS_INTERVAL_SECONDS = 3600
 
 ShelfRead = tuple[list[Vault], list[JsonObject]]
 
@@ -59,6 +79,57 @@ def read_shelf() -> ShelfRead:
     warnings: list[JsonObject] = []
     vaults = universe.discover_vaults(enrich=True, on_warning=warnings.append)
     return vaults, warnings
+
+
+def read_rewards() -> JsonObject:
+    """The tracked account's claimable rewards, as the `rewards` command reads them."""
+    return rewards_of(nav_service.book_account())
+
+
+def rewards_view(payload: JsonObject, *, read_at: datetime) -> RewardsResponse:
+    """The `rewards` payload, each reward valued where 1Tx quotes a USDC route."""
+    rows = []
+    for item in payload.get("rewards") or []:
+        token = item["reward_token"]
+        chain_id = int(item["chain_id"])
+        rows.append(
+            Reward(
+                provider=item["provider"],
+                chain_id=chain_id,
+                chain=chains.chain_name(chain_id),
+                token=token["address"],
+                symbol=token["symbol"],
+                claimable=item["claimable_amount_normalized"],
+                pending=item["pending_amount_normalized"],
+                usd=_reward_usd(item, chain_id),
+                swap_status=(item.get("swap") or {}).get("status") or "unavailable",
+                instrument_ids=list(item.get("instrument_ids") or []),
+            )
+        )
+    rows.sort(key=lambda r: r.usd or 0.0, reverse=True)
+    return RewardsResponse(
+        wallet=payload.get("wallet") or "",
+        read_at=read_at,
+        rewards=rows,
+        claimable_usd=sum(r.usd for r in rows if r.usd is not None),
+        unpriced=sum(1 for r in rows if r.usd is None),
+        errors=[str(e) for e in payload.get("errors") or []],
+    )
+
+
+def _reward_usd(item: JsonObject, chain_id: int) -> float | None:
+    usdc = (chains.usdc_address(chain_id) or "").lower()
+    if not usdc:
+        return None
+    if item["reward_token"]["address"].lower() == usdc:
+        return float(Decimal(item["claimable_amount_normalized"]))
+    swap = item.get("swap") or {}
+    out = swap.get("expected_amount_out")
+    if swap.get("status") != "ready" or out is None:
+        return None
+    if str(swap.get("token_out") or "").lower() != usdc:
+        return None
+    return int(out) / 10**6
 
 
 def book_view(payload: JsonObject, *, read_at: datetime) -> BookResponse:
@@ -194,6 +265,7 @@ class Dashboard:
         *,
         read_book: Callable[[], JsonObject] = read_positions,
         read_shelf: Callable[[], ShelfRead] = read_shelf,
+        read_rewards: Callable[[], JsonObject] = read_rewards,
         account: Callable[[], str] = nav_service.book_account,
         run_backfill: Callable[[], object] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -201,6 +273,7 @@ class Dashboard:
         self._engine = engine
         self._read_book = read_book
         self._read_shelf = read_shelf
+        self._read_rewards = read_rewards
         self._account = account
         self._run_backfill = run_backfill or (lambda: nav_job.backfill(engine))
         self._clock = clock
@@ -208,7 +281,17 @@ class Dashboard:
         self._book_lock = threading.Lock()
         self._shelf: tuple[float, ShelfResponse] | None = None
         self._shelf_lock = threading.Lock()
+        self._rewards: tuple[float, RewardsResponse] | None = None
+        self._rewards_lock = threading.Lock()
         self._backfill_lock = threading.Lock()
+        self._running: set[str] = set()
+
+    def _record(
+        self, job: str, run: Callable[[], Any], detail: Callable[[Any], JsonObject]
+    ) -> Any:
+        if self._engine is None:  # a dashboard with no database, in tests
+            return run()
+        return recorded(self._engine, job, run, detail)
 
     def book(self, *, refresh: bool = False) -> BookResponse:
         with self._book_lock:
@@ -236,9 +319,58 @@ class Dashboard:
                 or (not refresh and asked - cached[0] < SHELF_TTL_SECONDS)
             ):
                 return cached[1]
-            view = shelf_view(self._read_shelf(), read_at=self._clock())
+            view = self._record(
+                "shelf",
+                lambda: shelf_view(self._read_shelf(), read_at=self._clock()),
+                lambda v: {"vaults": len(v.vaults), "warnings": v.warnings},
+            )
             self._shelf = (time.monotonic(), view)
             return view
+
+    def rewards(self, *, refresh: bool = False) -> RewardsResponse:
+        """The cached rewards, read first if missing, stale or asked for."""
+        asked = time.monotonic()
+        with self._rewards_lock:
+            cached = self._rewards
+            if cached and (
+                cached[0] >= asked
+                or (not refresh and asked - cached[0] < REWARDS_TTL_SECONDS)
+            ):
+                return cached[1]
+            view = self._record(
+                "rewards",
+                lambda: rewards_view(self._read_rewards(), read_at=self._clock()),
+                lambda v: {
+                    "rewards": len(v.rewards),
+                    "claimable_usd": v.claimable_usd,
+                    "unpriced": v.unpriced,
+                    "errors": v.errors,
+                },
+            )
+            self._rewards = (time.monotonic(), view)
+            return view
+
+    def run_job(self, name: str) -> bool:
+        """Run one job now; False when it is already running here."""
+        if name == "nav":
+            return self.backfill()
+        if name not in JOBS:
+            raise ValueError(f"no job {name}")
+        if name in self._running:
+            return False
+        self._running.add(name)
+        try:
+            if name == "shelf":
+                self.shelf(refresh=True)
+            else:
+                self.rewards(refresh=True)
+        finally:
+            self._running.discard(name)
+        return True
+
+    def running(self) -> list[str]:
+        names = set(self._running) | ({"nav"} if self.backfilling else set())
+        return [name for name in JOBS if name in names]
 
     def backfill(self) -> bool:
         """Run one backfill unless one is already running here; False if it was."""
@@ -272,6 +404,9 @@ class Dashboard:
                 .order_by(JobRunRow.id.desc())
                 .limit(1)
             ).first()
+            shares = session.scalars(
+                select(PositionYieldRow).where(PositionYieldRow.account == account)
+            ).all()
         points = [_point(row) for row in days]
         detail = (last.detail or {}) if last else {}
         errors = detail.get("errors") or {}
@@ -301,16 +436,96 @@ class Dashboard:
             days=points,
             chains=coverage,
             summary=_summary(points),
+            by_position=_by_position(shares),
+            by_protocol=_by_protocol(shares),
             last_run=_job(last) if last else None,
             backfilling=self.backfilling,
         )
 
-    def jobs(self, limit: int = 20) -> list[JobRun]:
+    def jobs(self, limit: int = 20) -> JobsResponse:
         with Session(self._engine) as session:
             rows = session.scalars(
                 select(JobRunRow).order_by(JobRunRow.id.desc()).limit(limit)
             ).all()
-        return [_job(row) for row in rows]
+            latest = {
+                job: session.scalars(
+                    select(JobRunRow)
+                    .where(JobRunRow.job == job)
+                    .order_by(JobRunRow.id.desc())
+                    .limit(1)
+                ).first()
+                for job in JOBS
+            }
+        return JobsResponse(
+            latest={job: _job(row) for job, row in latest.items() if row is not None},
+            runs=[_job(row) for row in rows],
+            running=self.running(),  # type: ignore[arg-type]
+        )
+
+    def executions(self, limit: int = 50) -> list[Execution]:
+        """What the server's execution runs logged, newest first. The CLI keeps
+        its own log in files; what it executed is not here."""
+        with Session(self._engine) as session:
+            rows = session.scalars(
+                select(AllocationLogRow)
+                .order_by(AllocationLogRow.id.desc())
+                .limit(limit)
+            ).all()
+        return [_execution(row) for row in rows]
+
+
+def _execution(row: AllocationLogRow) -> Execution:
+    entry = row.entry
+    chain_id = int(entry["chain_id"])
+    return Execution(
+        id=row.id,
+        logged_at=row.logged_at,
+        instrument_id=entry["instrument_id"],
+        chain_id=chain_id,
+        chain=chains.chain_name(chain_id),
+        action_type=entry["action_type"],
+        tx_hash=entry["tx_hash"],
+        usd=entry.get("usd"),
+        shares=entry.get("shares"),
+        share_price=entry.get("share_price"),
+        basis=entry.get("basis") or "unresolved",
+    )
+
+
+def _by_position(rows: Sequence[PositionYieldRow]) -> list[PositionYield]:
+    shares = [
+        PositionYield(
+            chain_id=row.chain_id,
+            chain=chains.chain_name(row.chain_id),
+            instrument_id=row.instrument_id,
+            protocol=row.protocol,
+            symbol=row.symbol,
+            yield_usd=row.yield_micro / ONE_USD,
+            unknown_days=row.unknown_days,
+        )
+        for row in rows
+    ]
+    return sorted(shares, key=lambda share: share.yield_usd, reverse=True)
+
+
+def _by_protocol(rows: Sequence[PositionYieldRow]) -> list[ProtocolYield]:
+    earned: dict[str, int] = {}
+    unknown: dict[str, int] = {}
+    for row in rows:
+        earned[row.protocol] = earned.get(row.protocol, 0) + row.yield_micro
+        unknown[row.protocol] = unknown.get(row.protocol, 0) + row.unknown_days
+    return sorted(
+        (
+            ProtocolYield(
+                protocol=protocol,
+                yield_usd=micro / ONE_USD,
+                unknown_days=unknown[protocol],
+            )
+            for protocol, micro in earned.items()
+        ),
+        key=lambda share: share.yield_usd,
+        reverse=True,
+    )
 
 
 def _usd(micro: int | None) -> float | None:

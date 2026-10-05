@@ -157,28 +157,81 @@ def test_positions_not_held_are_not_reported() -> None:
     assert read(chain, [instrument("Morpho", vault)]).positions == ()
 
 
-def test_aave_uses_the_scaled_balance_as_base_and_flags_debt_as_a_loop() -> None:
+def test_aave_uses_the_scaled_balance_as_base() -> None:
     chain = FakeChain(head=200)
     atoken, pool = "0x" + "22" * 20, "0x" + "99" * 20
     chain.on(atoken, "balanceOf(address)", balance(5_000_000))
     chain.on(atoken, "scaledBalanceOf(address)", balance(4_800_000))
     chain.on(atoken, "POOL()", lambda _a, _b: address_word(pool))
-    debt = {"value": 0}
     chain.on(
-        pool,
-        "getUserAccountData(address)",
-        lambda _a, _b: word(10**8, debt["value"], 0, 0, 0, 0),
+        pool, "getUserAccountData(address)", lambda _a, _b: word(10**8, 0, 0, 0, 0, 0)
     )
     close = read(chain, [instrument("Aave", atoken)])
     assert close.ok
     assert close.positions[0].base_shares_raw == 4_800_000
     assert close.positions[0].usd_micro == 5_000_000
+    assert close.positions[0].debt_shares_raw is None
 
-    debt["value"] = 1
+
+def levered_pool(chain: FakeChain, atoken: str, pool: str, *, reserves: int) -> None:
+    """A pool where the Safe has 400 of collateral and 300 of debt (base
+    currency), borrowing reserve 3 (and reserve 5 too when ``reserves`` is 2)."""
+    usdc_reserve = "0x" + "c0" * 20
+    debt_token = "0x" + "d7" * 20
+    chain.on(atoken, "POOL()", lambda _a, _b: address_word(pool))
+    chain.on(
+        pool,
+        "getUserAccountData(address)",
+        lambda _a, _b: word(400 * 10**8, 300 * 10**8, 0, 0, 0, 10**18),
+    )
+    bitmap = (0b01 << 6) | (0b10 << 0) | ((0b01 << 10) if reserves == 2 else 0)
+    chain.on(pool, "getUserConfiguration(address)", lambda _a, _b: word(bitmap))
+    chain.on(
+        pool,
+        "getReserveAddressById(uint16)",
+        lambda args, _b: (
+            address_word(usdc_reserve) if abi_decode(["uint16"], args)[0] == 3 else None
+        ),
+    )
+    reserve = [0] * 15
+    reserve[10] = int(debt_token, 16)
+    chain.on(pool, "getReserveData(address)", lambda _a, _b: word(*reserve))
+    chain.on(debt_token, "scaledBalanceOf(address)", balance(290_000_000))
+
+
+def test_a_levered_aave_position_is_its_equity_with_its_debt_shares() -> None:
+    chain = FakeChain(head=200)
+    atoken, pool = "0x" + "22" * 20, "0x" + "99" * 20
+    chain.on(atoken, "balanceOf(address)", balance(400_000_000))
+    chain.on(atoken, "scaledBalanceOf(address)", balance(380_000_000))
+    levered_pool(chain, atoken, pool, reserves=1)
+    close = read(chain, [instrument("Neverland", atoken)])
+    assert close.ok
+    (position,) = close.positions
+    assert position.underlying_raw == 100_000_000
+    assert position.usd_micro == 100_000_000
+    assert position.base_shares_raw == 380_000_000
+    assert position.debt_shares_raw == 290_000_000
+
+
+def test_a_loop_whose_debt_cannot_be_attributed_is_unknown() -> None:
+    chain = FakeChain(head=200)
+    atoken, other, pool = "0x" + "22" * 20, "0x" + "23" * 20, "0x" + "99" * 20
+    chain.on(atoken, "balanceOf(address)", balance(400_000_000))
+    chain.on(atoken, "scaledBalanceOf(address)", balance(380_000_000))
+    levered_pool(chain, atoken, pool, reserves=2)
     close = read(chain, [instrument("Aave", atoken)])
     assert not close.ok
     assert close.positions[0].usd_micro is None
-    assert "levered" in (close.positions[0].reason or "")
+    assert "2 assets borrowed" in (close.positions[0].reason or "")
+
+    levered_pool(chain, atoken, pool, reserves=1)
+    chain.on(other, "balanceOf(address)", balance(1_000_000))
+    chain.on(other, "scaledBalanceOf(address)", balance(1_000_000))
+    chain.on(other, "POOL()", lambda _a, _b: address_word(pool))
+    close = read(chain, [instrument("Aave", atoken), instrument("Aave", other)])
+    assert not close.ok
+    assert all("share the pool's debt" in (p.reason or "") for p in close.positions)
 
 
 def test_comet_principal_and_moonwell_underlying() -> None:

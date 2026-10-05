@@ -10,7 +10,11 @@ Valuation follows 1Tx's own ``/positions`` (darex ``positions.service``):
 - ERC-4626 vaults: ``convertToAssets(shares)``; the shares are the base count.
 - Aave and its forks: ``balanceOf`` is the underlying; ``scaledBalanceOf`` is
   the base count, because the balance itself grows with yield. A position
-  with debt against it is a loop, and is not valued here.
+  with debt against it is a loop, valued at its equity as the live book does:
+  the collateral less the share of it the pool's debt-to-collateral ratio
+  takes. That needs it to be the account's only position in the pool,
+  borrowing one asset; the debt's scaled balance is reported too, so a day
+  the loop was resized is known as one.
 - Compound V3: ``balanceOf``; the principal from ``userBasic`` is the base.
 - Moonwell: ``balanceOfUnderlying``; the mToken balance is the base.
 - Pendle PTs: ``getPtToAssetRate(market)`` on the router-static; the PT
@@ -98,6 +102,9 @@ _BALANCE_OF_UNDERLYING = _selector("balanceOfUnderlying(address)")
 _PT_TO_ASSET_RATE = _selector("getPtToAssetRate(address)")
 _POOL = _selector("POOL()")
 _USER_ACCOUNT_DATA = _selector("getUserAccountData(address)")
+_USER_CONFIGURATION = _selector("getUserConfiguration(address)")
+_RESERVE_ADDRESS_BY_ID = _selector("getReserveAddressById(uint16)")
+_RESERVE_DATA = _selector("getReserveData(address)")
 _READ_TOKENS = _selector("readTokens()")
 _ASSET_INFO = _selector("assetInfo()")
 
@@ -340,6 +347,8 @@ class InstrumentClose:
     usd_micro: int | None
     # Why the position could not be valued; None when it was.
     reason: str | None = None
+    # A loop's debt, as the debt token's scaled balance; None when unlevered.
+    debt_shares_raw: int | None = None
 
 
 @dataclass(frozen=True)
@@ -413,7 +422,8 @@ def read_chain_close(
 
     Three multicalls: every listed yield token's balance; then, for the held
     ones, what they are worth in their asset; then the facts that depend on
-    those answers (an Aave pool's debt, a Pendle SY's accounting asset).
+    those answers (an Aave pool's debt, a Pendle SY's accounting asset). A
+    pool with debt takes three more, to find the debt's scaled balance.
     """
     listed = [i for i in instruments if i.chain_id == chain_id]
     owner = _address_arg(account)
@@ -453,13 +463,16 @@ def read_chain_close(
     third = _Batch()
     for item in held:
         if item.method == "aave" and (pool := _address(item.answer(second, "pool"))):
+            item.pool = pool
             item.ask(third, "account", pool, _USER_ACCOUNT_DATA + owner)
+            item.ask(third, "config", pool, _USER_CONFIGURATION + owner)
         elif item.method == "pendle_pt" and (
             sy := _address(item.answer(second, "tokens"))
         ):
             item.ask(third, "asset", sy, _ASSET_INFO)
     third.run(rpc, block.number)
 
+    _read_debt(rpc, block.number, owner, held, third)
     for item in held:
         _value(item, second, third)
 
@@ -501,6 +514,10 @@ class _Held:
     asks: dict[tuple[int, str], int] = field(default_factory=dict)
     underlying: int | None = None
     base: int | None = None
+    pool: str | None = None
+    # A loop's debt: its scaled balance, or why it could not be read.
+    debt_shares: int | None = None
+    debt_reason: str | None = None
     asset: str | None = None
     decimals: int | None = None
     reason: str | None = None
@@ -525,10 +542,21 @@ def _value(item: _Held, second: _Batch, third: _Batch) -> None:
         item.underlying = _uint(item.answer(second, "assets"))
         item.base = item.balance
     elif method == "aave":
-        if _word(item.answer(third, "account"), 1):
-            item.reason = "levered: the debt against it is not valued historically"
+        account = item.answer(third, "account")
+        collateral, debt = _word(account, 0), _word(account, 1)
         item.underlying = item.balance
         item.base = _uint(item.answer(second, "base"))
+        if debt:
+            if item.debt_reason:
+                item.reason = f"levered: {item.debt_reason}"
+            elif not collateral:
+                item.reason = "levered: the pool reports no collateral"
+            else:
+                # The live book's equity: the collateral less the share of it
+                # the pool's debt-to-collateral ratio takes.
+                item.underlying = max(
+                    item.balance * (collateral - debt) // collateral, 0
+                )
     elif method == "comet":
         principal = _int_word(item.answer(second, "basic"), 0)
         item.underlying = item.balance
@@ -580,7 +608,64 @@ def _close(
         price_source=source,
         usd_micro=usd,
         reason=reason,
+        debt_shares_raw=item.debt_shares,
     )
+
+
+def _read_debt(
+    rpc: Rpc, block: int, owner: bytes, held: Sequence[_Held], third: _Batch
+) -> None:
+    """Each levered Aave position's debt, as its debt token's scaled balance.
+
+    The pool's totals are the account's, so its debt is the loop's only when
+    the loop is the one position held in the pool and one asset is borrowed.
+    """
+    levered = [
+        item
+        for item in held
+        if item.method == "aave"
+        and item.pool
+        and _word(item.answer(third, "account"), 1)
+    ]
+    in_pool: dict[str, int] = {}
+    for item in held:
+        if item.pool:
+            in_pool[item.pool] = in_pool.get(item.pool, 0) + 1
+    borrowed: dict[int, int] = {}
+    fourth = _Batch()
+    for item in levered:
+        assert item.pool is not None
+        bitmap = _word(item.answer(third, "config"), 0) or 0
+        ids = [i for i in range(128) if (bitmap >> (2 * i)) & 0b01]
+        if in_pool[item.pool] != 1:
+            item.debt_reason = f"{in_pool[item.pool]} positions share the pool's debt"
+        elif len(ids) != 1:
+            item.debt_reason = f"{len(ids)} assets borrowed from the pool"
+        else:
+            borrowed[id(item)] = ids[0]
+            item.ask(
+                fourth, "reserve", item.pool, _RESERVE_ADDRESS_BY_ID + _u256(ids[0])
+            )
+    fourth.run(rpc, block)
+    fifth = _Batch()
+    for item in levered:
+        if id(item) in borrowed and (asset := _address(item.answer(fourth, "reserve"))):
+            assert item.pool is not None
+            item.ask(fifth, "data", item.pool, _RESERVE_DATA + _address_arg(asset))
+    fifth.run(rpc, block)
+    sixth = _Batch()
+    for item in levered:
+        # Aave v3's reserve data: the variable debt token is the eleventh word.
+        token = _address(_u256(_word(item.answer(fifth, "data"), 10) or 0))
+        if token:
+            item.ask(sixth, "debt", token, _SCALED_BALANCE_OF + owner)
+    sixth.run(rpc, block)
+    for item in levered:
+        if item.debt_reason:
+            continue
+        item.debt_shares = _uint(item.answer(sixth, "debt"))
+        if item.debt_shares is None:
+            item.debt_reason = "the debt token could not be read"
 
 
 def _u256(value: int) -> bytes:

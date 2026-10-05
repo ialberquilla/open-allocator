@@ -25,12 +25,13 @@ from sqlalchemy.orm import Session
 
 from oa_server.db.models import (
     ChainCloseRow,
-    JobRunRow,
     NavAccountRow,
     NavDayRow,
     PositionCloseRow,
+    PositionYieldRow,
 )
-from open_allocator.core.nav import PositionClose
+from oa_server.jobs import finish_run, start_run
+from open_allocator.core.nav import PositionClose, attribute_yield, position_key
 from open_allocator.exec.chain_book import (
     ArchiveUnavailable,
     ChainClose,
@@ -98,7 +99,7 @@ def backfill(
             result.notes.append("another backfill is running")
             return result
         try:
-            run_id = _start_run(engine)
+            run_id = start_run(engine, JOB)
             try:
                 _backfill(
                     engine,
@@ -109,12 +110,12 @@ def backfill(
                     first_day=first_day,
                 )
             except Exception as error:
-                _finish_run(
+                finish_run(
                     engine, run_id, "failed", {**result.payload(), "error": str(error)}
                 )
                 raise
             status = "ok" if not result.errors else "partial"
-            _finish_run(engine, run_id, status, result.payload())
+            finish_run(engine, run_id, status, result.payload())
         finally:
             lock.execute(text("select pg_advisory_unlock(:k)"), {"k": _LOCK_KEY})
     return result
@@ -260,6 +261,7 @@ def _store_close(engine: Engine, account: str, day: date, close: ChainClose) -> 
                 shares_raw=Decimal(p.shares_raw),
                 base_shares_raw=_decimal(p.base_shares_raw),
                 underlying_raw=_decimal(p.underlying_raw),
+                debt_shares_raw=_decimal(p.debt_shares_raw),
                 decimals=p.decimals,
                 price_usd=p.price_usd,
                 price_source=p.price_source,
@@ -271,11 +273,15 @@ def _store_close(engine: Engine, account: str, day: date, close: ChainClose) -> 
 
 
 def _rebuild_nav(engine: Engine, result: BackfillResult) -> None:
-    """Derive the whole series from the stored closes and replace it."""
+    """Derive the whole series, and each position's share of its return, from
+    the stored closes and replace them."""
     account = result.account
     with Session(engine) as session, session.begin():
         start = result.start_day
         session.execute(delete(NavDayRow).where(NavDayRow.account == account))
+        session.execute(
+            delete(PositionYieldRow).where(PositionYieldRow.account == account)
+        )
         if start is None:
             return
         closes = (
@@ -314,6 +320,9 @@ def _rebuild_nav(engine: Engine, result: BackfillResult) -> None:
                     if p.base_shares_raw is None
                     else int(p.base_shares_raw),
                     usd_micro=p.usd_micro,
+                    debt_shares=None
+                    if p.debt_shares_raw is None
+                    else int(p.debt_shares_raw),
                 )
             )
 
@@ -357,22 +366,35 @@ def _rebuild_nav(engine: Engine, result: BackfillResult) -> None:
         )
         result.nav_days = len(rows)
 
-
-def _start_run(engine: Engine) -> int:
-    with Session(engine) as session, session.begin():
-        row = JobRunRow(job=JOB, started_at=datetime.now(UTC), status="running")
-        session.add(row)
-        session.flush()
-        return row.id
-
-
-def _finish_run(
-    engine: Engine, run_id: int, status: str, detail: dict[str, Any]
-) -> None:
-    with Session(engine) as session, session.begin():
-        row = session.get(JobRunRow, run_id)
-        if row is not None:
-            row.status, row.detail, row.finished_at = status, detail, datetime.now(UTC)
+        # Attributed over the current ledger only: one emptied before it (a
+        # test deposit, a full exit) is not this record, as on the NAV page.
+        opened = [row.day for row in rows if row.status == "opened"]
+        if not opened:
+            return
+        since = date.fromisoformat(opened[-1])
+        described = {
+            position_key(p.chain_id, p.instrument_id): p
+            for p in sorted(positions, key=lambda p: p.day)
+        }
+        shares = attribute_yield(
+            None
+            if by_chain is None
+            else [leg for legs in by_chain.values() for leg in legs]
+            for day, by_chain, _reason in series
+            if date.fromisoformat(day) >= since
+        )
+        session.add_all(
+            PositionYieldRow(
+                account=account,
+                chain_id=described[key].chain_id,
+                instrument_id=described[key].instrument_id,
+                protocol=described[key].protocol,
+                symbol=described[key].symbol,
+                yield_micro=share.yield_micro,
+                unknown_days=share.unknown_days,
+            )
+            for key, share in shares.items()
+        )
 
 
 def _decimal(value: int | None) -> Decimal | None:

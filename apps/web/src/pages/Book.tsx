@@ -6,9 +6,11 @@ import { PositionsTable } from "@/components/PositionsTable";
 import { Notice } from "@/components/Shell";
 import { StatTile } from "@/components/StatTile";
 import { Button } from "@/components/ui/button";
+import { Cell, Table } from "@/components/Table";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { api, type BookSlice } from "@/lib/api";
-import { ago, pct, usd } from "@/lib/format";
+import { chainColor } from "@/lib/chains";
+import { ago, fineUsd, pct, usd } from "@/lib/format";
 import { seriesColor } from "@/lib/palette";
 import { useApi } from "@/lib/useApi";
 
@@ -72,8 +74,66 @@ export function Book() {
           </Card>
         </>
       )}
+
+      <RewardsCard />
     </div>
   );
+}
+
+function RewardsCard() {
+  const rewards = useApi(() => api.rewards());
+  const data = rewards.data;
+  return (
+    <Card>
+      <CardHeader
+        title="Claimable rewards"
+        description={
+          data
+            ? `${usd(data.claimable_usd)} where 1Tx quotes a swap to USDC${data.unpriced ? `; ${data.unpriced} unpriced` : ""} · read ${ago(data.read_at)}.`
+            : "Incentives the positions have earned, not yet claimed."
+        }
+      />
+      <CardContent>
+        {rewards.error && <p className="text-sm text-destructive">Could not read the rewards: {rewards.error}</p>}
+        {!data && !rewards.error && <p className="text-sm text-muted-foreground">Reading…</p>}
+        {data && data.errors.length > 0 && (
+          <p className="mb-3 text-sm text-warning">Some providers could not be read: {data.errors.join("; ")}</p>
+        )}
+        {data?.rewards.length === 0 && <p className="text-sm text-muted-foreground">Nothing to claim.</p>}
+        {data && data.rewards.length > 0 && (
+          <Table head={["Token", "Chain", "Provider", "Claimable", "Pending", "In USDC"]} minWidth={620}>
+            {data.rewards.map((reward) => (
+              <tr key={`${reward.chain_id}:${reward.provider}:${reward.token}`}>
+                <Cell className="font-semibold">{reward.symbol}</Cell>
+                <Cell>
+                  <span style={{ color: chainColor(reward.chain_id) }}>{reward.chain}</span>
+                </Cell>
+                <Cell className="text-muted-foreground">{reward.provider}</Cell>
+                <Cell className="tabular-nums">{trim(reward.claimable)}</Cell>
+                <Cell className="tabular-nums text-muted-foreground">{trim(reward.pending)}</Cell>
+                <Cell className="tabular-nums">
+                  {reward.usd == null ? (
+                    <span className="text-muted-foreground" title={`swap: ${reward.swap_status}`}>
+                      unpriced
+                    </span>
+                  ) : (
+                    fineUsd(reward.usd)
+                  )}
+                </Cell>
+              </tr>
+            ))}
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** A normalized token amount to six decimals, cut rather than rounded. */
+function trim(amount: string): string {
+  const [whole = "0", fraction = ""] = amount.split(".");
+  const kept = fraction.slice(0, 6).replace(/0+$/, "");
+  return kept ? `${whole}.${kept}` : whole;
 }
 
 function SliceCard({ title, slices }: { title: string; slices: BookSlice[] }) {

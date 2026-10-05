@@ -162,20 +162,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/nav/backfill": {
+    "/api/rewards": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
-        put?: never;
         /**
-         * Start Backfill
-         * @description Read any closed day still missing, then rebuild NAV, in the background.
+         * Get Rewards
+         * @description What the account can claim, read hourly; claiming is not offered here.
          */
-        post: operations["start_backfill_api_nav_backfill_post"];
+        get: operations["get_rewards_api_rewards_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/executions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Executions
+         * @description What the server's own execution runs logged, newest first.
+         */
+        get: operations["get_executions_api_executions_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -189,10 +209,34 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Jobs */
+        /**
+         * Get Jobs
+         * @description The last run of each job, and recent runs of all of them.
+         */
         get: operations["get_jobs_api_jobs_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start Job
+         * @description Run a job now, in the background: `nav` reads any closed day still
+         *     missing and rebuilds NAV; `shelf` and `rewards` read them again.
+         */
+        post: operations["start_job_api_jobs__name__post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -211,11 +255,6 @@ export interface components {
             result: {
                 [key: string]: unknown;
             };
-        };
-        /** BackfillResponse */
-        BackfillResponse: {
-            /** Started */
-            started: boolean;
         };
         /** BookPosition */
         BookPosition: {
@@ -346,6 +385,37 @@ export interface components {
             /** Transactions */
             transactions: number;
         };
+        /**
+         * Execution
+         * @description One executed action from the allocation log.
+         */
+        Execution: {
+            /** Id */
+            id: number;
+            /**
+             * Logged At
+             * Format: date-time
+             */
+            logged_at: string;
+            /** Instrument Id */
+            instrument_id: string;
+            /** Chain Id */
+            chain_id: number;
+            /** Chain */
+            chain: string;
+            /** Action Type */
+            action_type: string;
+            /** Tx Hash */
+            tx_hash: string;
+            /** Usd */
+            usd: number | null;
+            /** Shares */
+            shares: string | null;
+            /** Share Price */
+            share_price: string | null;
+            /** Basis */
+            basis: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -379,6 +449,27 @@ export interface components {
             detail: {
                 [key: string]: unknown;
             } | null;
+        };
+        /** JobStartResponse */
+        JobStartResponse: {
+            /**
+             * Job
+             * @enum {string}
+             */
+            job: "nav" | "shelf" | "rewards";
+            /** Started */
+            started: boolean;
+        };
+        /** JobsResponse */
+        JobsResponse: {
+            /** Latest */
+            latest: {
+                [key: string]: components["schemas"]["JobRun"];
+            };
+            /** Runs */
+            runs: components["schemas"]["JobRun"][];
+            /** Running */
+            running: ("nav" | "shelf" | "rewards")[];
         };
         /** LoopCloseReview */
         LoopCloseReview: {
@@ -480,6 +571,10 @@ export interface components {
             /** Chains */
             chains: components["schemas"]["NavChain"][];
             summary: components["schemas"]["NavSummary"];
+            /** By Position */
+            by_position: components["schemas"]["PositionYield"][];
+            /** By Protocol */
+            by_protocol: components["schemas"]["ProtocolYield"][];
             last_run: components["schemas"]["JobRun"] | null;
             /** Backfilling */
             backfilling: boolean;
@@ -571,6 +666,32 @@ export interface components {
              * Format: date-time
              */
             expires_at: string;
+        };
+        /** PositionYield */
+        PositionYield: {
+            /** Chain Id */
+            chain_id: number;
+            /** Chain */
+            chain: string;
+            /** Instrument Id */
+            instrument_id: string;
+            /** Protocol */
+            protocol: string;
+            /** Symbol */
+            symbol: string;
+            /** Yield Usd */
+            yield_usd: number;
+            /** Unknown Days */
+            unknown_days: number;
+        };
+        /** ProtocolYield */
+        ProtocolYield: {
+            /** Protocol */
+            protocol: string;
+            /** Yield Usd */
+            yield_usd: number;
+            /** Unknown Days */
+            unknown_days: number;
         };
         /** RebalanceReview */
         RebalanceReview: {
@@ -724,6 +845,47 @@ export interface components {
             limit: unknown;
             /** Actual */
             actual: unknown;
+        };
+        /** Reward */
+        Reward: {
+            /** Provider */
+            provider: string;
+            /** Chain Id */
+            chain_id: number;
+            /** Chain */
+            chain: string;
+            /** Token */
+            token: string;
+            /** Symbol */
+            symbol: string;
+            /** Claimable */
+            claimable: string;
+            /** Pending */
+            pending: string;
+            /** Usd */
+            usd: number | null;
+            /** Swap Status */
+            swap_status: string;
+            /** Instrument Ids */
+            instrument_ids: string[];
+        };
+        /** RewardsResponse */
+        RewardsResponse: {
+            /** Wallet */
+            wallet: string;
+            /**
+             * Read At
+             * Format: date-time
+             */
+            read_at: string;
+            /** Rewards */
+            rewards: components["schemas"]["Reward"][];
+            /** Claimable Usd */
+            claimable_usd: number;
+            /** Unpriced */
+            unpriced: number;
+            /** Errors */
+            errors: string[];
         };
         /** ShelfResponse */
         ShelfResponse: {
@@ -1099,9 +1261,11 @@ export interface operations {
             };
         };
     };
-    start_backfill_api_nav_backfill_post: {
+    get_rewards_api_rewards_get: {
         parameters: {
-            query?: never;
+            query?: {
+                refresh?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -1109,12 +1273,52 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful Response */
-            202: {
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BackfillResponse"];
+                    "application/json": components["schemas"]["RewardsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_executions_api_executions_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Execution"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -1136,7 +1340,38 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["JobRun"][];
+                    "application/json": components["schemas"]["JobsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    start_job_api_jobs__name__post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: "nav" | "shelf" | "rewards";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobStartResponse"];
                 };
             };
             /** @description Validation Error */

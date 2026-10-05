@@ -39,12 +39,17 @@ class PositionClose:
     ``base_shares`` is a count that does not grow with yield: ERC-4626 or
     mToken shares, Aave's scaled balance, Comet's principal, a PT balance.
     None when it could not be read.
+
+    ``debt_shares`` is a loop's debt in the same terms (the debt token's
+    scaled balance); None for a position with no debt. ``usd_micro`` is then
+    the loop's equity.
     """
 
     chain_id: int
     instrument_id: str
     base_shares: int | None
     usd_micro: int
+    debt_shares: int | None = None
 
     @property
     def key(self) -> str:
@@ -94,6 +99,10 @@ def close_flows(
     - A position that appears: its whole value flowed in. One that is gone: its
       last value flowed out (the part of a day's yield it earned before leaving
       is not seen).
+    - A loop whose collateral and debt shares are both unchanged had no flow.
+      One resized (either changed) cannot be split: two legs moved at
+      different prices, and one share count does not say how much equity
+      came or went.
     """
     before = {leg.key: leg for leg in previous}
     after = {leg.key: leg for leg in current}
@@ -106,19 +115,82 @@ def close_flows(
         prior = before.get(key)
         if prior is None:
             flow += leg.usd_micro
-        elif (
-            leg.base_shares is None or prior.base_shares is None or leg.base_shares <= 0
-        ):
+            continue
+        moved = held_flow(prior, leg)
+        if moved is None:
             flow += leg.usd_micro - prior.usd_micro
             unknown = True
-        elif leg.base_shares != prior.base_shares:
-            flow += div_round(
-                (leg.base_shares - prior.base_shares) * leg.usd_micro, leg.base_shares
-            )
+        else:
+            flow += moved
     for key, prior in before.items():
         if key not in after:
             flow -= prior.usd_micro
     return CloseFlows(nav_micro=nav, flow_micro=flow, unknown=unknown)
+
+
+def held_flow(prior: PositionClose, leg: PositionClose) -> int | None:
+    """The flow into a position held at both closes, micro-USD; None when it
+    cannot be split from the return."""
+    if leg.base_shares is None or prior.base_shares is None or leg.base_shares <= 0:
+        return None
+    if leg.debt_shares is not None or prior.debt_shares is not None:
+        same = (
+            leg.debt_shares == prior.debt_shares
+            and leg.base_shares == prior.base_shares
+        )
+        return 0 if same else None
+    if leg.base_shares == prior.base_shares:
+        return 0
+    return div_round(
+        (leg.base_shares - prior.base_shares) * leg.usd_micro, leg.base_shares
+    )
+
+
+@dataclass(frozen=True)
+class PositionYield:
+    # Return earned while held, micro-USD, over the days it could be split.
+    yield_micro: int
+    # Days held at both closes whose flow could not be split from the return.
+    unknown_days: int
+
+
+def attribute_yield(
+    closes: Iterable[Sequence[PositionClose] | None],
+) -> dict[str, PositionYield]:
+    """Each position's share of the return, by `position_key`, over closes in
+    day order.
+
+    A position's return is its value change less its flow, on each day it is
+    held at both ends; ``None`` is an unread day, and the next close is diffed
+    against the last one read, as the ledger does. The part of a day earned
+    by a position entering or leaving is not seen here either, and gas is not
+    charged to any position.
+    """
+    earned: dict[str, int] = {}
+    unknown: dict[str, int] = {}
+    previous: dict[str, PositionClose] | None = None
+    for legs in closes:
+        if legs is None:
+            continue
+        current = {leg.key: leg for leg in legs}
+        for key, leg in current.items():
+            prior = (previous or {}).get(key)
+            if prior is None:
+                continue
+            moved = held_flow(prior, leg)
+            if moved is None:
+                unknown[key] = unknown.get(key, 0) + 1
+            else:
+                earned[key] = (
+                    earned.get(key, 0) + leg.usd_micro - prior.usd_micro - moved
+                )
+        previous = current
+    return {
+        key: PositionYield(
+            yield_micro=earned.get(key, 0), unknown_days=unknown.get(key, 0)
+        )
+        for key in sorted(earned.keys() | unknown.keys())
+    }
 
 
 def unit_step(

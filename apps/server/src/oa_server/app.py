@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,15 +26,18 @@ from oa_server.auth import LocalAccessMiddleware
 from oa_server.dashboard import Dashboard
 from oa_server.schemas import (
     ApproveResponse,
-    BackfillResponse,
     BookResponse,
-    JobRun,
+    Execution,
+    JobName,
+    JobsResponse,
+    JobStartResponse,
     NavResponse,
     PlanHashRequest,
     PlanResponse,
     PlanSummary,
     RejectResponse,
     Review,
+    RewardsResponse,
     ShelfResponse,
 )
 from oa_server.settings import Settings
@@ -83,7 +86,7 @@ def _refused(error: ServiceError) -> HTTPException:
 
 def _log_failure(task: asyncio.Task[Any]) -> None:
     if not task.cancelled() and task.exception() is not None:
-        log.error("NAV backfill failed", exc_info=task.exception())
+        log.error("%s failed", task.get_name(), exc_info=task.exception())
 
 
 def create_app(
@@ -93,12 +96,11 @@ def create_app(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     web_dist: Path = WEB_DIST,
     dashboard: Dashboard | None = None,
-    backfill_every: float | None = None,
-    shelf_every: float | None = None,
+    every: Mapping[str, float] | None = None,
 ) -> FastAPI:
-    """`backfill_every` and `shelf_every` (seconds) run the NAV backfill and the
-    shelf read on start and then on that interval; None runs them only when
-    asked."""
+    """`every` maps a job (`nav`, `shelf`, `rewards`) to the seconds between its
+    runs; each listed job runs on start and then on that interval. A job not
+    listed runs only when asked."""
     mcp = build_mcp(plan_store, approval_url=settings.approval_url)
     mcp_app = mcp.streamable_http_app(streamable_http_path="/mcp", host=settings.host)
 
@@ -113,19 +115,18 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         tasks = []
-        if dashboard is not None and backfill_every:
-            tasks.append(
-                asyncio.create_task(
-                    repeat("NAV backfill", dashboard.backfill, backfill_every)
-                )
-            )
-        if dashboard is not None and shelf_every:
+        if dashboard is not None:
             board = dashboard
-            tasks.append(
-                asyncio.create_task(
-                    repeat("shelf read", lambda: board.shelf(refresh=True), shelf_every)
+            for name, seconds in (every or {}).items():
+                tasks.append(
+                    asyncio.create_task(
+                        repeat(
+                            f"{name} job",
+                            lambda name=name: board.run_job(name),
+                            seconds,
+                        )
+                    )
                 )
-            )
         async with mcp.session_manager.run():
             yield
         for task in tasks:
@@ -235,19 +236,40 @@ def create_app(
         """The NAV history the backfill has derived, and what it could not read."""
         return board().nav()
 
-    @app.post("/api/nav/backfill", response_model=BackfillResponse, status_code=202)
-    async def start_backfill() -> BackfillResponse:
-        """Read any closed day still missing, then rebuild NAV, in the background."""
-        current = board()
-        if current.backfilling:
-            return BackfillResponse(started=False)
-        task = asyncio.create_task(asyncio.to_thread(current.backfill))
-        task.add_done_callback(_log_failure)
-        return BackfillResponse(started=True)
+    @app.get("/api/rewards", response_model=RewardsResponse)
+    def get_rewards(refresh: bool = False) -> RewardsResponse:
+        """What the account can claim, read hourly; claiming is not offered here."""
+        try:
+            return board().rewards(refresh=refresh)
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise HTTPException(
+                502, {"error": f"rewards read failed: {error}"}
+            ) from error
 
-    @app.get("/api/jobs", response_model=list[JobRun])
-    def get_jobs(limit: int = 20) -> list[JobRun]:
+    @app.get("/api/executions", response_model=list[Execution])
+    def get_executions(limit: int = 50) -> list[Execution]:
+        """What the server's own execution runs logged, newest first."""
+        return board().executions(min(max(limit, 1), 500))
+
+    @app.get("/api/jobs", response_model=JobsResponse)
+    def get_jobs(limit: int = 20) -> JobsResponse:
+        """The last run of each job, and recent runs of all of them."""
         return board().jobs(min(max(limit, 1), 100))
+
+    @app.post("/api/jobs/{name}", response_model=JobStartResponse, status_code=202)
+    async def start_job(name: JobName) -> JobStartResponse:
+        """Run a job now, in the background: `nav` reads any closed day still
+        missing and rebuilds NAV; `shelf` and `rewards` read them again."""
+        current = board()
+        if name in current.running():
+            return JobStartResponse(job=name, started=False)
+        task = asyncio.create_task(
+            asyncio.to_thread(current.run_job, name), name=f"{name} job"
+        )
+        task.add_done_callback(_log_failure)
+        return JobStartResponse(job=name, started=True)
 
     # The MCP endpoint, served by the same process and store.
     app.router.routes.extend(mcp_app.routes)

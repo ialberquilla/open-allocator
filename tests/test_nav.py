@@ -9,6 +9,8 @@ from open_allocator.core.nav import (
     LedgerState,
     LedgerStep,
     PositionClose,
+    PositionYield,
+    attribute_yield,
     close_flows,
     derive_nav,
     div_round,
@@ -172,6 +174,42 @@ def test_keys_ignore_address_case() -> None:
 def test_a_position_with_no_share_count_is_unknown() -> None:
     flows = close_flows([leg("100", shares=None)], [leg("100.05")])
     assert (flows.flow_micro, flows.unknown) == (usd("0.05"), True)
+
+
+def loop(usd_value: str, *, shares: int = 2000, debt: int = 1000) -> PositionClose:
+    return PositionClose(143, AAVE, shares, usd(usd_value), debt_shares=debt)
+
+
+def test_a_loop_held_unchanged_earns_its_equity_change() -> None:
+    flows = close_flows([loop("50")], [loop("49.98")])
+    assert (flows.flow_micro, flows.unknown) == (usd("-0.02") - usd("-0.02"), False)
+    assert flows.nav_micro == usd("49.98")
+
+
+def test_a_resized_loop_cannot_split_flow_from_return() -> None:
+    for resized in (loop("80", shares=3000), loop("80", debt=1500)):
+        flows = close_flows([loop("50")], [resized])
+        assert (flows.flow_micro, flows.unknown) == (usd("30"), True)
+
+
+def test_attribute_yield_splits_return_by_position_across_a_gap() -> None:
+    days = [
+        [leg("100"), loop("50")],
+        [leg("100.05"), loop("50.01")],
+        None,
+        # 500 more shares bought: a flow of 50.05; 0.05 is return, as the day before.
+        [leg("150.15", shares=1500), loop("80", debt=1500)],
+    ]
+    shares = attribute_yield(days)
+    assert shares == {
+        f"8453:{VAULT}": PositionYield(yield_micro=usd("0.1"), unknown_days=0),
+        f"143:{AAVE}": PositionYield(yield_micro=usd("0.01"), unknown_days=1),
+    }
+
+
+def test_attribute_yield_ignores_entries_and_exits() -> None:
+    shares = attribute_yield([[leg("100")], [leg("99.9", instrument=AAVE)], []])
+    assert shares == {}
 
 
 def test_div_round_is_half_even_both_signs() -> None:

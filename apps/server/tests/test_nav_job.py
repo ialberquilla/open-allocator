@@ -248,3 +248,67 @@ def test_book_view_aggregates_the_positions_payload() -> None:
     assert view.blended_apy == 8.0  # only positions reporting an APY
     assert view.effective_positions == pytest.approx(1 / (0.75**2 + 0.25**2))
     assert [s.label for s in view.by_chain] == ["Base", "Arbitrum One"]
+
+
+def test_each_positions_share_of_the_return_is_rebuilt_with_nav(
+    engine: Engine,
+) -> None:
+    run(engine, ScriptedChain())
+    nav = Dashboard(engine, read_book=dict, account=lambda: ACCOUNT).nav()
+    (share,) = nav.by_position
+    assert (share.instrument_id, share.chain, share.unknown_days) == (
+        VAULT,
+        "Base",
+        0,
+    )
+    assert share.yield_usd == pytest.approx(nav.summary.yield_usd)
+    assert [(p.protocol, p.yield_usd) for p in nav.by_protocol] == [
+        ("Morpho", pytest.approx(0.04))
+    ]
+
+
+class LoopChain(ScriptedChain):
+    """The Base vault, and a loop on Arbitrum whose equity grows 0.02 a day and
+    whose debt is resized on 09-03."""
+
+    def __call__(self, chain_id: int, day: date, **kwargs: Any) -> ChainClose:
+        close = super().__call__(chain_id, day, **kwargs)
+        if chain_id != 42161:
+            return close
+        n = (day - START).days
+        loop = InstrumentClose(
+            instrument_id=PT,
+            chain_id=42161,
+            protocol="Aave",
+            symbol="USDC",
+            shares_raw=300_000_000,
+            base_shares_raw=300_000_000,
+            underlying_raw=50_000_000 + n * 20_000,
+            decimals=6,
+            price_usd=Decimal(1),
+            price_source="numeraire",
+            usd_micro=50_000_000 + n * 20_000,
+            debt_shares_raw=250_000_000 if day < date(2026, 9, 3) else 260_000_000,
+        )
+        return ChainClose(chain_id, close.block, close.block_timestamp, (loop,))
+
+
+def test_a_resized_loop_leaves_that_day_unknown_and_stores_its_debt(
+    engine: Engine,
+) -> None:
+    run(engine, LoopChain())
+    with Session(engine) as session:
+        debts = session.scalars(
+            select(PositionCloseRow.debt_shares_raw)
+            .where(PositionCloseRow.chain_id == 42161)
+            .order_by(PositionCloseRow.day)
+        ).all()
+    assert debts[:3] == [250_000_000, 250_000_000, 260_000_000]
+    statuses = {row[0]: row[6] for row in nav_rows(engine)}
+    assert statuses[date(2026, 9, 3)] == "unknown"
+    assert statuses[date(2026, 9, 4)] == "ok"
+    nav = Dashboard(engine, read_book=dict, account=lambda: ACCOUNT).nav()
+    loop = next(p for p in nav.by_position if p.instrument_id == PT)
+    # 09-01→02 and 09-03→04→05 are split; the resize day is not.
+    assert loop.unknown_days == 1
+    assert loop.yield_usd == pytest.approx(0.06)
