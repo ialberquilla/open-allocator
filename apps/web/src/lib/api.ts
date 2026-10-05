@@ -1,0 +1,104 @@
+// The typed client for oa_server. Same origin: the browser sends the token
+// cookie itself, and no token is ever visible to this code.
+
+import type { components } from "@/lib/api-types";
+
+type Schemas = components["schemas"];
+
+export type PlanStatus = Schemas["PlanSummary"]["status"];
+export type PlanSummary = Schemas["PlanSummary"];
+export type PlanResponse = Schemas["PlanResponse"];
+export type ExecuteReview = Schemas["ExecuteReview"];
+export type WithdrawReview = Schemas["WithdrawReview"];
+export type RebalanceReview = Schemas["RebalanceReview"];
+export type LoopOpenReview = Schemas["LoopOpenReview"];
+export type LoopCloseReview = Schemas["LoopCloseReview"];
+export type BridgeReview = Schemas["BridgeReview"];
+export type Review =
+  | ExecuteReview
+  | WithdrawReview
+  | RebalanceReview
+  | LoopOpenReview
+  | LoopCloseReview
+  | BridgeReview;
+export type ReviewBundle = Schemas["ReviewBundle"];
+export type TokenAmount = Schemas["TokenAmount"];
+export type ApproveResponse = Schemas["ApproveResponse"];
+export type Book = Schemas["BookResponse"];
+export type BookPosition = Schemas["BookPosition"];
+export type BookSlice = Schemas["BookSlice"];
+export type Shelf = Schemas["ShelfResponse"];
+export type ShelfVault = Schemas["ShelfVault"];
+export type Nav = Schemas["NavResponse"];
+export type NavPoint = Schemas["NavPoint"];
+export type JobRun = Schemas["JobRun"];
+export type JobName = Schemas["JobStartResponse"]["job"];
+export type Jobs = Schemas["JobsResponse"];
+export type Execution = Schemas["Execution"];
+export type Rewards = Schemas["RewardsResponse"];
+export type PositionYield = Schemas["PositionYield"];
+export type ProtocolYield = Schemas["ProtocolYield"];
+
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly code: string | null,
+  ) {
+    super(message);
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    headers: { Accept: "application/json", ...(init?.body ? { "Content-Type": "application/json" } : {}) },
+  });
+  const body: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = (body as { detail?: unknown; error?: unknown } | null) ?? {};
+    const reason =
+      typeof detail.detail === "object" && detail.detail !== null
+        ? (detail.detail as { error?: string; code?: string })
+        : { error: typeof detail.error === "string" ? detail.error : undefined };
+    throw new ApiError(
+      response.status,
+      reason.error ?? `${response.status} ${response.statusText}`,
+      "code" in reason ? (reason.code ?? null) : null,
+    );
+  }
+  return body as T;
+}
+
+export const api = {
+  plans: () => request<PlanSummary[]>("/api/plans"),
+  plan: (hash: string) => request<PlanResponse>(`/api/plans/${hash}`),
+  approve: (hash: string) =>
+    request<ApproveResponse>("/api/approve", {
+      method: "POST",
+      body: JSON.stringify({ plan_hash: hash }),
+    }),
+  book: (refresh = false) => request<Book>(`/api/book${refresh ? "?refresh=true" : ""}`),
+  shelf: (refresh = false) => request<Shelf>(`/api/shelf${refresh ? "?refresh=true" : ""}`),
+  nav: () => request<Nav>("/api/nav"),
+  rewards: (refresh = false) => request<Rewards>(`/api/rewards${refresh ? "?refresh=true" : ""}`),
+  executions: () => request<Execution[]>("/api/executions"),
+  jobs: () => request<Jobs>("/api/jobs"),
+  startJob: (name: JobName) =>
+    request<Schemas["JobStartResponse"]>(`/api/jobs/${name}`, { method: "POST" }),
+  reject: (hash: string) =>
+    request<Schemas["RejectResponse"]>("/api/reject", {
+      method: "POST",
+      body: JSON.stringify({ plan_hash: hash }),
+    }),
+};
+
+/** The days of the current ledger: from its last opening on. An earlier ledger
+ *  that was emptied (a test deposit, a full exit) is not this record. */
+export function currentLedger(days: NavPoint[]): NavPoint[] {
+  let start = -1;
+  days.forEach((day, index) => {
+    if (day.status === "opened") start = index;
+  });
+  return start < 0 ? [] : days.slice(start);
+}

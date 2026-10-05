@@ -33,19 +33,35 @@ Repository = "https://github.com/ialberquilla/open-allocator"
 dev = [
     "eth-tester==0.13.0b1",
     "py-evm==0.12.1b1",
+    "mcp==2.2.0",
+    "oa-server",
     "pytest==9.1.1",
     "ruff==0.15.19",
+    "testcontainers[postgres]==4.15.0",
 ]
 
 [project.scripts]
 open-allocator = "open_allocator.cli:main"
+open-allocator-mcp = "open_allocator.mcp:main"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp==2.2.0",
+]
 
 [tool.uv]
 default-groups = ["dev"]
 exclude-newer = "7 days"
 
+[tool.uv.workspace]
+members = ["apps/server"]
+
+[tool.uv.sources]
+oa-server = { workspace = true }
+
 [tool.ruff]
 target-version = "py312"
+src = ["src", "apps/server/src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
@@ -54,7 +70,7 @@ select = ["E", "F", "I"]
 packages = ["src/open_allocator"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "apps/server/tests"]
 markers = ["integration: hits live 1Tx API / RPC; skipped without creds"]
 
 [tool.hatch.build.targets.sdist]

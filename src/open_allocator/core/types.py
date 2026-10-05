@@ -86,6 +86,9 @@ class Vault(FrozenModel):
     token_decimals: int | None = Field(default=None, ge=0)
     yield_token_address: str | None = None
     yield_token_decimals: int | None = Field(default=None, ge=0)
+    # Display only: 1Tx's name for the instrument and its receipt token.
+    yield_token_symbol: str | None = None
+    description: str | None = None
     asset_category: str | None = None
     # Yield source ("how this pays"), sourced from 1Tx discovery — never
     # hardcoded here, per the Dynamic Universe Rule. None = upstream has not

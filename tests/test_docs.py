@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 
 from open_allocator import cli
-from open_allocator.resources import PACKAGE_ROOT, WORKFLOWS_DIR
+from open_allocator.resources import GUIDES_DIR, PACKAGE_ROOT, WORKFLOWS_DIR
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_POINTERS = ["CLAUDE.md", "CODEX.md", "AGENTS.md", "OPENCODE.md"]
@@ -116,6 +116,8 @@ def markdown_files() -> list[Path]:
         path
         for path in REPO_ROOT.rglob("*.md")
         if not any(part in SKIPPED_DOC_DIRS for part in path.parts)
+        # Verbatim copies of root files: their links are checked at the root.
+        and not path.resolve().is_relative_to(GUIDES_DIR.resolve())
         and (tracked is None or path.resolve() in tracked)
     ]
 
@@ -219,3 +221,10 @@ def test_workflow_review_focus_items_are_known_checks() -> None:
         module_name, attribute_name = check
         module = importlib.import_module(module_name)
         assert hasattr(module, attribute_name)
+
+
+def test_packaged_guides_are_verbatim_copies_of_the_root_files() -> None:
+    """The MCP server serves these copies; `cp AGENT_GUIDE.md PROJECT_CONTEXT.md
+    src/open_allocator/guides/` after editing either."""
+    for name in ("AGENT_GUIDE.md", "PROJECT_CONTEXT.md"):
+        assert (GUIDES_DIR / name).read_bytes() == (REPO_ROOT / name).read_bytes()

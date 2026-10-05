@@ -552,3 +552,22 @@ def test_json_safe_records_what_it_can_rather_than_raising() -> None:
         to_address=ADDRESS,
     )
     assert json_safe(receipt)["transaction_hash"] == receipt.transaction_hash
+
+
+def test_service_calls_keep_the_files_unless_a_process_sets_a_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI never sets one, so it keeps `.open_allocator/`; the server sets
+    its database once at start."""
+    from open_allocator.service import _common, use_state_backend
+
+    monkeypatch.setattr(_common, "AllocatorConfig", lambda: Config())
+    backend = InMemoryBackend()
+
+    assert getattr(_common.allocator_config(), "state_backend", None) is None
+    use_state_backend(backend)
+    try:
+        config = _common.allocator_config()
+        assert backend_from_config(config, needs="idempotency_store_path") is backend
+    finally:
+        use_state_backend(None)

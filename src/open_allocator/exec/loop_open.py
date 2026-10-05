@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from decimal import Decimal
+from typing import Literal
 
 from open_allocator.core import policy as policy_core
 from open_allocator.core import positions as positions_core
@@ -67,6 +68,27 @@ class LoopOpenReport(FrozenModel):
     messages: tuple[str, ...] = ()
 
 
+class LoopOpeningPlan(FrozenModel):
+    """An open, complete enough to execute as it stands.
+
+    What a dry run shows and what a confirmation executes: applying it submits
+    this bundle and never plans again. ``loop_id``, ``equity_usd`` and
+    ``leverage`` are what it was planned from, kept so applying logs the open
+    and a re-check can score it again.
+    """
+
+    kind: Literal["loop-open"] = "loop-open"
+    account: str
+    loop_id: str
+    equity_usd: float
+    leverage: float
+    policy_result: policy_core.PolicyResult
+    announcement: loops_exec.LoopAnnouncement
+    plan: TxPlan
+    # Book read warnings from planning.
+    messages: tuple[str, ...] = ()
+
+
 def open_loop(
     client: object,
     signer: Signer,
@@ -81,35 +103,51 @@ def open_loop(
     idempotency_store: object | None = None,
 ) -> LoopOpenReport:
     """Plan, policy-check, announce and — with ``confirm`` — send one open."""
+    planned = plan_loop_opening(
+        client,
+        signer,
+        loop_id,
+        equity_usd=equity_usd,
+        leverage=leverage,
+        policy=policy,
+        known_instruments=known_instruments,
+        config=config,
+    )
+    if not confirm:
+        return dry_run_report(planned)
+    return apply_loop_opening_plan(
+        client,
+        signer,
+        planned,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+
+
+def plan_loop_opening(
+    client: object,
+    signer: Signer,
+    loop_id: str,
+    *,
+    equity_usd: float,
+    leverage: float,
+    policy: Policy,
+    known_instruments: Sequence[Vault],
+    config: object | None = None,
+) -> LoopOpeningPlan:
+    """The open ``loop-open`` would submit, policy-checked and announced, not sent."""
     if leverage < 1:
         raise TransactionPlanError(f"leverage {leverage} is below 1")
     address = signer.address()
     rows = loops_exec.loop_rows(client)
     vaults, _skipped = loops_exec.loop_vaults(rows, known_instruments)
     target = _target(loop_id, vaults, verb="opened")
-    vault = next(v for v in vaults if v.instrument_id.casefold() == loop_id.casefold())
     universe = list(known_instruments) + vaults
 
     book, warnings = loops_exec.read_book(client, address, config, rows=rows)
     _require_idle(book, target.chain_id, equity_usd)
-
-    leg = Allocation(
-        legs=(
-            AllocationLeg(
-                instrument_id=vault.instrument_id,
-                weight=1.0,
-                usd=equity_usd,
-                leverage=leverage,
-            ),
-        ),
-        total_usd=equity_usd,
-        metadata={},
-    )
-    policy_result = policy_core.check_incremental(
-        leg,
-        policy,
-        universe,
-        positions_core.held_usd_by_instrument(book),
+    policy_result = _open_policy_result(
+        loop_id, vaults, universe, book, equity_usd, leverage, policy
     )
     if not policy_result.ok:
         raise PolicyCheckFailed(policy_result)
@@ -119,7 +157,7 @@ def open_loop(
         target=target,
         action="open",
         account=address,
-        amount=loops_exec.equity_raw(equity_usd, vault),
+        amount=loops_exec.equity_raw(equity_usd, _vault(loop_id, vaults)),
         leverage=leverage,
         leg_index=0,
         config=config,
@@ -135,30 +173,66 @@ def open_loop(
     if not announcement.confirmable:
         raise TransactionPlanError("; ".join(announcement.blockers))
 
-    plan = bundle_execution.assemble_plan(
-        [bundle_execution.PlannedBundle(bundle=bundle, steps=steps)],
-        f"open loop {loop_id}",
+    return LoopOpeningPlan(
+        account=address,
+        loop_id=loop_id,
+        equity_usd=equity_usd,
+        leverage=leverage,
+        policy_result=policy_result,
+        announcement=announcement,
+        plan=bundle_execution.assemble_plan(
+            [bundle_execution.PlannedBundle(bundle=bundle, steps=steps)],
+            f"open loop {loop_id}",
+        ),
+        messages=tuple(warnings),
     )
-    if not confirm:
-        return LoopOpenReport(
-            status="planned",
-            loop_id=loop_id,
-            account=address,
-            equity_usd=equity_usd,
-            leverage=leverage,
-            policy_result=policy_result,
-            announcement=announcement,
-            plan=plan,
-            messages=("dry-run only; no transactions broadcast", *warnings),
+
+
+def dry_run_report(planned: LoopOpeningPlan) -> LoopOpenReport:
+    """The ``loop-open`` dry-run report."""
+    return LoopOpenReport(
+        status="planned",
+        loop_id=planned.loop_id,
+        account=planned.account,
+        equity_usd=planned.equity_usd,
+        leverage=planned.leverage,
+        policy_result=planned.policy_result,
+        announcement=planned.announcement,
+        plan=planned.plan,
+        messages=("dry-run only; no transactions broadcast", *planned.messages),
+    )
+
+
+def apply_loop_opening_plan(
+    client: object,
+    signer: Signer,
+    planned: LoopOpeningPlan,
+    *,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> LoopOpenReport:
+    """Execute exactly ``planned``, refusing it when it no longer describes the
+    account: another signer, or the open sent since it was built.
+    """
+    address = signer.address()
+    if address.casefold() != planned.account.casefold():
+        raise TransactionPlanError(
+            f"the plan was built for {planned.account}, but the signer is {address}"
+        )
+    key = opening_key(planned)
+    if _store_completed(idempotency_store, key):
+        raise TransactionPlanError(
+            f"the plan is stale: the open of {planned.loop_id} was sent after it "
+            "was built; plan again"
         )
 
-    key = f"loop-open:{loop_id}:{bundle.digest}"
+    equity_usd = planned.equity_usd
     result = bundle_execution.execute_plan(
         client,
         signer,
-        plan,
+        planned.plan,
         stage="execute",
-        policy_result=policy_result,
+        policy_result=planned.policy_result,
         completion_key=lambda _bundle: key,
         log=lambda _logged, _receipt: bundle_execution.BundleLog(
             action_type="loop_open",
@@ -172,12 +246,12 @@ def open_loop(
         completed_keys = (key,)
     report = LoopOpenReport(
         status=result.status,
-        loop_id=loop_id,
+        loop_id=planned.loop_id,
         account=address,
         equity_usd=equity_usd,
-        leverage=leverage,
-        policy_result=policy_result,
-        announcement=announcement,
+        leverage=planned.leverage,
+        policy_result=planned.policy_result,
+        announcement=planned.announcement,
         plan=result.plan,
         steps=result.steps,
         receipts=result.receipts,
@@ -185,10 +259,74 @@ def open_loop(
         preparations=result.preparations,
         funding=result.funding,
         in_progress=result.in_progress,
-        messages=(*result.messages, *warnings),
+        messages=(*result.messages, *planned.messages),
     )
     _write_checkpoint(config, "loop-open", report, completed_keys=completed_keys)
     return report
+
+
+def check_opening_policy(
+    client: object,
+    planned: LoopOpeningPlan,
+    policy: Policy,
+    *,
+    known_instruments: Sequence[Vault],
+    config: object | None = None,
+) -> policy_core.PolicyResult:
+    """The planning check of ``planned``, against today's book and loop screen."""
+    rows = loops_exec.loop_rows(client)
+    vaults, _skipped = loops_exec.loop_vaults(rows, known_instruments)
+    _target(planned.loop_id, vaults, verb="opened")
+    book, _warnings = loops_exec.read_book(client, planned.account, config, rows=rows)
+    return _open_policy_result(
+        planned.loop_id,
+        vaults,
+        list(known_instruments) + vaults,
+        book,
+        planned.equity_usd,
+        planned.leverage,
+        policy,
+    )
+
+
+def opening_key(planned: LoopOpeningPlan) -> str:
+    """The completion key of the planned bundle: marked once the open is sent."""
+    digest = planned.plan.bundles[0].digest if planned.plan.bundles else ""
+    return f"loop-open:{planned.loop_id}:{digest}"
+
+
+def _vault(loop_id: str, vaults: Sequence[Vault]) -> Vault:
+    return next(v for v in vaults if v.instrument_id.casefold() == loop_id.casefold())
+
+
+def _open_policy_result(
+    loop_id: str,
+    vaults: Sequence[Vault],
+    universe: Sequence[Vault],
+    book: positions_core.Positions,
+    equity_usd: float,
+    leverage: float,
+    policy: Policy,
+) -> policy_core.PolicyResult:
+    """The open's caps scored against the book it joins, its gates on itself."""
+    leg = Allocation(
+        legs=(
+            AllocationLeg(
+                instrument_id=_vault(loop_id, vaults).instrument_id,
+                weight=1.0,
+                usd=equity_usd,
+                leverage=leverage,
+            ),
+        ),
+        total_usd=equity_usd,
+        metadata={},
+    )
+    return policy_core.check_incremental(
+        leg,
+        policy,
+        list(universe),
+        positions_core.held_usd_by_instrument(book),
+    )
 
 
 def _require_idle(
@@ -214,4 +352,13 @@ def _require_idle(
         )
 
 
-__all__ = ["LoopOpenReport", "open_loop"]
+__all__ = [
+    "LoopOpenReport",
+    "LoopOpeningPlan",
+    "apply_loop_opening_plan",
+    "check_opening_policy",
+    "dry_run_report",
+    "open_loop",
+    "opening_key",
+    "plan_loop_opening",
+]

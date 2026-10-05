@@ -40,6 +40,7 @@ from open_allocator.exec.signer import Receipt, Signer
 
 if TYPE_CHECKING:
     # Imported for annotations only: both modules import this one.
+    from open_allocator.exec.allocation_plan import AllocationPlan
     from open_allocator.exec.bundle_execution import PlannedBundle
     from open_allocator.exec.deposit_sizing import FittedPlan as DepositFit
 
@@ -204,37 +205,137 @@ def execute_allocation(
     config: object | None = None,
     idempotency_store: object | None = None,
 ) -> ExecutionReport | TxPlan:
-    allocation_model = _allocation(allocation)
-    policy_model = _policy(policy)
-    known: tuple[Vault | Mapping[str, object], ...] = tuple(known_instruments or ())
-    address = signer.address()
-    known = _with_effective_loop_parameters(
-        client, known, allocation_model, address, config, idempotency_store
-    )
-    policy_result = policy_core.check(allocation_model, policy_model, known)
-    if not policy_result.ok:
-        raise PolicyCheckFailed(policy_result)
-
-    vaults_by_id = _vaults_by_id(known)
-    fitted = _calldata_deposit_plan(
+    planned = plan_allocation(
         client,
         signer,
-        address,
-        allocation_model,
-        vaults_by_id,
-        config,
-        idempotency_store,
-        caps=policy_model.caps,
+        allocation,
+        policy,
+        known_instruments=known_instruments,
+        config=config,
+        idempotency_store=idempotency_store,
     )
     if not confirm:
-        return fitted.plan
+        return planned.plan
+    return apply_allocation_plan(
+        client,
+        signer,
+        planned,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+
+
+def plan_allocation(
+    client: object,
+    signer: Signer,
+    allocation: Allocation | Mapping[str, object],
+    policy: Policy | Mapping[str, object],
+    *,
+    known_instruments: Iterable[Vault | Mapping[str, object]] | None = None,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> AllocationPlan:
+    """The deposit plan for an allocation, policy-checked, prepared and sized."""
+    from open_allocator.exec.allocation_plan import AllocationPlan
+
+    known = tuple(known_instruments or ())
+    fitted = plan_calldata_allocation(
+        client,
+        signer,
+        allocation,
+        policy,
+        known_instruments=known,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+    vaults = list(_vaults_by_id(known).values())
+    tokens: dict[int, calldata.DepositToken] = {}
+    for chain_id in sorted({vault.chain_id for vault in vaults}):
+        try:
+            tokens[chain_id] = calldata.deposit_token(chain_id, vaults, config)
+        except calldata.CalldataAmountError:
+            # Unusable for a deposit; applying refuses a plan that needs it.
+            continue
+    return AllocationPlan(
+        account=signer.address(),
+        allocation=_allocation(allocation),
+        policy_result=fitted.policy_result,
+        plan=fitted.plan,
+        preparation=fitted.preparation,
+        messages=fitted.messages,
+        deposit_usd=fitted.deposit_usd,
+        loops=fitted.loops,
+        deposit_tokens=tokens,
+    )
+
+
+def apply_allocation_plan(
+    client: object,
+    signer: Signer,
+    planned: AllocationPlan,
+    *,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> ExecutionReport:
+    """Execute exactly ``planned``, refusing it when it no longer describes the
+    account: another signer, or a leg submitted or bridging since it was built.
+    """
+    from open_allocator.exec import bridge
+    from open_allocator.exec.deposit_sizing import FittedPlan
+
+    address = signer.address()
+    if address.casefold() != planned.account.casefold():
+        raise TransactionPlanError(
+            f"the plan was built for {planned.account}, but the signer is {address}"
+        )
+    allocation = planned.allocation
+    # What planning skips: a leg sent, or one bridging. Either one appearing
+    # after the plan was built means it would be sent again.
+    legs = sorted(
+        {(bundle.leg_index, bundle.instrument_id) for bundle in planned.plan.bundles}
+    )
+    bridging = bridge.load_states(idempotency_store, legs)
+    stale = [
+        bridge.leg_id(index, instrument_id)
+        for index, instrument_id in legs
+        if _store_completed(idempotency_store, _leg_key(index, instrument_id))
+        or (
+            (state := bridging.get(index)) is not None
+            and state.active
+            and state.state != "completed"
+        )
+    ]
+    if stale:
+        raise TransactionPlanError(
+            "the plan is stale: "
+            + ", ".join(stale)
+            + " was sent or started bridging after it was built; plan again"
+        )
+
+    def token_for(chain_id: int) -> calldata.DepositToken:
+        token = planned.deposit_tokens.get(chain_id)
+        if token is None:
+            raise calldata.CalldataAmountError(
+                f"no deposit token for chain {chain_id} was resolved when the plan "
+                "was built"
+            )
+        return token
+
+    fitted = FittedPlan(
+        plan=planned.plan,
+        preparation=planned.preparation,
+        messages=planned.messages,
+        deposit_usd=dict(planned.deposit_usd),
+        loops=planned.loops,
+        policy_result=planned.policy_result,
+    )
     return _execute_calldata_deposits(
         client,
         signer,
         fitted,
-        allocation_model,
-        vaults_by_id,
-        policy_result,
+        allocation,
+        token_for,
+        planned.policy_result,
         config,
         idempotency_store,
     )
@@ -266,9 +367,7 @@ def plan_calldata_allocation(
         config,
         idempotency_store,
     )
-    policy_result = policy_core.check(allocation_model, policy_model, known)
-    if not policy_result.ok:
-        raise PolicyCheckFailed(policy_result)
+    policy_result = _checked_policy(allocation_model, policy_model, known)
     fitted = _calldata_deposit_plan(
         client,
         signer,
@@ -280,6 +379,45 @@ def plan_calldata_allocation(
         caps=policy_model.caps,
     )
     return replace(fitted, policy_result=policy_result)
+
+
+def check_allocation_policy(
+    client: object,
+    signer: Signer,
+    allocation: Allocation | Mapping[str, object],
+    policy: Policy | Mapping[str, object],
+    *,
+    known_instruments: Iterable[Vault | Mapping[str, object]] | None = None,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> policy_core.PolicyResult:
+    """The policy check planning runs, on today's instruments; raises
+    `PolicyCheckFailed` on a violation.
+
+    Approval runs it again before applying a stored plan, so a plan built under
+    one policy or shelf does not run once either has moved against it.
+    """
+    allocation_model = _allocation(allocation)
+    known = _with_effective_loop_parameters(
+        client,
+        tuple(known_instruments or ()),
+        allocation_model,
+        signer.address(),
+        config,
+        idempotency_store,
+    )
+    return _checked_policy(allocation_model, _policy(policy), known)
+
+
+def _checked_policy(
+    allocation: Allocation,
+    policy: Policy,
+    known: tuple[Vault | Mapping[str, object], ...],
+) -> policy_core.PolicyResult:
+    result = policy_core.check(allocation, policy, known)
+    if not result.ok:
+        raise PolicyCheckFailed(result)
+    return result
 
 
 def _with_effective_loop_parameters(
@@ -648,7 +786,7 @@ def _execute_calldata_deposits(
     signer: Signer,
     fitted: DepositFit,
     allocation: Allocation,
-    vaults_by_id: Mapping[str, Vault],
+    token_for: Callable[[int], calldata.DepositToken],
     policy_result: policy_core.PolicyResult,
     config: object | None,
     idempotency_store: object | None,
@@ -666,9 +804,6 @@ def _execute_calldata_deposits(
     unconfirmable = [item for loop in fitted.loops for item in loop.blockers]
     if unconfirmable:
         raise TransactionPlanError("; ".join(unconfirmable))
-
-    def token_for(chain_id: int) -> calldata.DepositToken:
-        return calldata.deposit_token(chain_id, vaults_by_id.values(), config)
 
     planned: dict[str, BridgeState] = {}
     for bundle in fitted.plan.bundles:

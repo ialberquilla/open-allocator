@@ -7,8 +7,10 @@ from pydantic import Field
 
 from open_allocator.core import amounts
 from open_allocator.core import withdraw as withdraw_core
+from open_allocator.core.positions import PositionHolding
 from open_allocator.core.types import FrozenModel, Policy, TxBundle, TxPlan
 from open_allocator.exec import bundle_execution, calldata, chains
+from open_allocator.exec.bundle_execution import PlanPreparation
 from open_allocator.exec.execute import (
     ExecutionStepReport,
     GasCheck,
@@ -46,6 +48,24 @@ class WithdrawExecutionReport(FrozenModel):
     messages: tuple[str, ...] = Field(default_factory=tuple)
 
 
+class WithdrawalPlan(FrozenModel):
+    """A withdrawal, complete enough to execute as it stands.
+
+    What a dry run shows and what a confirmation executes: applying it submits
+    this bundle and never plans again. ``position`` and ``amount`` are what it
+    was planned from, kept so the caller can bind the same idempotency scope.
+    """
+
+    kind: Literal["withdraw"] = "withdraw"
+    account: str
+    position: PositionHolding
+    amount: float | str | None = None
+    withdraw_plan: withdraw_core.WithdrawPlan
+    sell: WithdrawSellDetails
+    plan: TxPlan
+    preparation: PlanPreparation
+
+
 def withdraw(
     client: object,
     signer: Signer,
@@ -57,8 +77,44 @@ def withdraw(
     config: object | None = None,
     idempotency_store: object | None = None,
 ) -> WithdrawExecutionReport:
+    planned = plan_withdrawal(
+        client,
+        signer,
+        position,
+        policy,
+        amount,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+    if not confirm:
+        return dry_run_report(planned)
+    return apply_withdrawal_plan(
+        client,
+        signer,
+        planned,
+        config=config,
+        idempotency_store=idempotency_store,
+    )
+
+
+def plan_withdrawal(
+    client: object,
+    signer: Signer,
+    position: object,
+    policy: Policy | Mapping[str, object],
+    amount: float | str | None = None,
+    *,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> WithdrawalPlan:
+    """The withdrawal ``withdraw`` would submit for ``position``, not sent."""
     _refuse_levered(position)
-    withdraw_plan = withdraw_core.plan_withdraw(position, policy, amount=amount)
+    holding = (
+        position
+        if isinstance(position, PositionHolding)
+        else PositionHolding.model_validate(position)
+    )
+    withdraw_plan = withdraw_core.plan_withdraw(holding, policy, amount=amount)
     address = signer.address()
     tx_plan, sell = _calldata_tx_plan(
         client,
@@ -67,29 +123,68 @@ def withdraw(
         config,
         idempotency_store,
     )
-    if not confirm:
-        preparation = bundle_execution.prepare_plan(
+    return WithdrawalPlan(
+        account=address,
+        position=holding,
+        amount=amount,
+        withdraw_plan=withdraw_plan,
+        sell=sell,
+        plan=tx_plan,
+        preparation=bundle_execution.prepare_plan(
             signer, tx_plan, config, idempotency_store
+        ),
+    )
+
+
+def dry_run_report(planned: WithdrawalPlan) -> WithdrawExecutionReport:
+    """The ``withdraw`` dry-run report: the plan, its preparation and blockers."""
+    preparation = planned.preparation
+    return WithdrawExecutionReport(
+        status="planned",
+        withdraw_plan=planned.withdraw_plan,
+        sell=planned.sell,
+        plan=planned.plan,
+        preparations=preparation.preparations,
+        funding=preparation.funding,
+        messages=(
+            "dry-run only; no transactions broadcast",
+            *preparation.messages,
+            *preparation.blockers,
+        ),
+    )
+
+
+def apply_withdrawal_plan(
+    client: object,
+    signer: Signer,
+    planned: WithdrawalPlan,
+    *,
+    config: object | None = None,
+    idempotency_store: object | None = None,
+) -> WithdrawExecutionReport:
+    """Execute exactly ``planned``, refusing it when it no longer describes the
+    account: another signer, or the withdrawal submitted since it was built.
+    """
+    address = signer.address()
+    if address.casefold() != planned.account.casefold():
+        raise TransactionPlanError(
+            f"the plan was built for {planned.account}, but the signer is {address}"
         )
-        return WithdrawExecutionReport(
-            status="planned",
-            withdraw_plan=withdraw_plan,
-            sell=sell,
-            plan=tx_plan,
-            preparations=preparation.preparations,
-            funding=preparation.funding,
-            messages=(
-                "dry-run only; no transactions broadcast",
-                *preparation.messages,
-                *preparation.blockers,
-            ),
+    # Planning skips a withdrawal already sent; one sent since means a resend.
+    if planned.plan.bundles and _store_completed(
+        idempotency_store, _withdraw_key(planned.withdraw_plan)
+    ):
+        instrument_id = planned.withdraw_plan.instrument_id
+        raise TransactionPlanError(
+            f"the plan is stale: the withdrawal of {instrument_id} was sent after "
+            "it was built; plan again"
         )
     return _execute_calldata_withdraw(
         client,
         signer,
-        tx_plan,
-        withdraw_plan,
-        sell,
+        planned.plan,
+        planned.withdraw_plan,
+        planned.sell,
         config,
         idempotency_store,
     )
@@ -295,5 +390,9 @@ def _ok_policy_result() -> object:
 __all__ = [
     "WithdrawExecutionReport",
     "WithdrawSellDetails",
+    "WithdrawalPlan",
+    "apply_withdrawal_plan",
+    "dry_run_report",
+    "plan_withdrawal",
     "withdraw",
 ]
